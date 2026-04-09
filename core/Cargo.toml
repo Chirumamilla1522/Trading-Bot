@@ -1,0 +1,38 @@
+[package]
+name    = "trading-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+anyhow       = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Lock-free ring buffer (LMAX Disruptor-style)
+crossbeam       = "0.8"
+crossbeam-queue = "0.3"
+
+# CPU affinity / core pinning
+core_affinity = "0.8"
+
+# Options math
+statrs = "0.17"
+
+# Shared memory IPC (writes ticks to RAM block Python reads)
+shared_memory = "0.12"
+
+# Network / UDP multicast (OPRA Pillar feed)
+socket2 = "0.5"
+
+# Metrics
+metrics             = "0.23"
+metrics-exporter-prometheus = "0.15"
+
+[profile.release]
+opt-level   = 3
+lto         = true
+codegen-units = 1
+panic       = "abort"

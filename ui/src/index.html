@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentic Trading Terminal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <!-- Theme: Midnight Meridian (+ experimental skins: click ◐ MER in top bar → CRT / NEON / RAW; saved in localStorage att_ui_theme). Backups: terminal-legacy.css, terminal-v2-backup.css -->
+  <link rel="stylesheet" href="/src/terminal.css" />
+</head>
+<body>
+  <!-- ── Toast notifications ──────────────────────────────────────────────── -->
+  <div id="toast-container"></div>
+
+  <!-- ── Top bar ────────────────────────────────────────────────────────────── -->
+  <header id="topbar">
+    <div id="logo">⬡ ATT</div>
+    <div id="gobar-wrapper">
+      <input id="gobar" type="text" placeholder="Go to ticker… (press /)" autocomplete="off" spellcheck="false"/>
+    </div>
+
+    <!-- Live price ticker pill -->
+    <div id="price-pill">
+      <span id="pp-ticker">SPY</span>
+      <span id="pp-price">—</span>
+      <span id="pp-change">—</span>
+    </div>
+
+    <div id="status-row">
+      <span id="clock">--:--:--</span>
+      <span id="ws-indicator" class="ws-indicator ws-poll" title="WebSocket connection status">● POLL</span>
+      <span id="market-clock-badge" class="badge market-closed" title="NYSE market status">MKT: --</span>
+      <span id="llm-backend-badge" class="badge llm-badge-unknown" title="LLM backend: local llama.cpp or OpenRouter">LLM: --</span>
+      <span id="agent-status" class="agent-status agent-status-unknown" title="Agent loop status">AGENTS: --</span>
+      <span id="regime-badge" class="badge badge-unknown">REGIME: UNKNOWN</span>
+      <span id="cb-badge" class="badge badge-ok">CIRCUIT OK</span>
+      <button type="button" id="theme-cycle-btn" class="theme-cycle-btn" title="Cycle experimental UI themes (saved in this browser)">◐ MER</button>
+      <button id="kill-btn">⚡ KILL SWITCH</button>
+    </div>
+  </header>
+
+  <!-- ── Main grid ─────────────────────────────────────────────────────────── -->
+  <main id="workspace">
+
+    <!-- ══ Scanner sidebar ════════════════════════════════════════════════════ -->
+    <section id="col-scanner">
+      <div class="panel-header">
+        S&amp;P 500 SCANNER
+        <span id="scanner-count" class="panel-header-sub">0 / 0</span>
+      </div>
+      <div id="scanner-controls">
+        <input id="scanner-filter" type="text" placeholder="Filter…" autocomplete="off" />
+        <select id="scanner-sort">
+          <option value="iv">IV ↓</option>
+          <option value="chg">Day % ↓</option>
+          <option value="price">Price ↓</option>
+          <option value="pc">P/C ↓</option>
+          <option value="oi">OI ↓</option>
+          <option value="ticker">A–Z</option>
+        </select>
+      </div>
+      <div id="scanner-table-wrap">
+        <table class="data-table scanner-table" id="scanner-table">
+          <thead><tr>
+            <th>TICKER</th>
+            <th title="Last trade (Alpaca IEX when configured)">LAST</th>
+            <th title="Change vs prior close">CHG</th>
+            <th title="30-day ATM implied volatility">30d IV</th>
+            <th title="Put / Call contract count ratio">P/C</th>
+            <th title="Number of option contracts loaded">CTRS</th>
+          </tr></thead>
+          <tbody id="scanner-body">
+            <tr><td colspan="6" class="empty-row">Scanning… (~2 min)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ══ Left column — Options chain + live market + stock info ═════════════ -->
+    <section id="col-left">
+
+      <!-- ① CHART — always first, always visible ─────────────────────── -->
+      <div id="underlying-chart-section">
+        <!-- ticker + last price row -->
+        <div class="chart-price-header">
+          <span class="chart-ticker-name" id="chart-ticker-label">SPY</span>
+          <span class="chart-last-price" id="sd-last">—</span>
+          <span class="chart-chg-badge" id="sd-chg1">—</span>
+          <span class="chart-chg-pct"   id="sd-chgper">—</span>
+          <span class="chart-hl-meta"   id="sd-hl">—</span>
+          <span class="chart-vol-meta"  id="sd-vol">—</span>
+          <span id="ticker-chart-source" class="chart-src-badge">—</span>
+          <!-- hidden selects kept for JS compatibility -->
+          <select id="ticker-chart-style" class="chart-style-hidden">
+            <option value="candles" selected>Candles</option>
+            <option value="line">Line</option>
+            <option value="area">Area</option>
+          </select>
+          <select id="ticker-chart-tf" class="chart-style-hidden">
+            <option value="5D" selected>5D</option>
+            <option value="1M">1M</option><option value="3M">3M</option>
+            <option value="6M">6M</option><option value="1Y">1Y</option>
+            <option value="1D">1D</option><option value="1Day">1Day</option>
+            <option value="1Hour">1H</option><option value="15Min">15m</option>
+            <option value="5Min">5m</option><option value="1Min">1m</option>
+          </select>
+        </div>
+
+        <!-- chart canvas -->
+        <div class="chart-wrap chart-wrap-underlying" aria-label="Underlying stock OHLC chart">
+          <div id="ticker-chart-crosshair" class="chart-crosshair-hint" aria-live="polite"></div>
+          <div id="ticker-chart" class="chart-inner"></div>
+        </div>
+
+        <!-- timeframe + style button strip -->
+        <div class="chart-tf-strip">
+          <div class="chart-tf-group">
+            <button class="chart-tf-btn" data-tf="1D"    title="Today (5m bars)">1D</button>
+            <button class="chart-tf-btn" data-tf="5D"    title="5 days (daily)">5D</button>
+            <button class="chart-tf-btn" data-tf="1M"    title="1 month">1M</button>
+            <button class="chart-tf-btn" data-tf="3M"    title="3 months">3M</button>
+            <button class="chart-tf-btn" data-tf="6M"    title="6 months">6M</button>
+            <button class="chart-tf-btn" data-tf="1Y"    title="1 year">1Y</button>
+            <button class="chart-tf-btn" data-tf="1Hour" title="Hourly">1H</button>
+            <button class="chart-tf-btn" data-tf="15Min" title="15-min bars">15m</button>
+            <button class="chart-tf-btn" data-tf="1Min"  title="1-min bars">1m</button>
+          </div>
+          <div class="chart-style-group">
+            <button class="chart-style-btn chart-style-active" data-style="candles" title="Candlestick">▌▐</button>
+            <button class="chart-style-btn" data-style="line"  title="Line">⌇</button>
+            <button class="chart-style-btn" data-style="area"  title="Area">◿</button>
+          </div>
+          <span id="ticker-chart-bar-size" class="chart-bar-size-meta"></span>
+          <a class="chart-src-attribution" href="https://www.tradingview.com/lightweight-charts/" target="_blank" rel="noopener noreferrer">LW Charts</a>
+        </div>
+      </div>
+
+      <!-- ② LIVE QUOTE strip ───────────────────────────────────────────── -->
+      <div id="stock-quote-strip" class="stock-quote-strip" aria-label="Live equity quote (NBBO)">
+        <span class="sq-label">LIVE QUOTE</span>
+        <span id="sq-session" class="sq-session" title=""></span>
+        <span id="sq-bid" class="sq-val">—</span>
+        <span class="sq-x">×</span>
+        <span id="sq-ask" class="sq-val">—</span>
+        <span class="sq-sep">|</span>
+        <span id="sq-last" class="sq-val sq-last">—</span>
+        <span class="sq-sep">|</span>
+        <span id="sq-daypct" class="sq-val">—</span>
+        <span id="sq-src" class="sq-src"></span>
+      </div>
+
+      <!-- ③ L2/L3 toggle panel ─────────────────────────────────────────── -->
+      <div class="panel-header" id="ph-trading-viz-label">LIVE MARKET · L2 / L3</div>
+      <div class="trading-viz-host" id="trading-viz-host">
+        <div id="trading-viz-root"></div>
+      </div>
+
+      <!-- ④ OPTIONS CHAIN (collapsible) ───────────────────────────────── -->
+      <div class="panel-header collapsible collapsed" id="ph-chain" data-target="chain-body">
+        OPTIONS CHAIN &nbsp;<span class="ticker-label" id="chain-ticker">SPY</span>
+        <span id="chain-count" style="font-size:10px;color:var(--muted)"></span>
+        <span class="ph-arrow">▾</span>
+      </div>
+      <div class="collapsible-body collapsed" id="chain-body">
+        <div class="chain-toolbar">
+          <div class="chain-filter-group">
+            <button class="chain-cp-btn chain-cp-active" id="cp-all">ALL</button>
+            <button class="chain-cp-btn" id="cp-calls">CALLS</button>
+            <button class="chain-cp-btn" id="cp-puts">PUTS</button>
+          </div>
+          <select id="chain-sort" class="chain-sort-sel" title="Sort options chain">
+            <option value="iv_desc">IV ↓</option>
+            <option value="iv_asc">IV ↑</option>
+            <option value="strike_asc">Strike ↑</option>
+            <option value="strike_desc">Strike ↓</option>
+            <option value="exp_asc">Expiry ↑</option>
+            <option value="delta_desc">|Δ| ↓</option>
+            <option value="bid_desc">Bid ↓</option>
+          </select>
+          <input id="chain-strike-filter" class="chain-strike-input" type="number"
+                 placeholder="Strike…" min="0" step="1" title="Filter near strike price"/>
+        </div>
+        <div class="table-scroll chain-table-scroll" id="options-table-wrap">
+          <table class="data-table" id="options-table">
+            <thead>
+              <tr>
+                <th class="th-sortable" data-col="symbol">SYMBOL</th>
+                <th class="th-sortable" data-col="exp">EXP</th>
+                <th class="th-sortable" data-col="strike">STRIKE</th>
+                <th>C/P</th>
+                <th>BID</th>
+                <th>ASK</th>
+                <th class="th-sortable th-sort-active" data-col="iv">IV ▾</th>
+                <th class="th-sortable" data-col="delta">Δ</th>
+                <th>Γ</th><th>Θ</th><th>V</th>
+              </tr>
+            </thead>
+            <tbody id="options-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ⑤ STOCK INFO ─────────────────────────────────────────────────── -->
+      <div id="stock-info-panel" class="stock-info-panel">
+        <div class="si-tabs">
+          <button class="si-tab si-tab-active" data-tab="fundamentals">Fundamentals</button>
+          <button class="si-tab" data-tab="peers">Peers</button>
+          <button class="si-tab" data-tab="ecosystem">Ecosystem</button>
+        </div>
+        <div id="si-fundamentals" class="si-section si-section-active">
+          <div class="si-name-row">
+            <span id="si-name" class="si-name">—</span>
+            <span id="si-sector" class="si-sector-badge">—</span>
+          </div>
+          <div class="si-grid">
+            <div class="si-cell"><span class="si-lab">MKT CAP</span><span id="si-mktcap" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">P/E</span><span id="si-pe" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">FWD P/E</span><span id="si-fpe" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">PEG</span><span id="si-peg" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">EPS (TTM)</span><span id="si-eps" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">REVENUE</span><span id="si-rev" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">GROSS MGN</span><span id="si-gm" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">NET MGN</span><span id="si-nm" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">BETA</span><span id="si-beta" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">DIV YIELD</span><span id="si-div" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">52W HIGH</span><span id="si-52h" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">52W LOW</span><span id="si-52l" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">ROE</span><span id="si-roe" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">ANALYST</span><span id="si-rec" class="si-val">—</span></div>
+          </div>
+          <div id="si-desc" class="si-desc">—</div>
+        </div>
+        <div id="si-peers" class="si-section">
+          <div class="si-subsection-label">DIRECT COMPETITORS</div>
+          <div id="si-competitors" class="si-chips"></div>
+          <div class="si-subsection-label mt4">SIMILAR (SECTOR/INDUSTRY)</div>
+          <div id="si-similar" class="si-chips"></div>
+        </div>
+        <div id="si-ecosystem" class="si-section">
+          <div class="si-subsection-label">DEPENDS ON <span class="si-sub-note">(upstream suppliers)</span></div>
+          <div id="si-depends-on" class="si-chips si-chips-upstream"></div>
+          <div class="si-subsection-label mt4">DEPENDED BY <span class="si-sub-note">(key customers)</span></div>
+          <div id="si-depended-by" class="si-chips si-chips-downstream"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ Centre column ══════════════════════════════════════════════════════ -->
+    <section id="col-centre">
+      <div id="col-centre-scroll">
+        <div id="account-strip" class="account-strip" aria-label="Cash account">
+          <div class="metric-card">
+            <div class="metric-label">CASH</div>
+            <div class="metric-value" id="acct-cash">—</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">BUYING POWER</div>
+            <div class="metric-value" id="acct-bp">—</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">ACCT EQUITY</div>
+            <div class="metric-value" id="acct-equity">—</div>
+          </div>
+        </div>
+
+        <div id="pnl-strip">
+          <div class="metric-card" id="card-daily-pnl">
+            <div class="metric-label">DAILY P&L</div>
+            <div class="metric-value" id="daily-pnl">$0.00</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Δ PORTFOLIO</div>
+            <div class="metric-value" id="port-delta">0.000</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">V PORTFOLIO</div>
+            <div class="metric-value" id="port-vega">0.00</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">DRAWDOWN</div>
+            <div class="metric-value" id="drawdown">0.00%</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">SENTIMENT</div>
+            <div class="metric-value" id="sentiment">0.00</div>
+          </div>
+        </div>
+
+        <div class="panel-header">POSITIONS</div>
+        <div class="table-scroll" style="max-height:260px">
+          <table class="data-table">
+            <thead><tr>
+              <th>SYMBOL</th><th>QTY</th><th>AVG</th><th>LAST</th><th>UPL</th>
+            </tr></thead>
+            <tbody id="stock-positions-body"><tr><td colspan="5" class="empty-row">No stock positions</td></tr></tbody>
+          </table>
+        </div>
+
+        <div class="panel-header mt">OPEN OPTIONS</div>
+        <div class="table-scroll" style="max-height:220px">
+          <table class="data-table">
+            <thead><tr>
+              <th>CONTRACT</th><th>QTY</th><th>AVG</th><th>LAST</th><th>UPL</th>
+            </tr></thead>
+            <tbody id="open-positions-body"><tr><td colspan="5" class="empty-row">No options positions</td></tr></tbody>
+          </table>
+        </div>
+
+        <div class="panel-header mt" style="display:flex;align-items:center;gap:8px;">
+          LIVE NEWS TAPE
+          <span style="margin-left:auto;display:flex;gap:6px;align-items:center;">
+            <label for="news-sort" style="font-family: var(--font-ui); font-size: 9px; color: var(--muted); letter-spacing: .08em;">SORT</label>
+            <select id="news-sort" class="mini-select" title="Sort news">
+              <option value="time_desc" selected>Time ↓</option>
+              <option value="time_asc">Time ↑</option>
+              <option value="ticker_asc">Stock A–Z</option>
+              <option value="ticker_desc">Stock Z–A</option>
+            </select>
+          </span>
+        </div>
+        <div id="news-tape"></div>
+      </div>
+    </section>
+
+    <!-- ══ Right column ═══════════════════════════════════════════════════════ -->
+    <section id="col-right">
+      <div id="order-ticket">
+        <div class="panel-header rh-panel-hd">ORDER TICKET</div>
+        <div class="ot-tabs">
+          <button class="ot-tab ot-tab-active" data-tab="stock">Stock</button>
+          <button class="ot-tab" data-tab="option">Option</button>
+        </div>
+        <div class="ot-body ot-body-active" id="ot-stock">
+          <div class="ot-grid">
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-s-symbol">SYMBOL</label>
+              <input id="ot-s-symbol" class="ot-input" value="SPY" />
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab">SIDE</label>
+              <div class="ot-side-group">
+                <button class="ot-side-btn ot-btn-buy ot-side-active" id="ot-s-side-buy" data-side="buy">BUY</button>
+                <button class="ot-side-btn ot-btn-sell" id="ot-s-side-sell" data-side="sell">SELL</button>
+              </div>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-s-qty">QTY</label>
+              <input id="ot-s-qty" class="ot-input" type="number" min="1" step="1" value="1" />
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-s-type">TYPE</label>
+              <select id="ot-s-type" class="ot-select">
+                <option value="market">MKT</option>
+                <option value="limit">LMT</option>
+              </select>
+            </div>
+            <div class="ot-field" id="ot-s-lmt-row" style="display:none">
+              <label class="ot-lab" for="ot-s-lmt">LIMIT $</label>
+              <input id="ot-s-lmt" class="ot-input" type="number" min="0.01" step="0.01" />
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-s-tif">TIF</label>
+              <select id="ot-s-tif" class="ot-select">
+                <option value="day">DAY</option>
+                <option value="gtc">GTC</option>
+              </select>
+            </div>
+          </div>
+          <div id="ot-s-status" class="ot-status"></div>
+          <button id="ot-s-submit" class="ot-submit ot-submit-buy">PLACE BUY ORDER</button>
+        </div>
+        <div class="ot-body" id="ot-option">
+          <div class="ot-grid">
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-o-contract">CONTRACT</label>
+              <input id="ot-o-contract" class="ot-input" placeholder="Click a chain row…" />
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab">SIDE</label>
+              <div class="ot-side-group">
+                <button class="ot-side-btn ot-btn-buy ot-side-active" id="ot-o-side-buy" data-side="buy">BUY</button>
+                <button class="ot-side-btn ot-btn-sell" id="ot-o-side-sell" data-side="sell">SELL</button>
+              </div>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-o-qty">CONTRACTS</label>
+              <input id="ot-o-qty" class="ot-input" type="number" min="1" step="1" value="1"/>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-o-type">TYPE</label>
+              <select id="ot-o-type" class="ot-select">
+                <option value="limit">LMT</option>
+                <option value="market">MKT</option>
+              </select>
+            </div>
+            <div class="ot-field" id="ot-o-lmt-row">
+              <label class="ot-lab" for="ot-o-lmt">LIMIT $</label>
+              <input id="ot-o-lmt" class="ot-input" type="number" min="0.01" step="0.01" placeholder="mid"/>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-o-tif">TIF</label>
+              <select id="ot-o-tif" class="ot-select">
+                <option value="day">DAY</option>
+                <option value="gtc">GTC</option>
+              </select>
+            </div>
+          </div>
+          <div id="ot-o-status" class="ot-status"></div>
+          <button id="ot-o-submit" class="ot-submit ot-submit-buy">PLACE BUY ORDER</button>
+        </div>
+      </div>
+
+      <div id="col-right-scroll">
+        <div class="panel-header rh-panel-hd">
+          AGENT REASONING LOG
+          <span id="agent-indicator" class="agent-dot dot-idle"></span>
+        </div>
+        <div id="reasoning-panel"></div>
+
+        <div class="panel-header collapsible" data-target="blotter-body">
+          ORDER BLOTTER
+          <button id="refresh-orders-btn" class="blotter-refresh-btn" title="Refresh orders" style="margin-left:6px">↺</button>
+          <span class="ph-arrow">▾</span>
+        </div>
+        <div class="collapsible-body" id="blotter-body">
+          <div class="table-scroll" style="max-height:220px">
+            <table class="data-table">
+              <thead><tr>
+                <th>TIME</th><th>SYMBOL</th><th>SIDE</th><th>QTY</th>
+                <th>TYPE</th><th>PRICE</th><th>STATUS</th><th></th>
+              </tr></thead>
+              <tbody id="orders-body"><tr><td colspan="8" class="empty-row">No orders</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ── News Detail Modal ──────────────────────────────────────────────── -->
+  <div id="news-modal" class="news-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="news-modal-headline" hidden>
+    <div class="news-modal-card">
+      <div class="news-modal-header">
+        <div class="news-modal-meta" id="news-modal-meta"></div>
+        <button class="news-modal-close" id="news-modal-close" title="Close (Esc)">✕</button>
+      </div>
+      <h2 class="news-modal-headline" id="news-modal-headline"></h2>
+      <div class="news-modal-badges" id="news-modal-badges"></div>
+      <div class="news-modal-summary" id="news-modal-summary"></div>
+      <div class="news-modal-footer" id="news-modal-footer"></div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

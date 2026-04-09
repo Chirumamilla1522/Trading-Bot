@@ -1,0 +1,30 @@
+# ── Core agent framework ──────────────────────────────────────────────────────
+langgraph>=0.2
+langchain>=0.3
+langchain-openai>=0.2
+langchain-core>=0.3
+
+# ── Data models ───────────────────────────────────────────────────────────────
+pydantic>=2.7
+
+# ── API server (bridges UI ↔ agents) ─────────────────────────────────────────
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+
+# ── Caching & storage ─────────────────────────────────────────────────────────
+redis>=5.0
+# psycopg2-binary>=2.9       # uncomment for PostgreSQL archival
+
+# ── News sentiment ────────────────────────────────────────────────────────────
+# transformers>=4.44          # uncomment to enable FinBERT local inference
+# torch>=2.3                  # required for FinBERT GPU inference
+
+# ── Market data ───────────────────────────────────────────────────────────────
+# databento>=0.37             # uncomment for live OPRA Pillar feed
+alpaca-py>=0.30               # Alpaca paper/live + delayed options feed
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0
+structlog>=24.0
+certifi>=2024.0.0

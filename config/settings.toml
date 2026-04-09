@@ -1,0 +1,57 @@
+# ══════════════════════════════════════════════════════════════════════
+# Agentic Trading Terminal – Runtime Configuration
+# Copy to .env and fill secrets; never commit secrets.toml to git.
+# ══════════════════════════════════════════════════════════════════════
+
+[environment]
+# "testing"    → free OSS models via OpenRouter, Alpaca paper trading
+# "production" → premium models, live broker
+TRADING_ENV = "testing"
+
+# ── Agent models (override in .env) ──────────────────────────────────
+# All models are routed through OpenRouter.ai
+# Testing tier runs at near-zero cost (DeepSeek-V3, Llama 3.1)
+# Production tier uses Claude 3.5 Sonnet, GPT-4o, Gemini Flash
+
+[openrouter]
+BASE_URL = "https://openrouter.ai/api/v1"
+# OPENROUTER_API_KEY = "sk-or-..."   ← set in .env
+
+[broker]
+# Options: alpaca | ibkr | lime
+BROKER = "alpaca"
+# ALPACA_API_KEY    = "..."          ← set in .env
+# ALPACA_SECRET_KEY = "..."          ← set in .env
+ALPACA_BASE_URL   = "https://paper-api.alpaca.markets"   # paper by default
+
+[data]
+# Options: shm (Rust bridge) | databento | delayed (Alpaca 15-min)
+OPTIONS_DATA_SOURCE = "delayed"
+# DATABENTO_API_KEY = "..."          ← set in .env (for live OPRA)
+# BENZINGA_API_KEY  = "..."          ← set in .env
+FINBERT_ENABLED     = false          # set true to enable local FinBERT
+
+[risk]
+MAX_DAILY_DRAWDOWN = 0.05    # 5% kill-switch threshold
+MAX_POSITION_PCT   = 0.02    # 2% max capital per position
+
+[features]
+ENABLE_ADVERSARIAL_DEBATE = true
+ENABLE_SEMANTIC_CACHE     = true
+DEBATE_ROUNDS             = 3
+
+[storage]
+REDIS_URL    = "redis://localhost:6379"
+QUESTDB_HOST = "localhost"
+QUESTDB_PORT = 8812
+XAI_LOG_DIR  = "logs/xai"
+
+[opra_feed]
+# Only needed for direct OPRA multicast (requires co-location + 40 Gbps NIC)
+OPRA_MULTICAST_GROUP = "233.43.202.1"
+OPRA_PORT            = 11700
+OPRA_IFACE           = "eth0"
+
+[shm]
+SHM_NAME = "trading_ticks"
+CTRL_PIPE = "/tmp/trading_ctrl"
