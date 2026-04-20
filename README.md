@@ -10,6 +10,7 @@ This README is intentionally exhaustive so you can move machines, debug quickly,
 
 ## Docs (split by topic)
 
+- **`INSTALL.md`** — install Python and Node packages (venv, `pip`, `npm`, Tauri)
 - `docs/README.md` (index)
 - `docs/ARCHITECTURE.md`
 - `docs/AGENTS.md`
@@ -167,6 +168,8 @@ You’ll typically run:
 - **Node 18+** for the UI (Tauri/Vite)
 - Optional: **Redis** for semantic cache
 - Optional: **llama.cpp** `llama-server` for local LLM
+
+**Step-by-step installs (venv, pip, npm, Rust/Tauri):** see **`INSTALL.md`** in the repo root.
 
 ### Configuration
 Copy `.env.example` and fill in your keys:

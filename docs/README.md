@@ -2,6 +2,7 @@
 
 Start here, then drill into the sections below.
 
+- **Install Python & Node packages**: [`INSTALL.md`](../INSTALL.md)
 - **Workflows & methodology**: `docs/WORKFLOWS.md`
 - **Architecture**: `docs/ARCHITECTURE.md`
 - **Agents (pipeline + roles)**: `docs/AGENTS.md`
