@@ -14,11 +14,11 @@ httpx>=0.27
 
 # ── Caching & storage ─────────────────────────────────────────────────────────
 redis>=5.0
-# psycopg2-binary>=2.9       # uncomment for PostgreSQL archival
+psycopg[binary]>=3.1         # PostgreSQL warehouse (optional; set WAREHOUSE_POSTGRES_URL)
 
 # ── News sentiment ────────────────────────────────────────────────────────────
-# transformers>=4.44          # uncomment to enable FinBERT local inference
-# torch>=2.3                  # required for FinBERT GPU inference
+transformers>=4.44            # FinBERT local inference (ProsusAI/finbert)
+torch>=2.3                    # FinBERT backend (CPU ok; GPU optional)
 
 # ── Market data ───────────────────────────────────────────────────────────────
 # databento>=0.37             # uncomment for live OPRA Pillar feed
@@ -28,3 +28,6 @@ alpaca-py>=0.30               # Alpaca paper/live + delayed options feed
 python-dotenv>=1.0
 structlog>=24.0
 certifi>=2024.0.0
+
+# ── Experiment tracking (optional; used when MLFLOW_TRACKING_URI is set) ─────
+mlflow>=2.10

@@ -1,10 +1,11 @@
 """
 S&P 500 Ticker Roster + Async Options Scanner
 
-Cycles through all ~400 major constituents in concurrent batches,
-building per-ticker summary metrics (IV, P/C ratio, OI, volume).
-The scanner runs continuously in the background and exposes cached
-results; individual tickers refresh every ~5 minutes.
+``SP500_TICKERS`` is ordered with **index / sector / macro ETFs first** (see
+``INDEX_SECTOR_ETF_TICKERS``), then S&P 500–style single names. The scanner cycles
+through this list in concurrent batches, building per-ticker summary metrics
+(IV, P/C ratio, OI, volume). Results are cached; individual tickers refresh
+every ~5 minutes.
 """
 from __future__ import annotations
 
@@ -17,18 +18,50 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 
-# ─── S&P 500 + high-liquidity ETF roster ─────────────────────────────────────
-# Ordered by liquidity tier so the most important names are scanned first.
-SP500_TICKERS: list[str] = [
-    # ── Tier 1: Mega-cap tech + index ETFs ──────────────────────────────────
+# ─── Index / sector / macro ETFs (always first in ``SP500_TICKERS``) ─────────
+# Broad + sector SPDRs + common tradable proxies; equities follow in sector blocks below.
+INDEX_SECTOR_ETF_TICKERS: list[str] = [
     "SPY", "QQQ", "IWM", "DIA",
+    "VOO", "VTI", "IJH", "IJR", "MDY",
+    "XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC",
+    "SMH", "SOXX",
+    "GLD", "SLV", "TLT", "EEM",
+    "ARKK", "VXX", "UVXY", "SQQQ", "TQQQ", "SPXL", "SPXU",
+]
+_ETF_TICKERS_UPPER: frozenset[str] = frozenset(t.upper() for t in INDEX_SECTOR_ETF_TICKERS)
+
+# UI / API: benchmark strip + scanner section headers (order matches ``INDEX_SECTOR_ETF_TICKERS``)
+BENCHMARK_SCANNER_SECTIONS: list[dict[str, str | list[str]]] = [
+    {
+        "id": "core",
+        "label": "Core indices",
+        "tickers": ["SPY", "QQQ", "IWM", "DIA", "VOO", "VTI", "IJH", "IJR", "MDY"],
+    },
+    {
+        "id": "sectors",
+        "label": "Sectors & semis",
+        "tickers": ["XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC", "SMH", "SOXX"],
+    },
+    {
+        "id": "macro",
+        "label": "Macro & vol",
+        "tickers": ["GLD", "SLV", "TLT", "EEM", "ARKK", "VXX", "UVXY", "SQQQ", "TQQQ", "SPXL", "SPXU"],
+    },
+]
+_flat_sec = [t for sec in BENCHMARK_SCANNER_SECTIONS for t in sec["tickers"]]  # type: ignore[misc]
+if _flat_sec != INDEX_SECTOR_ETF_TICKERS:
+    raise RuntimeError("BENCHMARK_SCANNER_SECTIONS must partition INDEX_SECTOR_ETF_TICKERS in order")
+
+# ─── S&P 500 + high-liquidity names (equities; ETFs removed — re-prefixed above) ─
+_SP500_EQUITIES: list[str] = [
+    # ── Tier 1: Mega-cap tech ───────────────────────────────────────────────
     "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO",
     "GOOG", "AMD", "ORCL", "CRM", "ADBE", "NFLX", "QCOM", "TXN",
 
     # ── Technology ───────────────────────────────────────────────────────────
     "AMAT", "LRCX", "KLAC", "MU", "NOW", "SNPS", "CDNS", "CSCO",
-    "IBM", "ACN", "INTU", "FTNT", "PANW", "CRWD", "WDAY", "ANSS",
-    "AKAM", "HPQ", "HPE", "NTAP", "STX", "WDC", "JNPR", "KEYS",
+    "IBM", "ACN", "INTU", "FTNT", "PANW", "CRWD", "WDAY", "ANET",
+    "AKAM", "HPQ", "HPE", "NTAP", "STX", "WDC", "ZS", "KEYS",
     "GLW", "CTSH", "MPWR", "ENPH", "ZBRA", "CDW", "IT", "FFIV",
     "GEN", "VRSN", "FSLR", "INTC", "EPAM", "NLOK", "TER", "SWKS",
     "QRVO", "MCHP", "ON", "ADI", "NXPI", "MRVL", "MTSI", "SLAB",
@@ -55,7 +88,6 @@ SP500_TICKERS: list[str] = [
     "XOM", "CVX", "COP", "EOG", "SLB", "MPC", "VLO", "PSX",
     "OXY", "DVN", "HES", "BKR", "HAL", "APA", "EQT", "MRO",
     "FANG", "LNG", "OKE", "WMB", "KMI", "TRGP", "CTRA", "SM",
-    "XLE",
 
     # ── Consumer Discretionary ────────────────────────────────────────────────
     "HD", "MCD", "NKE", "LOW", "SBUX", "CMG", "TJX",
@@ -64,13 +96,12 @@ SP500_TICKERS: list[str] = [
     "WYNN", "MGM", "CZR", "HLT", "MAR", "CCL", "RCL", "NCLH",
     "AAL", "DAL", "UAL", "LUV", "ALK", "EXPE", "BKNG", "ABNB",
     "POOL", "PHM", "DHI", "LEN", "NVR", "TOL", "MTH", "GPC",
-    "XLY",
 
     # ── Consumer Staples ──────────────────────────────────────────────────────
     "WMT", "PG", "COST", "KO", "PEP", "PM", "MO", "MDLZ",
     "CL", "KHC", "GIS", "K", "CPB", "HSY", "MKC", "SJM",
     "CAG", "HRL", "STZ", "TAP", "CHD", "CLX", "ENR", "KR",
-    "SYY", "PFGC", "XLP",
+    "SYY", "PFGC",
 
     # ── Industrials ───────────────────────────────────────────────────────────
     "HON", "BA", "UPS", "RTX", "LMT", "GE", "NOC", "GD",
@@ -80,43 +111,42 @@ SP500_TICKERS: list[str] = [
     "BAH", "HII", "TDG", "SPR", "HWM", "TXT", "JBHT", "CHRW",
     "EXPD", "XPO", "ODFL", "SAIA", "UNP", "CSX", "NSC", "WAB",
     "CARR", "OTIS", "AXON", "ROP", "TT", "XYL", "IDEX", "IEX",
-    "MAS", "PNR", "WCN", "XLI",
+    "MAS", "PNR", "WCN",
 
     # ── Utilities ─────────────────────────────────────────────────────────────
     "NEE", "DUK", "SO", "D", "EXC", "AEP", "XEL", "ED",
     "PEG", "AWK", "ES", "WEC", "ETR", "CNP", "ATO", "NI",
     "LNT", "EVRG", "PPL", "FE", "CMS", "DTE", "PCG", "SRE",
-    "CEG", "VST", "XLU",
+    "CEG", "VST",
 
     # ── Real Estate ───────────────────────────────────────────────────────────
     "AMT", "PLD", "EQIX", "CCI", "SPG", "WELL", "O", "DLR",
     "PSA", "EQR", "AVB", "VTR", "SUI", "ELS", "MAA", "CPT",
-    "UDR", "KIM", "REG", "FRT", "BXP", "VICI", "GLPI", "XLRE",
+    "UDR", "KIM", "REG", "FRT", "BXP", "VICI", "GLPI",
 
     # ── Materials ─────────────────────────────────────────────────────────────
     "LIN", "APD", "DD", "DOW", "NEM", "FCX", "ALB", "IFF",
     "PPG", "SHW", "ECL", "EMN", "CE", "HUN", "FMC", "CF",
     "MOS", "NUE", "STLD", "RS", "ATI", "AA", "X", "CLF",
-    "MLM", "VMC", "PKG", "IP", "WRK", "SEE", "BALL", "AVY", "XLB",
+    "MLM", "VMC", "PKG", "IP", "WRK", "SEE", "BALL", "AVY",
 
     # ── Communication Services ────────────────────────────────────────────────
     "CMCSA", "DIS", "T", "VZ", "TMUS", "WBD", "PARA",
     "FOX", "FOXA", "OMC", "IPG", "MTCH", "PINS", "SNAP",
-    "SPOT", "TTWO", "EA", "RBLX", "U", "XLC",
-
-    # ── Sector / volatility ETFs ──────────────────────────────────────────────
-    "GLD", "SLV", "TLT", "EEM", "XLK", "XLF", "XLV",
-    "ARKK", "VXX", "UVXY", "SQQQ", "TQQQ", "SPXL", "SPXU",
+    "SPOT", "TTWO", "EA", "RBLX", "U",
 ]
 
-# De-duplicate while preserving insertion order
-SP500_TICKERS = list(dict.fromkeys(SP500_TICKERS))
+# Full scanner roster: all index/sector/macro ETFs first, then equities (deduped).
+SP500_TICKERS = list(
+    dict.fromkeys(
+        INDEX_SECTOR_ETF_TICKERS
+        + [t for t in _SP500_EQUITIES if t.upper() not in _ETF_TICKERS_UPPER]
+    )
+)
 
-# Top-100 for testing / rate-limited environments (first 100 by liquidity tier)
-SP500_TOP100: list[str] = SP500_TICKERS[:100]
-
-# Default scanner universe: first 50 mega/most-liquid names (see SCANNER_UNIVERSE in all_tickers)
-SP500_TOP50: list[str] = SP500_TICKERS[:50]
+# Default scanner universe: first 50 / 100 symbols (indices + sectors + stocks in order)
+SP500_TOP50: list[str] = list(SP500_TICKERS[:50])
+SP500_TOP100: list[str] = list(SP500_TICKERS[:100])
 
 
 # ─── Per-ticker scan result ───────────────────────────────────────────────────

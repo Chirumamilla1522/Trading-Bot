@@ -36,6 +36,10 @@ Evaluate:
 3. EXECUTION RISK: Are the bid-ask spreads acceptable? Wide spread → uncertain fill price.
 4. TIMING: Any upcoming events (earnings, Fed, macro) visible in term structure backwardation?
 
+UNITS (must follow):
+- `pending_proposal.max_risk` and `target_return` are USD. Options are quoted per-share; all dollar risk math is assumed to already include the 100x contract multiplier.
+- Do NOT “correct” units or convert per-share to dollars here. If the proposal looks internally inconsistent, HOLD and describe why.
+
 GROUNDING REQUIREMENTS (must follow):
 - Your reasoning MUST cite at least 6 concrete fields from context, including:
   drawdown_pct, portfolio_delta, portfolio_vega, market_regime, iv_regime, skew_ratio,
@@ -62,6 +66,7 @@ ABORT only if you identify a material risk the hard checks missed. Otherwise PRO
 
 
 def risk_manager_node(state: FirmState) -> FirmState:
+    _t0 = __import__("time").time()
     violations: list[str] = []
 
     # ── Gate 0: Control flags ─────────────────────────────────────────────────
@@ -163,6 +168,10 @@ def risk_manager_node(state: FirmState) -> FirmState:
         "tail_risks":           state.sentiment_tail_risks,
         "strategy_confidence":  state.strategy_confidence,
         "analyst_confidence":   state.analyst_confidence,
+        "news_timing_regime":   state.news_timing_regime,
+        "news_newest_age_minutes": state.news_newest_age_minutes,
+        "market_bias_score":    state.market_bias_score,
+        "movement_anomaly":     state.movement_anomaly,
     }
 
     messages = [
@@ -216,4 +225,25 @@ def risk_manager_node(state: FirmState) -> FirmState:
         inputs=context,
         outputs={"violations": llm_violations, "confidence": confidence},
     ))
+    try:
+        from agents.tracking.mlflow_tracing import log_agent_step
+        log_agent_step(
+            "risk_manager",
+            inputs={
+                "ticker": state.ticker,
+                "drawdown_pct": float(getattr(state.risk, "drawdown_pct", 0.0) or 0.0),
+                "portfolio_delta": float(getattr(state.risk, "portfolio_delta", 0.0) or 0.0),
+                "portfolio_gamma": float(getattr(state.risk, "portfolio_gamma", 0.0) or 0.0),
+                "portfolio_vega": float(getattr(state.risk, "portfolio_vega", 0.0) or 0.0),
+                "proposal_present": bool(state.pending_proposal),
+            },
+            outputs={
+                "decision": decision.value,
+                "violations_n": len(llm_violations or []),
+                "confidence": float(confidence or 0.0),
+            },
+            duration_s=max(0.0, __import__("time").time() - _t0),
+        )
+    except Exception:
+        pass
     return state

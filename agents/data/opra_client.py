@@ -14,8 +14,10 @@ import json
 import logging
 import mmap
 import os
+import re
 import struct
 import time
+from datetime import date
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator
 
@@ -179,6 +181,45 @@ def create_feed() -> OptionsFeed:
 
 # ─── Conversion helpers ───────────────────────────────────────────────────────────
 
+# OSI-style OCC tail: YYMMDD + C|P + strike*1000 (8 digits), after variable-length root.
+_OCC_TAIL_RE = re.compile(r"(\d{6})([CP])(\d{8})$", re.IGNORECASE)
+
+
+def parse_osi_occ_symbol(occ_symbol: str) -> tuple[str, OptionRight, float] | None:
+    """
+    Parse trailing YYMMDD, call/put, and strike from an OCC/OSI option symbol.
+    Root may be padded; spaces are ignored for matching.
+    Returns (yymmdd, right, strike) or None if the tail does not match.
+    """
+    s = (occ_symbol or "").strip().upper().replace(" ", "")
+    m = _OCC_TAIL_RE.search(s)
+    if not m:
+        return None
+    yymmdd, cp, strike8 = m.group(1), m.group(2).upper(), m.group(3)
+    try:
+        strike = int(strike8, 10) / 1000.0
+    except ValueError:
+        return None
+    right = OptionRight.CALL if cp == "C" else OptionRight.PUT
+    return yymmdd, right, strike
+
+
+def occ_expiry_as_date(occ_symbol: str) -> date | None:
+    """Calendar expiry embedded in OCC symbol, or None if unparsable."""
+    parsed = parse_osi_occ_symbol(occ_symbol)
+    if not parsed:
+        return None
+    yymmdd, _, _ = parsed
+    try:
+        yy = int(yymmdd[:2], 10)
+        mm = int(yymmdd[2:4], 10)
+        dd = int(yymmdd[4:6], 10)
+        year = 2000 + yy if yy < 85 else 1900 + yy
+        return date(year, mm, dd)
+    except ValueError:
+        return None
+
+
 def _dict_to_greeks(d: dict) -> GreeksSnapshot:
     raw = d.get("raw", d)
     return GreeksSnapshot(
@@ -241,13 +282,24 @@ def _alpaca_chain_to_greeks(occ_symbol: str, snap: Any) -> GreeksSnapshot:
         except (TypeError, ValueError):
             return default
 
-    # OCC symbol: e.g. SPY260620C00500000 → expiry=260620, right=C, strike=500.00
-    right = OptionRight.CALL if len(occ_symbol) >= 7 and occ_symbol[-9] == "C" else OptionRight.PUT
-    try:
-        strike = float(occ_symbol[-8:]) / 1000.0
-        expiry = occ_symbol[-15:-9]   # YYMMDD
-    except (ValueError, IndexError):
-        strike, expiry = 0.0, ""
+    parsed = parse_osi_occ_symbol(occ_symbol)
+    if parsed:
+        expiry, right, strike = parsed[0], parsed[1], parsed[2]
+    else:
+        right = OptionRight.CALL if len(occ_symbol) >= 9 and occ_symbol[-9] == "C" else OptionRight.PUT
+        try:
+            strike = float(occ_symbol[-8:]) / 1000.0
+            expiry = occ_symbol[-15:-9] if len(occ_symbol) >= 15 else ""
+        except (ValueError, IndexError):
+            strike, expiry = 0.0, ""
+
+    bid = _f(snap, "latest_quote", "bid_price")
+    ask = _f(snap, "latest_quote", "ask_price")
+    if bid <= 0 or ask <= 0 or ask < bid:
+        lt = getattr(snap, "latest_trade", None)
+        px = float(getattr(lt, "price", 0) or 0) if lt is not None else 0.0
+        if px > 0:
+            bid = ask = round(px, 2)
 
     return GreeksSnapshot(
         symbol = occ_symbol,
@@ -260,6 +312,6 @@ def _alpaca_chain_to_greeks(occ_symbol: str, snap: Any) -> GreeksSnapshot:
         theta  = _f(snap, "greeks", "theta"),
         vega   = _f(snap, "greeks", "vega"),
         rho    = _f(snap, "greeks", "rho"),
-        bid    = _f(snap, "latest_quote", "bid_price"),
-        ask    = _f(snap, "latest_quote", "ask_price"),
+        bid    = bid,
+        ask    = ask,
     )

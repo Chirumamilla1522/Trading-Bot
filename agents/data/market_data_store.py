@@ -1,11 +1,11 @@
 """
-Append-only JSONL market events (ticks / book snapshots) when the hub is active.
+Append-only market events (ticks / book snapshots) when the hub is active.
 
-Layout: ``logs/market_data/{TICKER}.jsonl`` (one file per symbol, rotated by size).
+Default storage: SQLite via ``agents/data/app_db.py``.
+Optional legacy JSONL mirror can be enabled for debugging.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
@@ -28,12 +28,20 @@ def _path(ticker: str) -> Path:
 def append_event(ticker: str, channel: str, payload: Any) -> None:
     """Record one hub message (tick, book, candle, reset)."""
     try:
-        rec = {
-            "ts": time.time(),
-            "channel": channel,
-            "payload": payload,
-        }
-        line = json.dumps(rec, default=str) + "\n"
+        rec = {"ts": time.time(), "channel": channel, "payload": payload}
+        try:
+            from agents.data.app_db import append_market_event
+
+            append_market_event(ticker=ticker, channel=channel, payload=payload)
+        except Exception:
+            pass
+
+        # Optional debug mirror
+        if os.getenv("MARKET_DATA_JSONL", "0").strip().lower() not in ("1", "true", "yes", "on"):
+            return
+
+        import json as _json
+        line = _json.dumps(rec, default=str) + "\n"
         p = _path(ticker)
         with _lock:
             if p.exists() and p.stat().st_size + len(line) > _MAX_BYTES:

@@ -32,3 +32,7 @@ ui/src-tauri/target/
 # Bundles / exports
 transfer_bundle.zip
 transfer_bundle/
+
+# Local caches / DBs (do not commit)
+cache/
+ui/mlflow.db

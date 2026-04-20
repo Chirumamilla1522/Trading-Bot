@@ -29,12 +29,22 @@ npm run tauri dev
 
 ### Logs
 
-- Agent reasoning log: `logs/xai/reasoning_YYYYMMDD.jsonl`
-- Persisted state snapshot: `agents/_firm_state.json`
+- **Primary persistence** (SQLite):
+  - App DB: `cache/app.sqlite3` (or `APP_DB_PATH` / `AGENTIC_DATA_DIR`)
+  - Processed news DB: `cache/news_processed.sqlite3`
+  - Portfolio series DB: `cache/portfolio_series.sqlite3`
+
+- **Optional debug mirrors** (off by default):
+  - Reasoning JSONL: `logs/xai/reasoning_YYYYMMDD.jsonl` (enable with `XAI_JSONL=1`)
+  - Processed news JSONL: `logs/news/processed_YYYYMMDD.jsonl` (enable with `NEWS_JSONL=1`)
+  - Market hub JSONL: `logs/market_data/{TICKER}.jsonl` (enable with `MARKET_DATA_JSONL=1`)
 
 ### Safe reset
 
-- Delete `agents/_firm_state.json` to start fresh, or use the API endpoint that deletes state (if present).
+- Delete `cache/app.sqlite3` (and optionally the other `cache/*.sqlite3` files) to start fresh,
+  or use the API endpoint that deletes state (if present).
+
+- If you still have a legacy `agents/_firm_state.json`, it is only used for one-time migration.
 
 ### Secrets hygiene
 

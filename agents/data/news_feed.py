@@ -46,10 +46,10 @@ log = logging.getLogger(__name__)
 BENZINGA_API_KEY = os.getenv("BENZINGA_API_KEY", "").strip()   # strip accidental whitespace
 FINBERT_ENABLED  = os.getenv("FINBERT_ENABLED", "false").lower() == "true"
 # More aggressive defaults (override via env in production if needed).
-# - BENZINGA_POLL_S: how often we run a full cycle across tiers
-# - YF_NEWS_TTL:     per-ticker TTL for yfinance cache (lower = fresher + more requests)
-BENZINGA_POLL_S  = int(os.getenv("BENZINGA_POLL_S", "10"))
-YF_NEWS_TTL      = int(os.getenv("YF_NEWS_TTL", "30"))
+# - BENZINGA_POLL_S: how often we run a full cycle across tiers (cadences below still gate API calls)
+# - YF_NEWS_TTL:     per-ticker TTL for yfinance cache seconds (lower = fresher + more requests)
+BENZINGA_POLL_S  = int(os.getenv("BENZINGA_POLL_S", "2"))
+YF_NEWS_TTL      = int(os.getenv("YF_NEWS_TTL", "25"))
 
 # Benzinga: API allows up to pageSize=100 per request
 BENZINGA_PAGE_SIZE = max(10, min(100, int(os.getenv("BENZINGA_PAGE_SIZE", "100"))))
@@ -57,9 +57,9 @@ BENZINGA_GENERAL_PAGE_SIZE = max(10, min(100, int(os.getenv("BENZINGA_GENERAL_PA
 # Extra pagination pages (0-based) for the general feed — more Benzinga headlines per cycle
 BENZINGA_GENERAL_EXTRA_PAGES = max(0, min(3, int(os.getenv("BENZINGA_GENERAL_EXTRA_PAGES", "3"))))
 
-# Prefer Benzinga heavily; yfinance can be "always" or "fallback" (only when Benzinga is unavailable).
-# This is useful when you want the majority of headlines to come from Benzinga.
-YF_MODE = os.getenv("YF_NEWS_MODE", "fallback").strip().lower()  # "always" | "fallback"
+# yfinance can be "always" (merge with Benzinga) or "fallback" (only when Benzinga unavailable).
+# For the UI we default to "always" so the feed is a true union of both sources.
+YF_MODE = os.getenv("YF_NEWS_MODE", "always").strip().lower()  # "always" | "fallback"
 
 # When BENZINGA_POLL_S is set very low (e.g., 1s), we still need to avoid hammering
 # the Benzinga API. These are per-endpoint minimum cadences.
@@ -73,6 +73,10 @@ TIER_INDICES = ["SPY", "QQQ", "IWM", "DIA", "VXX"]          # macro pulse
 # Use the canonical top-50 list from sp500.py (same universe the scanner uses)
 from agents.data.sp500 import SP500_TOP50 as _SP500_TOP50
 TIER_TOP_STOCKS = [t for t in _SP500_TOP50 if t not in TIER_INDICES]
+
+# Universe for entity extraction (ticker mentions)
+from agents.data.sp500 import SP500_TICKERS as _SP500_TICKERS
+_TICKER_SET = set([t.upper() for t in _SP500_TICKERS])
 
 
 # ── Category detection ────────────────────────────────────────────────────────
@@ -158,7 +162,7 @@ class FinBERTScorer:
         return _keyword_sentiment(text)
 
 
-_finbert = FinBERTScorer()
+_finbert: FinBERTScorer | None = None
 
 
 # ── Keyword sentiment scorer ──────────────────────────────────────────────────
@@ -204,11 +208,97 @@ def _keyword_sentiment(text: str) -> tuple[float, float]:
 
 
 def _score(text: str) -> tuple[float, float]:
+    # Lazy init: prevents slow startup and HF downloads unless explicitly enabled.
+    global _finbert
+    if not FINBERT_ENABLED:
+        return _keyword_sentiment(text)
+    if _finbert is None:
+        _finbert = FinBERTScorer()
     return _finbert.score(text)
 
 
 def _headline_hash(text: str) -> str:
     return hashlib.sha1(text.strip().lower().encode()).hexdigest()[:12]
+
+
+def _extract_ticker_mentions(text: str) -> list[str]:
+    """
+    Extract $TSLA / (TSLA) / plain TSLA style mentions from text.
+    Uses the scanner universe as a whitelist to keep false positives low.
+    """
+    if not text:
+        return []
+    s = " " + str(text).upper() + " "
+    found: list[str] = []
+
+    # $TSLA style
+    for m in re.findall(r"\\$([A-Z]{1,6})\\b", s):
+        if m in _TICKER_SET and m not in found:
+            found.append(m)
+    # (TSLA) style
+    for m in re.findall(r"\\(([A-Z]{1,6})\\)", s):
+        if m in _TICKER_SET and m not in found:
+            found.append(m)
+    # Bare tickers: avoid matching common words by whitelisting
+    for m in re.findall(r"\\b([A-Z]{1,6})\\b", s):
+        if m in _TICKER_SET and m not in found:
+            found.append(m)
+        if len(found) >= 10:
+            break
+    return found[:10]
+
+
+def _impact_and_urgency(item: NewsItem) -> tuple[float, str, float]:
+    """
+    Compute (impact_score, urgency_tier, vol_prob) from category/priority/sentiment/confidence.
+    0..1 scale; designed for UI ranking + alerts (not trading decisions).
+    """
+    pr = (item.priority or "NORMAL").upper()
+    cat = (item.category or "general").lower()
+    base = 0.15
+    if pr == "HIGH":
+        base += 0.35
+    elif pr == "LOW":
+        base -= 0.05
+
+    cat_boost = {
+        "earnings": 0.25,
+        "deal": 0.30,
+        "macro": 0.25,
+        "regulatory": 0.28,
+        "guidance": 0.22,
+        "bankruptcy": 0.35,
+        "management": 0.22,
+        "dividend": 0.12,
+        "split": 0.10,
+        "analyst": 0.10,
+        "product": 0.08,
+        "partnership": 0.10,
+        "general": 0.0,
+    }.get(cat, 0.0)
+
+    s = float(item.sentiment or 0.0)
+    conf = float(item.confidence or 0.0)
+    sent_amp = min(0.25, abs(s) * 0.25) * (0.35 + min(1.0, conf))
+
+    impact = base + cat_boost + sent_amp
+    # Source weight (best-effort): Benzinga slightly higher for speed/structure
+    src = (item.source or "").upper()
+    rel_w = 1.10 if src.startswith("BENZINGA") else 1.0
+    impact = max(0.0, min(1.0, impact * rel_w))
+
+    # Vol-prob proxy: more weight on tail events
+    vol_prob = max(0.0, min(1.0, (impact ** 1.15)))
+
+    if impact >= 0.78:
+        tier = "T0"
+    elif impact >= 0.55:
+        tier = "T1"
+    elif impact >= 0.30:
+        tier = "T2"
+    else:
+        tier = "T3"
+    return impact, tier, vol_prob
 
 
 def _parse_bz_datetime(*candidates: str | None) -> datetime:
@@ -316,6 +406,9 @@ def _parse_yf_article(art: dict, query_ticker: str) -> tuple[str, str, datetime,
 
 # Cache keyed by ticker, storing (items, expire_monotonic)
 _yf_cache: dict[str, tuple[list[NewsItem], float]] = {}
+# Periodically bust the *active* symbol so Yahoo headlines refresh before YF_NEWS_TTL (tape ages are publish times).
+_last_yf_active_cache_bust_m: float = 0.0
+_YF_ACTIVE_BUST_INTERVAL_S = float(os.getenv("YF_NEWS_ACTIVE_BUST_S", "20"))
 
 
 def _fetch_yf_tier(
@@ -378,6 +471,15 @@ def _fetch_yf_tier(
                 summary      = summary[:600] if summary else "",
                 url          = url,
             )
+            # Intelligence fields
+            mentions = _extract_ticker_mentions(f"{title} {summary or ''}")
+            # Merge related tickers + extracted mentions
+            ni.mentioned_tickers = [t for t in mentions if t]
+            impact, tier, volp = _impact_and_urgency(ni)
+            ni.impact_score = round(float(impact), 4)
+            ni.urgency_tier = tier
+            ni.vol_prob = round(float(volp), 4)
+            ni.reliability_weight = 1.10 if (ni.source or "").upper().startswith("BENZINGA") else 1.0
             fresh.append(ni)
             if h not in seen:
                 seen.add(h)
@@ -488,6 +590,17 @@ async def _fetch_benzinga_tier(
             summary      = bz_summary,
             url          = art.get("url") or art.get("link") or "",
         ))
+        try:
+            ni = items[-1]
+            mentions = _extract_ticker_mentions(f"{title} {bz_summary or ''}")
+            ni.mentioned_tickers = [t for t in mentions if t]
+            impact, tier, volp = _impact_and_urgency(ni)
+            ni.impact_score = round(float(impact), 4)
+            ni.urgency_tier = tier
+            ni.vol_prob = round(float(volp), 4)
+            ni.reliability_weight = 1.10
+        except Exception:
+            pass
 
     if items:
         log.info("Benzinga [%s] %d new articles (tickers: %s)",
@@ -594,6 +707,8 @@ async def unified_news_stream(
         log.info("News feed disabled (ENABLE_NEWS_FEED=false)")
         return
 
+    global _last_yf_active_cache_bust_m
+
     seen: set[str] = set()
     bz_available   = bool(BENZINGA_API_KEY)   # False after hard auth failure
     bz_hard_fail   = False                    # True on 401/403 — stop retrying forever
@@ -602,8 +717,9 @@ async def unified_news_stream(
     last_bz_tier_fetch    = 0.0
 
     log.info(
-        "News stream started: Benzinga=%s  yfinance=always  tiers=indices+portfolio+active+top_stocks",
+        "News stream started: Benzinga=%s  yfinance=%s  tiers=indices+portfolio+active+top_stocks",
         "enabled (key set)" if bz_available else "disabled (no key)",
+        YF_MODE,
     )
 
     async with httpx.AsyncClient() as client:
@@ -613,6 +729,16 @@ async def unified_news_stream(
             # Build tier lists
             active_tickers    = get_tickers()
             portfolio_tickers = get_portfolio_tickers() if get_portfolio_tickers else []
+            # Re-fetch Yahoo news for the active symbol on this cadence (still limited by what Yahoo returns).
+            now_bust = time.monotonic()
+            if now_bust - _last_yf_active_cache_bust_m >= _YF_ACTIVE_BUST_INTERVAL_S:
+                _last_yf_active_cache_bust_m = now_bust
+                try:
+                    at = (active_tickers[0] if active_tickers else "SPY").strip().upper()
+                    if at:
+                        _yf_cache.pop(at, None)
+                except Exception:
+                    pass
             # Pull top names every cycle for volume (yfinance + Benzinga per ticker)
             include_top = True
 
@@ -733,7 +859,7 @@ async def _synthetic_batch(seen: set[str]) -> AsyncIterator[NewsItem]:
     h = _headline_hash(text)
     if h not in seen:
         seen.add(h)
-        yield NewsItem(
+        ni = NewsItem(
             headline     = text,
             source       = "SYNTHETIC",
             published_at = datetime.now(tz=timezone.utc),
@@ -745,6 +871,17 @@ async def _synthetic_batch(seen: set[str]) -> AsyncIterator[NewsItem]:
             priority     = prio,
             ticker_tier  = "index",
         )
+        try:
+            mentions = _extract_ticker_mentions(text)
+            ni.mentioned_tickers = [t for t in mentions if t]
+            impact, tier, volp = _impact_and_urgency(ni)
+            ni.impact_score = round(float(impact), 4)
+            ni.urgency_tier = tier
+            ni.vol_prob = round(float(volp), 4)
+            ni.reliability_weight = 0.9
+        except Exception:
+            pass
+        yield ni
 
 
 # ── Legacy compat shim ────────────────────────────────────────────────────────

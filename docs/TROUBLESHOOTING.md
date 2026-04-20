@@ -6,7 +6,9 @@
 **Check**
 - Is the agent loop running? (UI agent status pill; backend logs)
 - Is llama.cpp reachable at `LLAMA_LOCAL_BASE_URL`?
-- Are you seeing `SYSTEM / ERROR` lines in `logs/xai/reasoning_YYYYMMDD.jsonl`?
+- Are you seeing `SYSTEM / ERROR` rows in the reasoning log (`GET /reasoning_log`)?
+  - By default the log is stored in SQLite (`cache/app.sqlite3` table `xai_log`).
+  - If `XAI_JSONL=1` is enabled, you can also inspect `logs/xai/reasoning_YYYYMMDD.jsonl`.
 
 ### Symptom: `APITimeoutError: Request timed out`
 **Cause**: local LLM request exceeded the configured timeout.

@@ -15,6 +15,8 @@ from agents.config import MODELS
 from agents.llm_providers import chat_llm
 from agents.llm_retry import invoke_llm
 from agents.features import build_chain_analytics
+from agents.data.options_chain_filter import parse_greeks_expiry_str
+from agents.data.opra_client import occ_expiry_as_date
 from agents.schemas import StrategistOutput, parse_and_validate
 from agents.state import (
     AgentDecision, FirmState, OptionRight, OrderSide,
@@ -31,12 +33,7 @@ REGIME-TO-STRATEGY MATRIX (follow this unless contradicted by skew/sentiment):
 │ TRENDING_UP     │ ELEVATED       │ Bull Put Spread (collect premium), Cash-secured Put    │
 │ TRENDING_DOWN   │ ELEVATED       │ Bear Put Spread, Long Put, Protective Collar           │
 │ TRENDING_DOWN   │ EXTREME        │ HOLD or Bear Put Spread (small size)                   │
-│ MEAN_REVERTING  │ ELEVATED       │ Iron Condor, Iron Butterfly, Short Strangle            │
-│ MEAN_REVERTING  │ NORMAL         │ Iron Condor, Butterfly Spread                          │
-│ HIGH_VOL        │ ELEVATED/EXTREME│ Iron Condor (wide wings), HOLD                        │
-│ LOW_VOL         │ LOW            │ Long Straddle, Long Strangle, Calendar Spread          │
-│ UNKNOWN         │ ANY            │ HOLD (insufficient data)                               │
-└─────────────────┴────────────────┴────────────────────────────────────────────────────────┘
+│-────────────────┴────────────────┴────────────────────────────────────────────────────────┘
 
 Skew modifiers:
 - skew_ratio > 1.25 (fear bid): prefer put credit spreads, iron condors weighted to put side
@@ -44,6 +41,10 @@ Skew modifiers:
 - sentiment > 0.4: lean bullish; sentiment < -0.3: lean bearish
 """
 
+# MEAN_REVERTING  │ ELEVATED       │ Iron Condor, Iron Butterfly, Short Strangle            │
+# │ HIGH_VOL        │ ELEVATED/EXTREME│ Iron Condor (wide wings), HOLD                        │
+# │ LOW_VOL         │ LOW            │ Long Straddle, Long Strangle, Calendar Spread          │
+# └─
 SYSTEM_PROMPT = f"""ROLE: Strategist (Strategy selection + proposal assembly)
 You are the strategy constructor for an autonomous options desk. Your job is to choose ONE
 options strategy that fits THIS ticker RIGHT NOW, using the provided context (price/IV/skew/regime,
@@ -55,6 +56,7 @@ SIZING RULES:
 - max_risk (max dollar loss) must be ≤ position_cap_pct × current_nav
 - target_return = max_risk × reward_risk_ratio (aim for ≥ 1.5:1 on debit spreads, ≥ 0.33:1 on credit)
 - Keep it simple: 2-4 legs, qty 1 each (scale up only if max_risk allows 2+)
+- Options prices are per-share; contract notional uses a 100x multiplier: dollars = option_price × qty × 100
 - For credit spreads: max_risk = width_of_spread × 100 − premium_collected × 100
 - For debit spreads: max_risk = net_debit × 100
 
@@ -68,10 +70,16 @@ RESEARCHER DEBATE GUIDANCE:
 - If bear_conviction > bull_conviction by ≥3 → lean bearish or HOLD.
 - If convictions are equal → favour market-neutral (iron condor, butterfly).
 
+TIMING (multi-horizon, not HFT):
+- If `news_timing_regime` is fresh, headline+price narratives may justify directional risk.
+- If stale or none, prefer thesis from `market_bias_score`, movement_signal, iv_regime —
+  do not assume edge from old headlines.
+
 GROUNDING REQUIREMENTS (must follow):
 - In the PROCEED rationale, cite at least 6 concrete fields from context, including:
   underlying_price, market_regime, iv_regime, skew_ratio, aggregate_sentiment,
-  price_change_pct or movement_signal, and position_cap_dollars/max_risk.
+  news_timing_regime or market_bias_score, price_change_pct or movement_signal,
+  and position_cap_dollars/max_risk.
 - You MUST only use OCC symbols from `near_atm_contracts`. Do NOT invent symbols.
 - If `near_atm_contracts` is empty OR you are unsure about strikes/expiry, output HOLD.
 
@@ -101,14 +109,26 @@ Do not output anything except the JSON object."""
 
 
 def strategist_node(state: FirmState) -> FirmState:
-    # Gate on analyst + sentiment confidence
-    if state.analyst_confidence < 0.3 and state.sentiment_confidence < 0.3:
+    # Gate: need specialist conviction OR non-news structure (bias / anomaly)
+    if (
+        state.analyst_confidence < 0.3
+        and state.sentiment_confidence < 0.3
+        and abs(state.market_bias_score) < 0.35
+        and not state.movement_anomaly
+    ):
         state.pending_proposal = None
         state.reasoning_log.append(ReasoningEntry(
             agent="Strategist", action="HOLD",
-            reasoning="Both analyst and sentiment confidence too low (<0.3). Skipping proposal generation.",
-            inputs={"analyst_confidence": state.analyst_confidence,
-                    "sentiment_confidence": state.sentiment_confidence},
+            reasoning=(
+                "Analyst and sentiment confidence low (<0.3) and no strong "
+                "non-news signal (market_bias/anomaly). Skipping proposal generation."
+            ),
+            inputs={
+                "analyst_confidence": state.analyst_confidence,
+                "sentiment_confidence": state.sentiment_confidence,
+                "market_bias_score": state.market_bias_score,
+                "movement_anomaly": state.movement_anomaly,
+            },
             outputs={"skipped": True},
         ))
         return state
@@ -132,6 +152,77 @@ def strategist_node(state: FirmState) -> FirmState:
     # NAV-based sizing guidance
     nav = max(state.risk.current_nav, state.account_equity, 10_000.0)
     position_cap = nav * state.risk.position_cap_pct
+
+    def _compute_mid(bid: float, ask: float) -> float | None:
+        try:
+            bid = float(bid)
+            ask = float(ask)
+        except Exception:
+            return None
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        return round((bid + ask) / 2.0, 2)
+
+    def _estimate_max_loss_usd_from_quotes(proposal: TradeProposal) -> float | None:
+        """
+        Best-effort max loss estimate in USD using mids from latest_greeks.
+        We only use this to detect the common "forgot ×100" unit mistake.
+        """
+        try:
+            gmap = {g.symbol: g for g in (state.latest_greeks or [])}
+            legs = proposal.legs or []
+            if not legs:
+                return None
+
+            # Net premium in USD (+credit, -debit)
+            missing = 0
+            net_usd = 0.0
+            for leg in legs:
+                g = gmap.get(leg.symbol)
+                if not g:
+                    missing += 1
+                    continue
+                m = _compute_mid(getattr(g, "bid", 0.0), getattr(g, "ask", 0.0))
+                if m is None:
+                    missing += 1
+                    continue
+                sign = 1.0 if leg.side == OrderSide.SELL else -1.0
+                net_usd += sign * float(m) * float(leg.qty) * 100.0
+
+            if missing:
+                return None
+
+            # Debit-style: worst case loss ≈ debit paid.
+            if net_usd < 0:
+                return round(abs(net_usd), 2)
+
+            # Credit-style heuristics.
+            credit_usd = max(0.0, net_usd)
+            rights = {l.right for l in legs}
+            expiries = {str(l.expiry or "") for l in legs}
+
+            # Vertical spread: 2 legs, same right+expiry, qty 1 (or same qty).
+            if len(legs) == 2 and len(rights) == 1 and len(expiries) == 1:
+                strikes = sorted([float(l.strike) for l in legs])
+                width = abs(strikes[1] - strikes[0])
+                return round(max(0.0, width * 100.0 - credit_usd), 2)
+
+            # Iron condor: 2 puts + 2 calls, same expiry.
+            puts = [l for l in legs if l.right == OptionRight.PUT]
+            calls = [l for l in legs if l.right == OptionRight.CALL]
+            if len(puts) == 2 and len(calls) == 2 and len(expiries) == 1:
+                put_strikes = sorted([float(l.strike) for l in puts])
+                call_strikes = sorted([float(l.strike) for l in calls])
+                width_put = abs(put_strikes[1] - put_strikes[0])
+                width_call = abs(call_strikes[1] - call_strikes[0])
+                width = max(width_put, width_call)
+                return round(max(0.0, width * 100.0 - credit_usd), 2)
+
+            # Fallback: for unknown credit structures, use a conservative proxy.
+            # This isn't used for trading decisions, only unit-normalization.
+            return round(max(0.0, credit_usd), 2)
+        except Exception:
+            return None
 
     context = {
         "ticker":              state.ticker,
@@ -166,6 +257,16 @@ def strategist_node(state: FirmState) -> FirmState:
         "bear_researcher": {
             "argument":    state.bear_argument[:800] if state.bear_argument else "",
             "conviction":  state.bear_conviction,
+        },
+        "news_timing_regime":    state.news_timing_regime,
+        "news_newest_age_minutes": state.news_newest_age_minutes,
+        "market_bias_score":     round(state.market_bias_score, 4),
+        "tier3_structured_digests": state.tier3_structured_digests[:8],
+        "fundamentals_snapshot": {
+            "pe_ratio": state.fundamentals.get("pe_ratio"),
+            "fwd_pe":   state.fundamentals.get("fwd_pe"),
+            "beta":     state.fundamentals.get("beta"),
+            "sector":   state.fundamentals.get("sector"),
         },
     }
 
@@ -235,6 +336,35 @@ def strategist_node(state: FirmState) -> FirmState:
                     stop_loss_pct   = p.stop_loss_pct,
                     take_profit_pct = p.take_profit_pct,
                 )
+
+                # Normalize common unit mistake: model forgets options are quoted per-share (×100 per contract).
+                # If the proposal looks off by ~100x relative to live mids, correct it deterministically.
+                est_loss = _estimate_max_loss_usd_from_quotes(proposal)
+                try:
+                    mr = float(proposal.max_risk)
+                    tr = float(proposal.target_return)
+                except Exception:
+                    mr = tr = 0.0
+                if est_loss is not None and mr > 0:
+                    # Detect if max_risk likely provided in "option price units" instead of dollars.
+                    if mr < 25 and est_loss >= 100:
+                        scaled = mr * 100.0
+                        rel_err = abs(est_loss - scaled) / max(est_loss, 1.0)
+                        if rel_err <= 0.25:
+                            proposal.max_risk = round(scaled, 2)
+                            # target_return should be in dollars too; scale if it appears similarly small.
+                            if tr > 0 and tr < 250:
+                                proposal.target_return = round(tr * 100.0, 2)
+                            state.reasoning_log.append(ReasoningEntry(
+                                agent="Strategist",
+                                action="NORMALIZED_MULTIPLIER",
+                                reasoning=(
+                                    "Normalized proposal dollars by ×100 contract multiplier "
+                                    f"(estimated_max_loss≈${est_loss:.2f}, reported_max_risk={mr:.2f})."
+                                ),
+                                inputs={"estimated_max_loss_usd": est_loss, "reported_max_risk": mr},
+                                outputs={"normalized_max_risk": proposal.max_risk, "normalized_target_return": proposal.target_return},
+                            ))
                 reasoning  = proposal.rationale
                 confidence = proposal.confidence
                 # Validate max_risk against position cap
@@ -249,6 +379,33 @@ def strategist_node(state: FirmState) -> FirmState:
         decision  = AgentDecision.HOLD
         reasoning = f"Schema validation failed: {response.content[:250]}"
         proposal  = None
+
+    # Final gate: never allow expired contracts into pending_proposal
+    if decision == AgentDecision.PROCEED and proposal is not None:
+        today = __import__("datetime").date.today()
+        expired: list[dict] = []
+        for leg in proposal.legs:
+            sym = str(getattr(leg, "symbol", "") or "").strip()
+            exp_d = occ_expiry_as_date(sym)
+            if exp_d is None:
+                exp_d = parse_greeks_expiry_str(str(getattr(leg, "expiry", "") or ""))
+            if exp_d is not None and exp_d < today:
+                expired.append({"symbol": sym, "expired_on": exp_d.isoformat()})
+        if expired:
+            decision = AgentDecision.HOLD
+            proposal = None
+            confidence = 0.0
+            reasoning = (
+                "Rejected: proposal contains expired option legs. "
+                "Regenerate using only future-dated OCC symbols from near_atm_contracts."
+            )
+            state.reasoning_log.append(ReasoningEntry(
+                agent="Strategist",
+                action="HOLD",
+                reasoning=reasoning,
+                inputs={"expired_legs": expired},
+                outputs={"rejected": True},
+            ))
 
     state.pending_proposal   = proposal if decision == AgentDecision.PROCEED else None
     state.strategy_confidence = confidence

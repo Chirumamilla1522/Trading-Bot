@@ -2,48 +2,31 @@
 Agent Tier Manager
 ==================
 
-Three-tier execution model based on urgency and compute cost:
+Three-tier model (multi-horizon: tens of seconds to hours; not millisecond HFT):
 
 ┌──────────────────────────────────────────────────────────────────────┐
-│  TIER 1  –  ALWAYS ON  (lightweight, no LLM, runs every 30-60 s)   │
+│  TIER 1  –  ALWAYS ON  (lightweight, no LLM, ~30–60 s)               │
 │                                                                      │
-│  SentimentMonitor   : aggregate headline scores → sentiment signal  │
-│  MovementTracker    : EMA cross + vol → price movement signal       │
-│                                                                      │
-│  Both write to firm_state continuously so other agents always have  │
-│  fresh signals without waiting for a full pipeline run.             │
+│  SentimentMonitor  : LLM over structured Tier-2 news + news timing     │
+│  MovementTracker   : price/vol signals + market_bias (non-news bias)   │
 └─────────────────────────────────┬────────────────────────────────────┘
-                                  │ signals exceed trigger thresholds
+                                  │ multi-factor auto-triggers (below)
                                   ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  TIER 2  –  PERIODIC  (scheduled, may call APIs / LLMs)             │
+│  TIER 2  –  PERIODIC  (APIs / LLMs on a schedule)                    │
 │                                                                      │
-│  FundamentalsRefresher : yfinance info → firm_state.fundamentals    │
-│    → every 4 hours (fundamentals rarely change intraday)            │
-│                                                                      │
-│  NewsProcessor : AI-enriches headlines → cross-stock impact map     │
-│    → every 5 min (LLM: sentiment, category, affected tickers)      │
-│                                                                      │
-│  Note: Options chain refresh runs in api_server (15s cycle),        │
-│  not here — it's a data ingestion task, not an agent loop.          │
+│  FundamentalsRefresher — yfinance; fingerprint change → T3 flag      │
+│  NewsProcessor — LLM headlines → news_impact_map                   │
+│  (Options chain lives in api_server 15s task.)                       │
 └─────────────────────────────────┬────────────────────────────────────┘
-                                  │ data ready + T1 signal strong
                                   ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  TIER 3  –  TRIGGERED PIPELINE  (full LLM pipeline, event-driven)   │
+│  TIER 3  –  TRIGGERED LLM GRAPH                                      │
 │                                                                      │
-│  Trigger sources:                                                    │
-│    • Manual  : POST /run_cycle from UI                              │
-│    • Auto    : |sentiment| ≥ 0.40 AND |movement| ≥ 0.30            │
-│    • Scanner : anomaly detected on any S&P 500 stock               │
-│    • Timer   : api_server._cycle_task (60s fallback, skips if T3    │
-│                already ran within cooldown window)                   │
-│                                                                      │
-│  Pipeline (LangGraph):                                               │
-│    ingest_data → options_specialist → sentiment_analyst             │
-│    → bull_researcher → bear_researcher → strategist                │
-│    → risk_manager → [adversarial_debate] → desk_head               │
-│    → trader (autopilot) OR recommend (advisory) → xai_log          │
+│  Auto: sentiment+movement OR technical anomaly OR fundamentals OR     │
+│        market_bias+movement; + manual UI, scanner, api timer.         │
+│  Flow: ingest → options → sentiment → bull/bear → strategist →       │
+│        risk → [debate] → desk_head → trader/recommend → xai_log      │
 └──────────────────────────────────────────────────────────────────────┘
 
 Usage (called from api_server.py on startup):
@@ -67,7 +50,13 @@ log = logging.getLogger(__name__)
 # ── Trigger thresholds ─────────────────────────────────────────────────────────
 T1_SENTIMENT_THRESH  = 0.40   # |score| must exceed this
 T1_MOVEMENT_THRESH   = 0.30   # |signal| must exceed this
+# Non-news / technical auto-run: anomaly + movement, or strong structure + movement
+T3_MOVEMENT_ALONE_THRESH = 0.34
+T3_MARKET_BIAS_THRESH    = 0.42
 T3_COOLDOWN_MINUTES  = 15     # minimum gap between auto T3 runs
+
+# Prior fundamentals fingerprint (module state; compared on each Tier-2 refresh)
+_last_fundamentals_fingerprint: str | None = None
 
 # ── Intervals ──────────────────────────────────────────────────────────────────
 MOVEMENT_INTERVAL_SEC    = 30
@@ -81,53 +70,47 @@ NEWS_PROCESS_INTERVAL_SEC = 2 * 60     # 2 min — AI news analysis cycle
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TIER 1 — SENTIMENT MONITOR (no LLM, just score aggregation)
+#  TIER 1 — SENTIMENT MONITOR (LLM over structured Tier-2 news outputs)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _sentiment_monitor_loop(firm_state: "FirmState") -> None:
     """
-    Lightweight sentiment aggregation from already-cached headline scores.
-    Recomputes the recency-weighted average every 60 s — no LLM call.
-    Signals are written directly to firm_state.sentiment_monitor_score and
-    firm_state.aggregate_sentiment so the UI always has a fresh reading.
+    SentimentMonitor: LLM synthesizes ONE desk score from structured articles
+    (sentiment, confidence, impact_magnitude, digests) produced by Tier-2 NewsProcessor
+    and stored in SQLite / in-memory buffer — not raw keyword headline scores.
+
+    On LLM failure, falls back to a deterministic blend of the same structured fields.
     """
-    from datetime import timezone, timedelta
-    log.info("Tier-1 SentimentMonitor started.")
+    log.info("Tier-1 SentimentMonitor started (structured + LLM).")
     firm_state.tier1_active = True
 
     while True:
         try:
-            now    = datetime.now(timezone.utc)
-            cutoff = now - timedelta(hours=1)
+            from agents.desk_context import update_news_timing_from_feed
+            from agents.sentiment_monitor_llm import run_sentiment_monitor_cycle
 
-            recent = []
-            for n in firm_state.news_feed:
-                if not hasattr(n, "published_at") or n.published_at is None:
-                    continue
-                pub = n.published_at
-                if pub.tzinfo is None:
-                    pub = pub.replace(tzinfo=timezone.utc)
-                if pub >= cutoff:
-                    recent.append(n)
-
-            if recent:
-                def _weight(pub: datetime) -> float:
-                    p = pub if pub.tzinfo else pub.replace(tzinfo=timezone.utc)
-                    age_min = (now - p).total_seconds() / 60.0
-                    return max(0.1, 1.0 - (age_min / 60.0) * 0.9)
-
-                wsum = sum(_weight(n.published_at) * n.sentiment for n in recent)
-                wden = sum(_weight(n.published_at) for n in recent) or 1.0
-                score = round(wsum / wden, 4)
-            else:
-                score = 0.0
+            result = await asyncio.to_thread(
+                run_sentiment_monitor_cycle,
+                firm_state.ticker,
+            )
+            score = float(result.get("desk_sentiment", 0.0))
 
             firm_state.sentiment_monitor_score = score
-            # Keep aggregate_sentiment in sync so the full-LLM agent has a baseline
+            firm_state.sentiment_monitor_confidence = float(result.get("confidence") or 0.0)
+            firm_state.sentiment_monitor_reasoning = str(result.get("reasoning") or "")[:500]
+            firm_state.sentiment_monitor_source = str(result.get("source") or "none")
+
             if abs(score) > abs(firm_state.aggregate_sentiment):
                 firm_state.aggregate_sentiment = score
 
-            log.debug("SentimentMonitor: score=%.3f headlines=%d", score, len(recent))
+            log.debug(
+                "SentimentMonitor: score=%.3f source=%s conf=%.2f",
+                score,
+                firm_state.sentiment_monitor_source,
+                firm_state.sentiment_monitor_confidence,
+            )
+
+            update_news_timing_from_feed(firm_state)
 
         except Exception as exc:
             log.debug("SentimentMonitor error: %s", exc)
@@ -175,6 +158,10 @@ async def _movement_tracker_loop(firm_state: "FirmState") -> None:
                     signals["movement_signal"],
                 )
 
+            from agents.desk_context import update_market_bias_score
+
+            update_market_bias_score(firm_state)
+
         except Exception as exc:
             log.debug("MovementTracker error: %s", exc)
 
@@ -188,9 +175,11 @@ async def _movement_tracker_loop(firm_state: "FirmState") -> None:
 async def _fundamentals_loop(firm_state: "FirmState") -> None:
     """
     Fetches stock fundamentals from yfinance every 4 hours.
-    Fundamentals (P/E, EPS, revenue, analyst targets) rarely change intraday,
-    so a 4-hour refresh cycle is plenty.
+    When the fingerprint of key fields changes, sets fundamentals_material_change
+    so Tier-3 can run a full research pass (valuation / thesis update).
     """
+    global _last_fundamentals_fingerprint
+
     log.info("Tier-2 FundamentalsRefresher started.")
     firm_state.tier2_active = True
 
@@ -201,6 +190,20 @@ async def _fundamentals_loop(firm_state: "FirmState") -> None:
 
             info = await asyncio.to_thread(_fetch_fundamentals, ticker)
             if info:
+                from agents.desk_context import fundamentals_fingerprint
+
+                fp = fundamentals_fingerprint(info)
+                if (
+                    _last_fundamentals_fingerprint is not None
+                    and fp != _last_fundamentals_fingerprint
+                ):
+                    firm_state.fundamentals_material_change = True
+                    log.info(
+                        "Fundamentals fingerprint changed for %s — Tier-3 may auto-trigger.",
+                        ticker,
+                    )
+                _last_fundamentals_fingerprint = fp
+
                 firm_state.fundamentals         = info
                 firm_state.fundamentals_updated = datetime.now(timezone.utc)
                 log.info(
@@ -232,6 +235,9 @@ def _fetch_fundamentals(ticker: str) -> dict:
         else:
             mktcap_fmt = f"${mktcap:,.0f}"
 
+        from agents.data.fundamentals import dividend_yield_from_yfinance_info
+
+        _dy = dividend_yield_from_yfinance_info(info)
         return {
             "name":            info.get("longName", ticker),
             "sector":          info.get("sector", ""),
@@ -247,7 +253,7 @@ def _fetch_fundamentals(ticker: str) -> dict:
             "net_margin":      info.get("profitMargins", 0) or 0,
             "roe":             info.get("returnOnEquity", 0) or 0,
             "beta":            info.get("beta", 0) or 0,
-            "div_yield":       info.get("dividendYield", 0) or 0,
+            "div_yield":       _dy if _dy is not None else 0,
             "52w_high":        info.get("fiftyTwoWeekHigh", 0) or 0,
             "52w_low":         info.get("fiftyTwoWeekLow", 0) or 0,
             "analyst_target":  info.get("targetMeanPrice", 0) or 0,
@@ -316,8 +322,11 @@ async def _news_processor_loop(firm_state: "FirmState") -> None:
 
 async def _t3_watchdog_loop(firm_state: "FirmState") -> None:
     """
-    Checks T1 signals every 60 s. Triggers the full T3 pipeline automatically
-    when both sentiment AND movement signals are strong AND cooldown has passed.
+    Every 60 s: evaluates multi-factor auto-triggers (cooldown-aware).
+
+    Not HFT: horizons are minutes+. Triggers include headline+price alignment,
+    technical anomaly without fresh news, material fundamentals refresh, or
+    strong market_structure + movement.
     """
     log.info("Tier-3 watchdog started.")
 
@@ -329,6 +338,7 @@ async def _t3_watchdog_loop(firm_state: "FirmState") -> None:
 
             sentiment = abs(firm_state.sentiment_monitor_score)
             movement  = abs(firm_state.movement_signal)
+            bias      = abs(firm_state.market_bias_score)
 
             # Check cooldown
             last = firm_state.last_tier3_run
@@ -337,12 +347,31 @@ async def _t3_watchdog_loop(firm_state: "FirmState") -> None:
                 if elapsed < T3_COOLDOWN_MINUTES:
                     continue
 
+            source: str | None = None
             if sentiment >= T1_SENTIMENT_THRESH and movement >= T1_MOVEMENT_THRESH:
+                source = "auto_sentiment_movement"
+            elif firm_state.fundamentals_material_change:
+                source = "auto_fundamentals_change"
+            elif (
+                firm_state.movement_anomaly
+                and movement >= T3_MOVEMENT_ALONE_THRESH
+            ):
+                source = "auto_technical_anomaly"
+            elif bias >= T3_MARKET_BIAS_THRESH and movement >= T1_MOVEMENT_THRESH:
+                source = "auto_market_structure"
+
+            if source:
                 log.info(
-                    "T3 watchdog: triggering pipeline — sentiment=%.2f movement=%.2f",
-                    sentiment, movement,
+                    "T3 watchdog: triggering pipeline — source=%s sen=%.2f move=%.2f "
+                    "bias=%.2f anomaly=%s fundamentals_flag=%s",
+                    source,
+                    sentiment,
+                    movement,
+                    bias,
+                    firm_state.movement_anomaly,
+                    firm_state.fundamentals_material_change,
                 )
-                await trigger_tier3(firm_state, source="auto")
+                await trigger_tier3(firm_state, source=source)
 
         except Exception as exc:
             log.debug("T3 watchdog error: %s", exc)
@@ -376,14 +405,21 @@ async def trigger_tier3(firm_state: "FirmState", source: str = "manual") -> None
         action    = "INFO",
         reasoning = (
             f"Tier-3 pipeline triggered by: {source.upper()}\n"
-            f"Sentiment signal: {firm_state.sentiment_monitor_score:+.3f}  "
-            f"Movement signal: {firm_state.movement_signal:+.3f}  "
-            f"Anomaly: {firm_state.movement_anomaly}"
+            f"Sentiment: {firm_state.sentiment_monitor_score:+.3f}  "
+            f"Movement: {firm_state.movement_signal:+.3f}  "
+            f"Market bias (non-news): {firm_state.market_bias_score:+.3f}  "
+            f"News timing: {firm_state.news_timing_regime}  "
+            f"Newest headline age (min): {firm_state.news_newest_age_minutes}  "
+            f"Anomaly: {firm_state.movement_anomaly}  "
+            f"Fundamentals change pending: {firm_state.fundamentals_material_change}"
         ),
         inputs  = {
-            "source":    source,
-            "sentiment": firm_state.sentiment_monitor_score,
-            "movement":  firm_state.movement_signal,
+            "source":             source,
+            "sentiment":          firm_state.sentiment_monitor_score,
+            "movement":           firm_state.movement_signal,
+            "market_bias_score":  firm_state.market_bias_score,
+            "news_timing_regime": firm_state.news_timing_regime,
+            "fundamentals_flag":  firm_state.fundamentals_material_change,
         },
         outputs = {},
     ))
@@ -398,6 +434,13 @@ async def trigger_tier3(firm_state: "FirmState", source: str = "manual") -> None
             "tier1_active", "tier2_active", "tier3_active",
             "tier3_trigger", "last_tier3_run",
             "news_feed", "news_impact_map",
+            # Background loops / watchdog-owned (do not overwrite from graph snapshot)
+            "fundamentals_material_change",
+            "news_newest_age_minutes", "news_timing_regime", "market_bias_score",
+            "sentiment_monitor_score", "sentiment_monitor_confidence",
+            "sentiment_monitor_reasoning", "sentiment_monitor_source",
+            "movement_signal", "movement_anomaly",
+            "price_change_pct", "momentum", "vol_ratio", "movement_updated",
         }
         for fld in result.model_fields:
             if fld in _SKIP_MERGE:
@@ -414,6 +457,7 @@ async def trigger_tier3(firm_state: "FirmState", source: str = "manual") -> None
         log.error("T3 pipeline failed: %s", exc)
     finally:
         firm_state.tier3_active = False
+        firm_state.fundamentals_material_change = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -465,7 +509,12 @@ def tier_status(firm_state: "FirmState") -> dict:
         "tier1": {
             "active":           firm_state.tier1_active,
             "sentiment_score":  round(firm_state.sentiment_monitor_score, 4),
+            "sentiment_monitor_confidence": round(firm_state.sentiment_monitor_confidence, 4),
+            "sentiment_monitor_source": firm_state.sentiment_monitor_source,
             "movement_signal":  round(firm_state.movement_signal, 4),
+            "market_bias_score": round(firm_state.market_bias_score, 4),
+            "news_timing_regime": firm_state.news_timing_regime,
+            "news_newest_age_minutes": firm_state.news_newest_age_minutes,
             "movement_anomaly": firm_state.movement_anomaly,
             "price_change_pct": round(firm_state.price_change_pct * 100, 3),
             "momentum":         round(firm_state.momentum, 5),
@@ -483,6 +532,7 @@ def tier_status(firm_state: "FirmState") -> dict:
                 if firm_state.fundamentals_updated else None
             ),
             "has_fundamentals":     bool(firm_state.fundamentals),
+            "fundamentals_change_pending": firm_state.fundamentals_material_change,
         },
         "tier3": {
             "active":        firm_state.tier3_active,
@@ -500,6 +550,8 @@ def tier_status(firm_state: "FirmState") -> dict:
         "thresholds": {
             "sentiment": T1_SENTIMENT_THRESH,
             "movement":  T1_MOVEMENT_THRESH,
+            "movement_anomaly": T3_MOVEMENT_ALONE_THRESH,
+            "market_bias": T3_MARKET_BIAS_THRESH,
             "cooldown_minutes": T3_COOLDOWN_MINUTES,
         },
     }

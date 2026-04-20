@@ -44,6 +44,8 @@ _LOCAL_MODEL_ID_LOCK = threading.Lock()
 # ── Load-balancing pool ──────────────────────────────────────────────────────
 
 HEALTH_RECHECK_S = float(os.getenv("LLAMA_LOCAL_HEALTH_RECHECK_S", "60"))
+# Health GET /v1/models — LAN / remote hosts may need >3s; some servers omit /models (404) but chat works
+LLAMA_PROBE_TIMEOUT_S = float(os.getenv("LLAMA_PROBE_TIMEOUT_S", "8.0"))
 
 class _ServerSlot:
     """One entry in the LLM server pool."""
@@ -81,14 +83,34 @@ class _ServerPool:
         return healthy
 
     def _probe_one(self, slot: _ServerSlot) -> bool:
-        """Quick HTTP check on /v1/models."""
+        """
+        Quick HTTP check on ``GET .../v1/models``.
+
+        If the server returns 404/405/501 on ``/models`` but the connection succeeded,
+        we still treat it as healthy: some stacks only expose ``/v1/chat/completions``.
+        """
         try:
             import httpx as _hx
+
             url = f"{slot.url.rstrip('/')}/models"
-            with _hx.Client(timeout=3.0) as cli:
+            with _hx.Client(timeout=LLAMA_PROBE_TIMEOUT_S) as cli:
                 r = cli.get(url)
-            ok = r.status_code < 400
-        except Exception:
+            code = r.status_code
+            if code < 400:
+                ok = True
+            elif code in (404, 405, 501):
+                ok = True
+                log.debug(
+                    "LLM health: %s returned %s on /models — treating as reachable (chat may still work)",
+                    slot.url,
+                    code,
+                )
+            elif code in (502, 503, 504):
+                ok = False
+            else:
+                ok = code < 500
+        except Exception as exc:
+            log.debug("LLM health probe failed %s: %s", slot.url, exc)
             ok = False
         with self._lock:
             slot.healthy = ok

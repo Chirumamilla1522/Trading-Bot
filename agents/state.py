@@ -91,6 +91,18 @@ class NewsItem(BaseModel):
     summary:       str = ""   # article body snippet / abstract
     url:           str = ""   # canonical article link
 
+    # ── Intelligence-first fields (computed server-side) ───────────────────────
+    # Impact score: 0..1 (higher = more likely to move price / require attention)
+    impact_score:  float = 0.0
+    # Urgency tier: T0 (urgent) | T1 (high) | T2 (normal) | T3 (noise)
+    urgency_tier:  str = "T2"
+    # Model/extractor-discovered tickers mentioned in text (beyond headline tags)
+    mentioned_tickers: list[str] = []
+    # Per-source reliability weight (1.0 neutral, >1 more trusted, <1 less trusted)
+    reliability_weight: float = 1.0
+    # Volatility probability proxy (0..1). Derived from impact + category + source.
+    vol_prob:      float = 0.0
+
     @field_validator("published_at", mode="before")
     @classmethod
     def _ensure_utc(cls, v: Any) -> datetime:
@@ -181,6 +193,8 @@ class Recommendation(BaseModel):
     confidence:           float = 0.0
     created_at:           datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     status:               str   = "pending"   # "pending" | "approved" | "dismissed" | "expired"
+    # Set when status moves away from pending (approve / dismiss / expire).
+    resolved_at:          datetime | None = None
 
 
 # ─── Risk metrics ────────────────────────────────────────────────────────────────
@@ -225,7 +239,9 @@ class FirmState(BaseModel):
 
     # News & sentiment
     news_feed:        list[NewsItem] = []
-    aggregate_sentiment: float = 0.0   # rolling 1h window
+    # If set, SentimentAnalyst uses this many hours for headline recency (e.g. dry run ties to --news-hours).
+    sentiment_headline_lookback_hours: float | None = None
+    aggregate_sentiment: float = 0.0   # rolling window — see SentimentAnalyst lookback
 
     # Positions & orders
     open_positions:   list[Position] = []
@@ -269,17 +285,34 @@ class FirmState(BaseModel):
     vol_ratio:          float = 1.0    # recent vol / 10d avg vol
     movement_updated:   datetime | None = None
 
-    # ── Tier-1: Sentiment Monitor signals (updated every ~60s, no LLM) ─────────
-    sentiment_monitor_score: float = 0.0  # running weighted score from cached headlines
+    # ── Tier-1: Sentiment Monitor (LLM synthesis over Tier-2 structured news) ─
+    sentiment_monitor_score: float = 0.0  # desk score [-1..1] from structured pipeline
+    sentiment_monitor_confidence: float = 0.0  # 0..1 from last monitor LLM (or structured fallback)
+    sentiment_monitor_reasoning: str = ""  # short — last cycle (UI / debug)
+    # llm_structured | fallback_structured | none
+    sentiment_monitor_source: str = "none"
+
+    # ── Desk context (Tier-1 + ingest_data; multi-horizon, not HFT) ────────────
+    # Age of the newest headline in the 1h window (minutes); None if no headlines.
+    news_newest_age_minutes: float | None = None
+    # fresh (<15m) | moderate (15–60m) | stale (>60m) | none — drives chase vs risk-first policy
+    news_timing_regime: str = "none"
+    # Non-news bias from movement/momentum/volume [-1..1]; usable when headlines are stale/absent
+    market_bias_score: float = 0.0
 
     # ── Tier-2: Fundamentals snapshot (refreshed every 4h) ──────────────────────
     fundamentals:       dict[str, Any] = Field(default_factory=dict)
     fundamentals_updated: datetime | None = None
+    # Set True when yfinance snapshot fingerprint changes (Tier-2); cleared after T3 consumes it
+    fundamentals_material_change: bool = False
 
     # ── Tier-2: AI-processed news (refreshed every 5min) ─────────────────────
     news_impact_map:    dict[str, Any] = Field(default_factory=dict)
     # Cross-stock impact map: ticker → {total_impact, article_count, relationships}
     # Populated by the news processor loop in tiers.py
+
+    # ── Tier 3 ingest (filled in ingest_data_node; Tier-2 LLM digests for prompts) ─
+    tier3_structured_digests: list[str] = Field(default_factory=list)
 
     # ── Tier metadata (managed by tiers.py) ─────────────────────────────────────
     tier1_active:       bool  = False

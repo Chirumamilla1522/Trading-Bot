@@ -35,7 +35,8 @@
       <span id="agent-status" class="agent-status agent-status-unknown" title="Agent loop status">AGENTS: --</span>
       <span id="regime-badge" class="badge badge-unknown">REGIME: UNKNOWN</span>
       <span id="cb-badge" class="badge badge-ok">CIRCUIT OK</span>
-      <button type="button" id="theme-cycle-btn" class="theme-cycle-btn" title="Cycle experimental UI themes (saved in this browser)">◐ MER</button>
+      <button type="button" id="theme-cycle-btn" class="theme-cycle-btn" title="Cycle experimental UI themes (saved in this browser)">✹ NUKE</button>
+      <button type="button" id="color-mode-btn" class="color-mode-btn" title="Toggle Light/Dark (saved in this browser)">☀ LIGHT</button>
       <button id="kill-btn">⚡ KILL SWITCH</button>
     </div>
   </header>
@@ -320,6 +321,60 @@
           </span>
         </div>
         <div id="news-tape"></div>
+
+        <!-- ══ Data Dashboard (tables) ═══════════════════════════════════════ -->
+        <div class="panel-header mt collapsible collapsed" id="ph-dashboard" data-target="dashboard-body">
+          DATA DASHBOARD
+          <span id="dash-stats" class="panel-header-sub" style="margin-left:auto;">—</span>
+          <span class="ph-arrow">▾</span>
+        </div>
+        <div class="collapsible-body collapsed" id="dashboard-body">
+          <div class="dash-tabs" id="dash-tabs" style="display:flex;gap:6px;align-items:center;margin:8px 0 10px;">
+            <button type="button" class="mini-btn dash-tab dash-tab-active" data-tab="queue">Queue</button>
+            <button type="button" class="mini-btn dash-tab" data-tab="processed">Processed</button>
+            <button type="button" class="mini-btn dash-tab" data-tab="impacts">Impacts</button>
+            <span style="margin-left:auto;display:flex;gap:6px;align-items:center;">
+              <input id="dash-filter" type="text" placeholder="Filter…" class="mini-input" style="width:160px;" />
+              <button type="button" id="dash-refresh" class="mini-btn" title="Refresh dashboard tables">Refresh</button>
+            </span>
+          </div>
+
+          <!-- Queue -->
+          <div class="dash-pane" id="dash-pane-queue">
+            <div class="table-scroll" style="max-height:260px">
+              <table class="data-table">
+                <thead><tr>
+                  <th>PRI</th><th>URG</th><th>IMPACT</th><th>SENT</th><th>CONF</th><th>AGE</th><th>HEADLINE</th><th>SEEN</th>
+                </tr></thead>
+                <tbody id="dash-queue-body"><tr><td colspan="8" class="empty-row">Loading queue…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Processed -->
+          <div class="dash-pane" id="dash-pane-processed" style="display:none">
+            <div class="table-scroll" style="max-height:260px">
+              <table class="data-table">
+                <thead><tr>
+                  <th>TIME</th><th>TICKERS</th><th>CAT</th><th>IMP</th><th>SENT</th><th>CONF</th><th>HEADLINE</th>
+                </tr></thead>
+                <tbody id="dash-processed-body"><tr><td colspan="7" class="empty-row">Loading processed…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Impacts -->
+          <div class="dash-pane" id="dash-pane-impacts" style="display:none">
+            <div class="table-scroll" style="max-height:260px">
+              <table class="data-table">
+                <thead><tr>
+                  <th>TICKER</th><th>TOTAL</th><th>ART</th><th>RELATIONSHIPS</th>
+                </tr></thead>
+                <tbody id="dash-impacts-body"><tr><td colspan="4" class="empty-row">Loading impacts…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 

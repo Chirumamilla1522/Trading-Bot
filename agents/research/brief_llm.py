@@ -28,6 +28,10 @@ You will be given a JSON payload containing:
 Your job is to write a brief that is explicitly grounded in the snapshot (THIS ticker, NOW),
 and to state what changed vs the prior. Do NOT be generic.
 
+STRICTNESS:
+- Use ONLY the provided JSON snapshot + prior fields. Do NOT use outside knowledge, do NOT invent earnings dates.
+- If key snapshot fields are missing/zero/unknown, explicitly say “not provided” and lower confidence.
+
 GROUNDING REQUIREMENTS (must follow):
 - In `thesis_short` or `agent_notes`, cite at least 5 concrete snapshot fields (numbers).
 - `what_changed` must list the top 1-4 deltas vs prior (if prior exists), otherwise say “first pass”.

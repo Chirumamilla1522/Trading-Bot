@@ -2,23 +2,24 @@
 Tier-3 LangGraph Pipeline — Full Research & Execution Graph
 ===========================================================
 
-Tier-1 (SentimentMonitor + MovementTracker) and Tier-2 (FundamentalsRefresher)
-run as always-on background loops managed by tiers.py.
+Tier-1 (SentimentMonitor: LLM on structured Tier-2 news + MovementTracker) and
+Tier-2 (FundamentalsRefresher, NewsProcessor) run as background loops managed by tiers.py.
 
-This file defines Tier-3: the triggered, LLM-heavy research and execution
-pipeline.  It is invoked by:
-  • Manual UI button  → POST /run_cycle
-  • T3 watchdog auto-trigger (tiers.py) when T1 signals align
-  • Scanner anomaly hook
+Tier-3 is the triggered LLM pipeline (multi-horizon, not HFT). Invoked by:
+  • Manual UI → POST /run_cycle
+  • Auto watchdog (sentiment+movement, technical anomaly, fundamentals change,
+    or market structure — see tiers.py)
+  • Scanner / timer hooks
 
 Pipeline flow:
 
   [ingest_data]
+       │  IV surface + regime + desk timing/bias + Tier-2 digests
        │  (gate: circuit breaker / kill switch → early_abort)
        ▼
-  [options_specialist]    ← IV surface + skew + chain analytics
+  [options_specialist]    ← IV surface + skew + chain + desk context
        │
-  [sentiment_analyst]     ← LLM news analysis → sentiment score + themes
+  [sentiment_analyst]     ← Headline LLM, reconciled w/ SentimentMonitor prior
        │
   [bull_researcher]       ← builds the bullish case from market data
        │
@@ -43,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -76,15 +78,22 @@ Market context you MUST use:
 - IV regime:          {iv_regime}  (ATM IV: {iv_atm:.1%})
 - IV skew ratio:      {skew_ratio:.2f}  (>1 = puts expensive = downside fear priced in)
 - Sentiment score:    {sentiment:+.3f}  (-1 bearish … +1 bullish)
+- Non-news bias:      {market_bias:+.3f}  (structure/momentum; relevant when headlines are stale/absent)
+- News timing:        {news_timing}  (newest headline ~{news_age} min; fresh = can react to narrative, stale = do not chase — use risk + structure)
 - Key themes:         {themes}
 - Momentum signal:    {momentum:+.4f}
 - Volume ratio:       {vol_ratio:.2f}x avg
+- Tier-2 structured digests (AI-enriched news lines; may overlap themes): {structured_digests}
 
 Instructions:
 1. Name 3-4 specific bullish catalysts grounded in the numbers above.
 2. State which options strategy benefits most and why (reference IV regime).
 3. Identify the single strongest argument against your case — acknowledge it briefly.
 4. End with: "CONVICTION: X/10" where X is how strongly you believe in the bullish thesis.
+
+STRICTNESS:
+- Use ONLY the fields provided above. Do NOT invent earnings dates, guidance, or fundamentals not present.
+- If regime/IV/news fields are "unknown" or missing, say so and lower conviction.
 
 Be concise (5-7 sentences). Do NOT output JSON."""
 
@@ -104,15 +113,22 @@ Market context:
 - IV regime:          {iv_regime}  (ATM IV: {iv_atm:.1%})
 - IV skew ratio:      {skew_ratio:.2f}
 - Sentiment score:    {sentiment:+.3f}
+- Non-news bias:      {market_bias:+.3f}
+- News timing:        {news_timing}  (newest ~{news_age} min; if stale, prioritise tail risks / mean reversion / fade rather than chasing headline direction)
 - Tail risks:         {tail_risks}
 - Drawdown so far:    {drawdown:.2%}
 - Portfolio delta:    {port_delta:+.3f}
+- Tier-2 structured digests: {structured_digests}
 
 Instructions:
 1. Pick the Bull's 2 weakest points and dismantle them with data.
 2. Name 2-3 concrete downside risks or regime threats.
 3. Suggest what an overly-bearish case would get WRONG (stay calibrated).
 4. End with: "CONVICTION: X/10" where X is how strongly you believe in the bearish thesis.
+
+STRICTNESS:
+- Use ONLY the fields provided above and the Bull argument. Do NOT invent catalysts, dates, or “known” events.
+- If fields are unknown/missing, explicitly say “not provided” and reduce conviction.
 
 Be concise (5-7 sentences). Do NOT output JSON."""
 
@@ -129,6 +145,14 @@ def bull_researcher_node(state: FirmState) -> FirmState:
         temperature=0.3,
     )
 
+    _na = state.news_newest_age_minutes
+    _news_age = f"{_na:.1f}" if _na is not None else "n/a"
+    _dig = (
+        " | ".join(state.tier3_structured_digests[:4])
+        if state.tier3_structured_digests
+        else "none"
+    )
+
     prompt = BULL_RESEARCH_PROMPT.format(
         ticker           = state.ticker,
         price_change_pct = state.price_change_pct * 100,
@@ -137,9 +161,13 @@ def bull_researcher_node(state: FirmState) -> FirmState:
         iv_atm           = state.iv_atm,
         skew_ratio       = state.iv_skew_ratio,
         sentiment        = state.aggregate_sentiment,
+        market_bias      = state.market_bias_score,
+        news_timing      = state.news_timing_regime,
+        news_age         = _news_age,
         themes           = ", ".join(state.sentiment_themes) or "none",
         momentum         = state.momentum,
         vol_ratio        = state.vol_ratio,
+        structured_digests = _dig[:900],
     )
 
     messages = [HumanMessage(content=prompt)]
@@ -158,9 +186,11 @@ def bull_researcher_node(state: FirmState) -> FirmState:
         action    = "HOLD",  # research phase, no trade decision yet
         reasoning = argument,
         inputs    = {
-            "sentiment":        state.aggregate_sentiment,
-            "movement_signal":  state.movement_signal,
-            "regime":           state.market_regime.value,
+            "sentiment":         state.aggregate_sentiment,
+            "movement_signal":   state.movement_signal,
+            "regime":            state.market_regime.value,
+            "news_timing_regime": state.news_timing_regime,
+            "market_bias_score":  state.market_bias_score,
         },
         outputs   = {"conviction": conviction},
     ))
@@ -179,6 +209,14 @@ def bear_researcher_node(state: FirmState) -> FirmState:
         temperature=0.3,
     )
 
+    _na = state.news_newest_age_minutes
+    _news_age = f"{_na:.1f}" if _na is not None else "n/a"
+    _dig = (
+        " | ".join(state.tier3_structured_digests[:4])
+        if state.tier3_structured_digests
+        else "none"
+    )
+
     prompt = BEAR_RESEARCH_PROMPT.format(
         ticker           = state.ticker,
         bull_argument    = state.bull_argument or "(no bull argument provided)",
@@ -188,9 +226,13 @@ def bear_researcher_node(state: FirmState) -> FirmState:
         iv_atm           = state.iv_atm,
         skew_ratio       = state.iv_skew_ratio,
         sentiment        = state.aggregate_sentiment,
+        market_bias      = state.market_bias_score,
+        news_timing      = state.news_timing_regime,
+        news_age         = _news_age,
         tail_risks       = ", ".join(state.sentiment_tail_risks) or "none identified",
         drawdown         = state.risk.drawdown_pct,
         port_delta       = state.risk.portfolio_delta,
+        structured_digests = _dig[:900],
     )
 
     messages = [HumanMessage(content=prompt)]
@@ -227,11 +269,44 @@ def ingest_data_node(state: FirmState) -> FirmState:
     - Vol surface reconstruction from option chain
     - Market regime classification (LOW_VOL / MEAN_REVERTING / TRENDING_* / HIGH_VOL)
     - Full IV metrics: ATM IV, skew ratio (25d put/call), term structure by DTE bucket
+    - News age / timing regime + non-news market bias (aligned with Tier-1 desk_context)
+    - Tier-2 structured ``llm_digest`` lines for ``tier3_structured_digests`` (parallel to headline LLM)
     """
+    _t0 = time.time()
     try:
+        from agents.desk_context import update_market_bias_score, update_news_timing_from_feed
         from agents.features import build_vol_surface, classify_regime, compute_iv_metrics
 
+        # Refresh spot price before any options analytics.
+        # This prevents stale/incorrect `underlying_price` from poisoning near-ATM selection and regime metrics.
+        try:
+            from agents.data.equity_snapshot import fetch_stock_quote
+
+            q = fetch_stock_quote(str(state.ticker or "").upper())
+            last = q.get("last") if isinstance(q, dict) else None
+            if last is not None:
+                last_f = float(last)
+                cur = float(state.underlying_price or 0.0)
+                # Update if missing or materially different (quote is source of truth vs option-strike fallback).
+                if cur <= 0.0 or abs(last_f - cur) / max(last_f, 1.0) >= 0.02:
+                    state.underlying_price = last_f
+        except Exception:
+            pass
+
+        update_news_timing_from_feed(state)
+        update_market_bias_score(state)
+
+        from agents.tier3_context import attach_structured_news_digests
+
+        attach_structured_news_digests(state, limit=10)
+
         if state.latest_greeks:
+            from agents.data.options_chain_filter import filter_greeks_for_agents
+
+            greeks_for_agents = filter_greeks_for_agents(
+                list(state.latest_greeks), state.underlying_price
+            )
+            state.latest_greeks = greeks_for_agents
             state.vol_surface   = build_vol_surface(state.ticker, state.latest_greeks)
             state.market_regime = classify_regime(state.latest_greeks)
             iv = compute_iv_metrics(state.latest_greeks, state.underlying_price)
@@ -250,6 +325,27 @@ def ingest_data_node(state: FirmState) -> FirmState:
         state.iv_atm * 100,
         state.iv_skew_ratio,
     )
+    try:
+        from agents.tracking.mlflow_tracing import log_agent_step
+        log_agent_step(
+            "ingest_data",
+            inputs={
+                "ticker": state.ticker,
+                "underlying_price": float(state.underlying_price or 0.0),
+                "news_feed_count": len(state.news_feed or []),
+                "latest_greeks_in": None,  # not tracked precisely here
+            },
+            outputs={
+                "latest_greeks_count": len(state.latest_greeks or []),
+                "market_regime": getattr(state.market_regime, "value", str(state.market_regime)),
+                "iv_regime": state.iv_regime,
+                "iv_atm": float(state.iv_atm or 0.0),
+                "iv_skew_ratio": float(state.iv_skew_ratio or 0.0),
+            },
+            duration_s=max(0.0, time.time() - _t0),
+        )
+    except Exception:
+        pass
     return state
 
 
@@ -286,6 +382,32 @@ def recommend_node(state: FirmState) -> FirmState:
     if not state.pending_proposal:
         return state
 
+    # Safety: never park expired legs as recommendations (can happen via stale persistence)
+    try:
+        from datetime import date as _date
+        from agents.data.opra_client import occ_expiry_as_date
+        from agents.data.options_chain_filter import parse_greeks_expiry_str
+
+        today = _date.today()
+        expired: list[dict] = []
+        for leg in state.pending_proposal.legs:
+            sym = (leg.symbol or "").strip()
+            exp_d = occ_expiry_as_date(sym) or parse_greeks_expiry_str(str(leg.expiry or ""))
+            if exp_d is not None and exp_d < today:
+                expired.append({"symbol": sym, "expired_on": exp_d.isoformat()})
+        if expired:
+            state.pending_proposal = None
+            state.reasoning_log.append(ReasoningEntry(
+                agent="System",
+                action="INFO",
+                reasoning="Proposal dropped: contains expired legs; not adding to recommendations.",
+                inputs={"expired_legs": expired},
+                outputs={"skipped_recommendation": True},
+            ))
+            return state
+    except Exception:
+        pass
+
     # Build a recommendation from the current pipeline outputs
     last_desk = next(
         (e for e in reversed(state.reasoning_log) if e.agent == "DeskHead"),
@@ -301,6 +423,24 @@ def recommend_node(state: FirmState) -> FirmState:
         confidence          = state.strategy_confidence,
     )
     state.pending_recommendations.append(rec)
+    try:
+        from agents.tracking.mlflow_tracing import log_agent_step
+        log_agent_step(
+            "recommend",
+            inputs={
+                "ticker": state.ticker,
+                "strategy_name": state.pending_proposal.strategy_name if state.pending_proposal else "",
+                "legs_count": len(state.pending_proposal.legs) if state.pending_proposal else 0,
+                "trading_mode": state.trading_mode,
+            },
+            outputs={
+                "recommendation_id": rec.id,
+                "status": rec.status,
+                "pending_recommendations_count": len(state.pending_recommendations or []),
+            },
+        )
+    except Exception:
+        pass
 
     state.reasoning_log.append(ReasoningEntry(
         agent     = "System",

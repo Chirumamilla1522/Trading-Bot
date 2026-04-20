@@ -1,5 +1,13 @@
 """
-OHLC bars for UI charts — Alpaca first (if keys), then Alpha Vantage, then Yahoo; optional synthetic for dev.
+OHLC bars for UI charts.
+
+- ``CHART_HISTORY_PREFERENCE=yfinance_first`` (default): Yahoo Finance for historic bars
+  (intraday caps: 1m ≈ 7d, 5m–1h ≈ 60d per Yahoo; daily ranges use 1d candles). Often delayed ~15m.
+  Alpaca is used if Yahoo returns nothing (fallback chain unchanged).
+- ``CHART_HISTORY_PREFERENCE=alpaca_first``: Alpaca historical bars first when API keys are set,
+  then Alpha Vantage, then Yahoo.
+
+Live last / bid-ask for the quote strip stays on Alpaca (or your quote path in ``api_server``), not this module.
 """
 from __future__ import annotations
 
@@ -18,7 +26,12 @@ log = logging.getLogger(__name__)
 # Short-lived cache: UI polls /bars every ~15s; dedupes bursts when switching tickers or multiple widgets.
 _bars_cache_lock = threading.Lock()
 _bars_cache: dict[tuple[str, str, int], tuple[float, list[dict[str, Any]], str]] = {}
-_BARS_CACHE_TTL_S = float(os.getenv("CHART_BARS_CACHE_TTL_S", "60"))
+# In-memory dedupe; yfinance/Alpaca pulls benefit from a few minutes of reuse.
+_BARS_CACHE_TTL_S = float(os.getenv("CHART_BARS_CACHE_TTL_S", "300"))
+
+# Historic OHLC for charts: "yfinance_first" (default, fewer Alpaca calls; Yahoo may be ~15m delayed)
+# or "alpaca_first" (paid data path, Alpaca then Yahoo fallback).
+_CHART_HIST_PREF = os.getenv("CHART_HISTORY_PREFERENCE", "yfinance_first").strip().lower()
 
 
 def _bars_cache_get(key: tuple[str, str, int]) -> tuple[list[dict[str, Any]], str] | None:
@@ -101,13 +114,19 @@ def _synthetic_bars(ticker: str, n: int, bar_seconds: int) -> list[dict[str, Any
     return out
 
 
-# Multi-day / multi-month **daily** ranges (underlying stock history, not a single calendar day).
+# Multi-day **daily** ranges: value ≈ trading sessions to return (trimmed after fetch).
+# MAX uses Yahoo period=max (decades of daily) then keeps the last N rows for chart performance.
+_MAX_DAILY_BARS = max(1000, min(12000, int(float(os.getenv("CHART_MAX_HISTORY_DAILY_BARS", "8000")))))
+
 _RANGE_DAILY_LIMIT: dict[str, int] = {
     "5D": 7,
     "1M": 22,
     "3M": 66,
     "6M": 126,
     "1Y": 252,
+    "2Y": 504,
+    "5Y": 1260,
+    "MAX": _MAX_DAILY_BARS,
 }
 
 _ET = ZoneInfo("America/New_York")
@@ -154,7 +173,13 @@ def summary_from_bars(bars: list[dict[str, Any]], ticker: str) -> dict[str, Any]
     }
 
 
-def fetch_bars(ticker: str, timeframe: str = "1Day", limit: int = 120) -> tuple[list[dict[str, Any]], str]:
+def fetch_bars(
+    ticker: str,
+    timeframe: str = "1Day",
+    limit: int = 120,
+    *,
+    bypass_disk: bool = False,
+) -> tuple[list[dict[str, Any]], str]:
     """
     Returns (bars, source) where source is e.g. 'alpaca', 'alphavantage', 'yfinance', 'synthetic', or 'no_data'.
 
@@ -167,7 +192,8 @@ def fetch_bars(ticker: str, timeframe: str = "1Day", limit: int = 120) -> tuple[
     t = ticker.upper().strip()
     tf = (timeframe or "1Day").strip()
 
-    # Bar width in seconds (for synthetic spacing only)
+    # Bar width in seconds (for synthetic spacing / Alpaca lookback only).
+    # "1D" = one session of 5m bars — must stay 300, not 86400.
     tf_sec = {
         "1D": 300,
         "1Day": 86400,
@@ -181,7 +207,8 @@ def fetch_bars(ticker: str, timeframe: str = "1Day", limit: int = 120) -> tuple[
     if tf in _RANGE_DAILY_LIMIT:
         n = _RANGE_DAILY_LIMIT[tf]
     else:
-        n = max(10, min(500, int(limit)))
+        # Deep daily history (timeframe=1Day) — respect client limit up to 10k bars.
+        n = max(10, min(10000, int(limit)))
 
     _cache_key = (t, tf, int(limit))
     _cached = _bars_cache_get(_cache_key)
@@ -192,10 +219,41 @@ def fetch_bars(ticker: str, timeframe: str = "1Day", limit: int = 120) -> tuple[
         _bars_cache_put(_cache_key, bars, src)
         return bars, src
 
-    # Intraday: optional Yahoo (`prepost=True`) so charts show pre/regular/post when
-    # Alpaca IEX bars are RTH-centric. Enable with CHART_INTRADAY_USE_YFINANCE=true.
+    # Local SQLite (SP500_TOP50 warmed at startup) — daily ranges only, instant plot.
     if (
-        tf not in _RANGE_DAILY_LIMIT
+        not bypass_disk
+        and tf != "1D"
+        and (tf in _RANGE_DAILY_LIMIT or tf == "1Day")
+    ):
+        try:
+            from agents.data import bars_cache_db as _bcdb
+
+            full, _ts = _bcdb.get_daily_bars(t)
+            if full and len(full) >= 5:
+                if tf in _RANGE_DAILY_LIMIT:
+                    out = full[-n:] if len(full) > n else list(full)
+                else:
+                    cap = max(10, min(10000, int(limit)))
+                    out = full[-cap:] if len(full) > cap else list(full)
+                if out:
+                    return _ret(out, "sqlite_daily")
+        except Exception:
+            pass
+
+    # Prefer Yahoo for chart history when configured (saves Alpaca rate limits; delayed vs broker).
+    if _CHART_HIST_PREF in ("yfinance_first", "yahoo_first", "yf_first"):
+        yf_bars = _yfinance_bars(t, tf, n)
+        if yf_bars:
+            if tf == "1D":
+                yf_bars = _filter_bars_last_et_day(yf_bars)
+            if yf_bars:
+                return _ret(yf_bars, "yfinance")
+
+    # Intraday: optional Yahoo (`prepost=True`) when Alpaca-first so charts show pre/regular/post
+    # when Alpaca IEX bars are RTH-centric. Enable with CHART_INTRADAY_USE_YFINANCE=true.
+    if (
+        _CHART_HIST_PREF not in ("yfinance_first", "yahoo_first", "yf_first")
+        and tf not in _RANGE_DAILY_LIMIT
         and tf != "1Day"
         and os.getenv("CHART_INTRADAY_USE_YFINANCE", "").lower() in ("1", "true", "yes")
     ):
@@ -252,7 +310,9 @@ def fetch_bars(ticker: str, timeframe: str = "1Day", limit: int = 120) -> tuple[
                 # Supply start+end but NO limit — Alpaca returns oldest-first when
                 # limit+start are combined, so we fetch the full window and trim ourselves.
                 end_dt = datetime.now(timezone.utc)
-                start_dt = end_dt - timedelta(days=max(14, n * 3))  # ~2.5× for weekends
+                # ~1.55 calendar days per trading day + buffer; cap multi-decade asks.
+                cal_days = min(365 * 40, max(14, int(n * 1.55) + 30))
+                start_dt = end_dt - timedelta(days=cal_days)
                 req = StockBarsRequest(
                     symbol_or_symbols=[t],
                     timeframe=alpaca_tf,
@@ -262,23 +322,22 @@ def fetch_bars(ticker: str, timeframe: str = "1Day", limit: int = 120) -> tuple[
                 )
             else:
                 end = datetime.now(timezone.utc)
-                # Lookback extended so intraday TFs can span multi-day/multi-month ranges
-                # when the frontend passes a large limit (e.g. 1Y × 1H = ~1764 bars).
-                lookback = {
-                    "1D":    timedelta(days=7),
-                    "1Min":  timedelta(days=10),
-                    "5Min":  timedelta(days=21),
-                    "15Min": timedelta(days=90),   # supports up to 3M range
-                    "1Hour": timedelta(days=400),  # supports up to 1Y range
-                    "1Day":  timedelta(days=450),
-                }.get(tf, timedelta(days=30))
+                # NOTE: Alpaca can return oldest-first when `limit` is combined with `start`.
+                # To reliably get the most recent `n` bars, we request a bounded [start,end] window
+                # WITHOUT `limit`, then we sort/trim client-side.
+                #
+                # Keep the window tight to avoid huge responses.
+                # Add a small day buffer to survive nights/weekends and still include the newest bars.
+                lookback = timedelta(seconds=max(tf_sec * n * 3, 3 * 86400)) + timedelta(days=2)
+                # Hard cap to protect performance (should never be hit for our UI limits).
+                if lookback > timedelta(days=450):
+                    lookback = timedelta(days=450)
                 start = end - lookback
                 req = StockBarsRequest(
                     symbol_or_symbols=[t],
                     timeframe=alpaca_tf,
                     start=start,
                     end=end,
-                    limit=n,
                     feed=_feed,
                 )
             bars_obj = _alpaca_get_stock_bars_retry(client, req, t)
@@ -300,8 +359,24 @@ def fetch_bars(ticker: str, timeframe: str = "1Day", limit: int = 120) -> tuple[
                             pass
                         out.append(row)
                     if out:
+                        out.sort(key=lambda x: int(x.get("time") or 0))
                         if tf == "1D":
                             out = _filter_bars_last_et_day(out)
+                        if len(out) > n:
+                            out = out[-n:]
+                        # Sanity: if intraday bars are stale (e.g. misconfigured data URL / feed),
+                        # fall back to other providers so the UI timeline matches "now".
+                        if tf not in _RANGE_DAILY_LIMIT and tf != "1Day":
+                            try:
+                                last_ts = int(out[-1].get("time") or 0)
+                                if last_ts > 0 and (int(time.time()) - last_ts) > 3 * 86400:
+                                    log.warning(
+                                        "Alpaca bars look stale for %s (%s): last_ts=%s; falling back",
+                                        t, tf, last_ts,
+                                    )
+                                    raise RuntimeError("alpaca_bars_stale")
+                            except Exception:
+                                raise
                         # For daily ranges, Alpaca returns oldest-first across the window;
                         # keep only the most-recent n bars.
                         if tf in _RANGE_DAILY_LIMIT and len(out) > n:
@@ -391,6 +466,9 @@ def _yfinance_bars(ticker: str, timeframe: str, n: int) -> list[dict] | None:
         "3M":  "1d",
         "6M":  "1d",
         "1Y":  "1d",
+        "2Y":  "1d",
+        "5Y":  "1d",
+        "MAX": "1d",
     }
     _YF_PERIOD: dict[str, str] = {
         "5D": "5d",
@@ -398,19 +476,31 @@ def _yfinance_bars(ticker: str, timeframe: str, n: int) -> list[dict] | None:
         "3M": "3mo",
         "6M": "6mo",
         "1Y": "1y",
+        "2Y": "2y",
+        "5Y": "5y",
+        "MAX": "max",  # full Yahoo daily history for the symbol, then trim to last N bars
         # Intraday — yfinance caps intraday history differently; use period
         "1D":    "5d",
         "1Min":  "7d",
         "5Min":  "60d",
         "15Min": "60d",
         "1Hour": "730d",
-        "1Day":  "2y",
+        "1Day":  "5y",  # overridden below from `n` (deep daily history without always pulling max)
     }
 
     interval = _YF_INTERVAL.get(timeframe)
     period   = _YF_PERIOD.get(timeframe)
     if not interval or not period:
         return None
+
+    # Daily bar series (timeframe=1Day): scale Yahoo window to requested depth (faster than always using max).
+    if timeframe == "1Day" and n:
+        if n <= 300:
+            period = "5y"
+        elif n <= 1200:
+            period = "10y"
+        else:
+            period = "max"
 
     try:
         # Include pre/regular/post session bars for intraday (yfinance)

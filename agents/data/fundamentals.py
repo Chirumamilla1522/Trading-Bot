@@ -6,18 +6,70 @@ Data sources:
   - Curated static maps → competitors, depends_on, depended_by
   - Sector-peer fallback using SP500_TOP100 for unknowns
 
-Cache TTL = 1 hour (fundamentals barely change intraday).
+Note: caching is handled at the API layer (SQLite) to keep reads fast while
+refreshing only when values change.
 """
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
 log = logging.getLogger(__name__)
 
-_FUNDAMENTALS_TTL = 3600.0  # 1 hour
-_fundamentals_cache: dict[str, tuple[dict, float]] = {}  # ticker → (data, expire_at)
+
+def dividend_yield_as_decimal(raw: Any) -> float | None:
+    """
+    Yahoo / yfinance ``dividendYield`` is inconsistent: often a **decimal** (e.g. 0.0348
+    for 3.48%) but sometimes a **percent number** (e.g. 1.14 for 1.14%). The UI multiplies
+    by 100 again, so percent-style values must be converted to decimals here.
+    """
+    if raw is None or raw == "N/A":
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v < 0:  # NaN or negative
+        return None
+    if v > 1.0:
+        v = v / 100.0
+    return round(v, 6)
+
+
+def dividend_yield_from_yfinance_info(info: dict[str, Any]) -> float | None:
+    """
+    Best-effort dividend yield as a **decimal** (e.g. 0.04 = 4%).
+
+    Yahoo often populates ``trailingAnnualDividendYield`` correctly while ``dividendYield``
+    may be a percent-style number in the 0–1 range (e.g. 0.4 meaning 0.4%, which would
+    wrongly show as 40% if passed straight to the UI).
+    """
+    if not info:
+        return None
+
+    def _get(k: str) -> Any:
+        v = info.get(k)
+        if v is None or v == "N/A":
+            return None
+        return v
+
+    tr = _get("trailingAnnualDividendYield")
+    if tr is not None:
+        v = dividend_yield_as_decimal(tr)
+        if v is not None:
+            return v
+
+    try:
+        rate = _get("dividendRate")
+        px = _get("currentPrice") or _get("regularMarketPrice")
+        if rate is not None and px is not None:
+            r, p = float(rate), float(px)
+            if p > 0 and r >= 0:
+                return round(r / p, 6)
+    except (TypeError, ValueError):
+        pass
+
+    return dividend_yield_as_decimal(_get("dividendYield"))
 
 
 # ── Curated competitor map ────────────────────────────────────────────────────
@@ -248,7 +300,7 @@ def _yfinance_fetch(ticker: str) -> dict[str, Any]:
         "two_hundred_day_avg": _round(_f("twoHundredDayAverage")),
         # Risk / yield
         "beta":            _round(_f("beta")),
-        "dividend_yield":  _round(_f("dividendYield"), 4),
+        "dividend_yield":  _round(dividend_yield_from_yfinance_info(info), 4),
         "payout_ratio":    _round(_f("payoutRatio"), 4),
         # Size
         "shares_outstanding": _f("sharesOutstanding"),
@@ -322,13 +374,9 @@ def _sector_peers(ticker: str, sector: str, industry: str) -> list[str]:
 def fetch_stock_info(ticker: str) -> dict[str, Any]:
     """
     Full stock info: fundamentals + similar/competitor/dependency data.
-    Cached for FUNDAMENTALS_TTL seconds.
+    This function does not cache; callers can cache the resulting payload.
     """
     t = ticker.upper().strip()
-    now = time.monotonic()
-    cached, expires = _fundamentals_cache.get(t, ({}, 0.0))
-    if cached and now < expires:
-        return cached
 
     fund = _yfinance_fetch(t)
     sector   = fund.get("sector", "")
@@ -349,5 +397,4 @@ def fetch_stock_info(ticker: str) -> dict[str, Any]:
         "data_source":     "yfinance" if fund else "none",
     }
 
-    _fundamentals_cache[t] = (result, time.monotonic() + _FUNDAMENTALS_TTL)
     return result

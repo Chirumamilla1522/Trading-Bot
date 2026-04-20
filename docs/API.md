@@ -19,7 +19,7 @@ Base URL (default): `http://localhost:8000`
   - Latest news items from `FirmState.news_feed` (most recent slice).
 
 - `GET /reasoning_log?tail=500`
-  - Reads today’s JSONL from `logs/xai/`.
+  - Reads from SQLite XAI log (`cache/app.sqlite3` table `xai_log`).
   - `tail` controls max number of rows returned (server-enforced bounds).
 
 - `GET /agent_status`
@@ -42,6 +42,23 @@ There are endpoints for placing orders and syncing positions (see the endpoint l
 
 ### Notes
 
-- The UI primarily uses `/ws` and falls back to polling `/state`, `/reasoning_log`, `/agent_status`.
+- The UI primarily uses REST polling (`/state`, `/reasoning_log`, `/agent_status`) and uses `/ws/market` for market hub updates.
 - If you see only `SYSTEM/ERROR` lines in reasoning, check `docs/TROUBLESHOOTING.md`.
+
+### Options endpoints (filtering rules)
+
+- `GET /options/{ticker}`
+  - Returns the UI options chain for the ticker.
+  - Applies:
+    - **expiry filter** (expiry must be >= today; and DTE <= `OPTIONS_MAX_DTE_DAYS` / agent default)
+    - **strike filter** using asymmetric windows (calls spot→+band, puts −band→spot)
+  - Spot is resolved from `GET /quote/{ticker}` first, so the strike window applies consistently across tickers.
+
+### Recommendations endpoints (expiry guardrails)
+
+- `GET /recommendations`
+  - Returns persisted recommendations enriched with current quote snapshots (when available).
+  - Legs include `expired` + `occ_expiry` when the OCC symbol is expired.
+- `POST /recommendations/{rec_id}/approve`
+  - Refuses to execute recommendations with expired legs or missing quotes.
 

@@ -8,7 +8,9 @@ schema is fixed so deterministic code is safer and faster.
 from __future__ import annotations
 
 import logging
+from datetime import date
 
+from agents.data.opra_client import occ_expiry_as_date
 from agents.state import AgentDecision, FirmState, ReasoningEntry
 
 log = logging.getLogger(__name__)
@@ -75,6 +77,20 @@ def trader_node(state: FirmState) -> FirmState:
         return state
 
     proposal = state.pending_proposal
+
+    for leg in proposal.legs:
+        exp_d = occ_expiry_as_date(leg.symbol)
+        if exp_d is not None and exp_d < date.today():
+            state.reasoning_log.append(ReasoningEntry(
+                agent="Trader", action="ORDER_REJECTED",
+                reasoning=(
+                    f"Leg {leg.symbol} expired on {exp_d.isoformat()}; cannot build limits. "
+                    "Regenerate proposal from the current chain."
+                ),
+                inputs={"symbol": leg.symbol, "expired_on": exp_d.isoformat()},
+                outputs={},
+            ))
+            return state
 
     # Build symbol → greek lookup (first match wins)
     greeks_by_symbol = {g.symbol: g for g in state.latest_greeks}

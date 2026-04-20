@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentic Trading Terminal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="src/terminal.css" />
+</head>
+<body>
+
+  <div id="toast-container"></div>
+
+  <!-- ── Top bar ──────────────────────────────────────────────────────────── -->
+  <header id="topbar">
+    <div id="logo">ATT</div>
+
+    <div id="gobar-wrapper">
+      <input id="gobar" type="text" placeholder="Symbol search  /" autocomplete="off" spellcheck="false"/>
+    </div>
+
+    <!-- Active ticker price block -->
+    <div id="price-pill">
+      <span id="pp-ticker">SPY</span>
+      <span id="pp-price">—</span>
+      <span id="pp-change">—</span>
+    </div>
+
+    <div id="status-row">
+      <span id="clock">--:--:--</span>
+
+      <span id="market-clock-badge" class="topbar-badge market-closed" title="NYSE market status">MKT: --</span>
+
+      <!-- Agent activity indicator (dot + label) -->
+      <span id="agent-status" class="topbar-badge agent-status-unknown" title="Agent loop status">AGENTS: --</span>
+
+      <span id="regime-badge" class="topbar-badge badge-unknown">REGIME: —</span>
+
+      <span id="ws-indicator" class="topbar-badge ws-poll" title="Data feed status">● FEED</span>
+
+      <span id="llm-backend-badge" class="topbar-badge llm-badge-unknown" title="LLM backend">LLM: --</span>
+
+      <span id="cb-badge" class="topbar-badge badge-ok">CIRCUIT OK</span>
+
+      <div id="mode-toggle" class="mode-toggle">
+        <button class="mode-btn mode-active" data-mode="advisory">ADVISORY</button>
+        <button class="mode-btn" data-mode="autopilot">AUTOPILOT</button>
+      </div>
+
+      <button type="button" id="theme-cycle-btn" class="theme-cycle-btn" title="Cycle experimental UI themes (saved in this browser)">◈ HUD</button>
+      <button type="button" id="color-mode-btn" class="color-mode-btn" title="Toggle Light/Dark (saved in this browser)">☀ LIGHT</button>
+      <button id="kill-btn">⚡ KILL</button>
+    </div>
+  </header>
+
+  <!-- ── Tier signal bar (below topbar, above workspace) ─────────────────── -->
+  <div id="tier-bar">
+    <!-- T1 always-on -->
+    <div class="tier-group">
+      <span class="tier-label tier-t1">T1</span>
+      <span class="tier-item" title="Sentiment Monitor — always on">
+        SENT <span id="tb-sentiment" class="tier-val">—</span>
+      </span>
+      <span class="tier-item" title="Movement Tracker — always on">
+        MOV <span id="tb-movement" class="tier-val">—</span>
+      </span>
+      <span id="tb-anomaly" class="tier-anomaly-badge" style="display:none">ANOMALY</span>
+    </div>
+
+    <div class="tier-divider"></div>
+
+    <!-- Bull / Bear conviction from last T3 run -->
+    <div class="tier-group">
+      <span class="tier-label tier-t3">T3</span>
+      <span class="tier-item" title="Bull researcher conviction (last T3 run)">
+        BULL <span id="tb-bull" class="tier-val tier-bull">—</span>
+      </span>
+      <span class="tier-item" title="Bear researcher conviction (last T3 run)">
+        BEAR <span id="tb-bear" class="tier-val tier-bear">—</span>
+      </span>
+      <span id="tb-t3-status" class="tier-t3-status tier-idle">IDLE</span>
+      <button id="tb-run-t3" class="tier-run-btn" title="Trigger T3 research pipeline">▶ RUN</button>
+    </div>
+
+    <div class="tier-divider"></div>
+
+    <span class="tier-item" style="margin-left:auto">
+      <span id="tb-last-run" class="tier-last">—</span>
+    </span>
+  </div>
+
+  <!-- ── Workspace ────────────────────────────────────────────────────────── -->
+  <main id="workspace">
+
+    <div class="cr-shell">
+      <nav class="cr-nav" aria-label="Primary">
+        <button class="cr-nav-btn cr-nav-active" type="button" aria-current="page" title="Control Room">
+          <span class="cr-ico" aria-hidden="true">◈</span><span class="cr-nav-lab">ROOM</span>
+        </button>
+        <button class="cr-nav-btn" type="button" title="Market">
+          <span class="cr-ico" aria-hidden="true">◎</span><span class="cr-nav-lab">MKT</span>
+        </button>
+        <button class="cr-nav-btn" type="button" title="Research">
+          <span class="cr-ico" aria-hidden="true">⌁</span><span class="cr-nav-lab">LAB</span>
+        </button>
+        <button class="cr-nav-btn" type="button" title="Execution">
+          <span class="cr-ico" aria-hidden="true">⇢</span><span class="cr-nav-lab">EXEC</span>
+        </button>
+        <div class="cr-nav-spacer"></div>
+        <button class="cr-nav-btn" type="button" title="Settings">
+          <span class="cr-ico" aria-hidden="true">⟡</span><span class="cr-nav-lab">SET</span>
+        </button>
+      </nav>
+
+      <section class="cr-canvas" aria-label="Canvas">
+        <header class="cr-canvas-top" aria-label="Canvas header">
+          <div class="cr-canvas-title">
+            <div class="cr-title-kicker">CONTROL ROOM</div>
+            <div class="cr-title-main">Agentic Trading</div>
+          </div>
+          <div class="cr-canvas-pills" aria-label="Status pills">
+            <span class="cr-pill"><span class="cr-dot" aria-hidden="true"></span>LIVE</span>
+            <span class="cr-pill">SYNC</span>
+            <span class="cr-pill">SAFE</span>
+          </div>
+        </header>
+
+        <div class="cr-grid" aria-label="Modules">
+          <section class="cr-module cr-module-scan" aria-label="Scanner module">
+
+    <!-- ═══ Scanner ═══════════════════════════════════════════════════════ -->
+    <section id="col-scanner">
+      <div class="panel-header">
+        <span>S&amp;P 500</span>
+        <span id="scanner-count" class="col-header-sub">0 / 0</span>
+      </div>
+      <div id="scanner-controls">
+        <input id="scanner-filter" type="text" placeholder="Filter…" autocomplete="off" />
+        <select id="scanner-sort">
+          <option value="iv">IV ↓</option>
+          <option value="chg">Day % ↓</option>
+          <option value="price">Price ↓</option>
+          <option value="pc">P/C ↓</option>
+          <option value="oi">OI ↓</option>
+          <option value="ticker">A–Z</option>
+        </select>
+      </div>
+      <div id="scanner-table-wrap">
+        <table class="data-table scanner-table" id="scanner-table">
+          <thead><tr>
+            <th>TICKER</th>
+            <th title="Last trade">LAST</th>
+            <th title="Day change">CHG</th>
+            <th title="30d implied vol">IV</th>
+            <th title="Put/Call ratio">P/C</th>
+            <th title="Contracts">CTRS</th>
+          </tr></thead>
+          <tbody id="scanner-body">
+            <tr><td colspan="6" class="empty-row">Scanning…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+          </section>
+
+          <section class="cr-module cr-module-market" aria-label="Market module">
+
+    <!-- ═══ Left — Chart + quote + trades + chain + info ══════════════════ -->
+    <section id="col-left">
+      <div id="col-left-scroll">
+
+      <!-- Chart section -->
+      <div id="underlying-chart-section">
+        <div class="chart-price-header">
+          <span class="chart-ticker-name" id="chart-ticker-label">SPY</span>
+          <span class="chart-last-price"  id="sd-last">—</span>
+          <span class="chart-chg-badge"   id="sd-chg1">—</span>
+          <span class="chart-chg-pct"     id="sd-chgper">—</span>
+          <span class="chart-hl-meta"     id="sd-hl">—</span>
+          <span class="chart-vol-meta"    id="sd-vol">—</span>
+          <span id="ticker-chart-source"  class="chart-src-badge">—</span>
+          <!-- hidden selects for JS compatibility -->
+          <select id="ticker-chart-style" class="chart-style-hidden">
+            <option value="candles" selected>Candles</option>
+            <option value="line">Line</option>
+            <option value="area">Area</option>
+          </select>
+          <select id="ticker-chart-tf" class="chart-style-hidden">
+            <option value="5D" selected>5D</option>
+            <option value="1M">1M</option><option value="3M">3M</option>
+            <option value="6M">6M</option><option value="1Y">1Y</option>
+            <option value="1D">1D</option><option value="1Day">1Day</option>
+            <option value="1Hour">1H</option><option value="15Min">15m</option>
+            <option value="5Min">5m</option><option value="1Min">1m</option>
+          </select>
+        </div>
+
+        <div class="chart-wrap chart-wrap-underlying">
+          <div id="ticker-chart-crosshair" class="chart-crosshair-hint" aria-live="polite"></div>
+          <div id="ticker-chart" class="chart-inner"></div>
+        </div>
+
+        <div class="chart-tf-strip">
+          <span class="chart-strip-label">RANGE</span>
+          <div class="chart-tf-group" id="chart-range-group">
+            <button class="chart-range-btn" data-range="1D">1D</button>
+            <button class="chart-range-btn active" data-range="5D">5D</button>
+            <button class="chart-range-btn" data-range="1M">1M</button>
+            <button class="chart-range-btn" data-range="3M">3M</button>
+            <button class="chart-range-btn" data-range="6M">6M</button>
+            <button class="chart-range-btn" data-range="1Y">1Y</button>
+          </div>
+          <div class="chart-strip-divider"></div>
+          <span class="chart-strip-label">INTERVAL</span>
+          <div class="chart-tf-group" id="chart-interval-group">
+            <button class="chart-interval-btn" data-interval="1m">1m</button>
+            <button class="chart-interval-btn" data-interval="5m">5m</button>
+            <button class="chart-interval-btn" data-interval="15m">15m</button>
+            <button class="chart-interval-btn active" data-interval="1H">1H</button>
+            <button class="chart-interval-btn" data-interval="1D">1D</button>
+          </div>
+          <div class="chart-strip-divider"></div>
+          <div class="chart-style-group">
+            <button class="chart-style-btn chart-style-active" data-style="candles">Candles</button>
+            <button class="chart-style-btn" data-style="line">Line</button>
+            <button class="chart-style-btn" data-style="area">Area</button>
+          </div>
+          <span id="ticker-chart-bar-size" class="chart-bar-size-meta"></span>
+        </div>
+      </div>
+
+      <!-- Live quote strip -->
+      <div id="stock-quote-strip" class="stock-quote-strip">
+        <span class="sq-label">QUOTE</span>
+        <span id="sq-session" class="sq-session"></span>
+        <span id="sq-bid" class="sq-val">—</span>
+        <span class="sq-x">×</span>
+        <span id="sq-ask" class="sq-val">—</span>
+        <span class="sq-sep">|</span>
+        <span id="sq-last" class="sq-val sq-last">—</span>
+        <span class="sq-sep">|</span>
+        <span id="sq-daypct" class="sq-val">—</span>
+        <span id="sq-src" class="sq-src"></span>
+      </div>
+
+      <!-- Live trades section (real Alpaca WebSocket trade stream) -->
+      <div class="panel-header collapsible" id="ph-trading-viz-label">
+        <span>LIVE TRADES</span>
+        <span class="col-header-sub" id="live-trades-sub">enable below</span>
+        <span class="ph-arrow">▾</span>
+      </div>
+      <div class="trading-viz-host" id="trading-viz-host">
+        <div id="trading-viz-root"></div>
+      </div>
+
+      <!-- Options chain -->
+      <div class="panel-header collapsible collapsed" id="ph-chain" data-target="chain-body">
+        <span>OPTIONS CHAIN</span>
+        <span class="ticker-label" id="chain-ticker">SPY</span>
+        <span id="chain-count" class="col-header-sub"></span>
+        <span class="ph-arrow">▾</span>
+      </div>
+      <div class="collapsible-body collapsed" id="chain-body">
+        <div class="chain-toolbar">
+          <div class="chain-filter-group">
+            <button class="chain-cp-btn chain-cp-active" id="cp-all">ALL</button>
+            <button class="chain-cp-btn" id="cp-calls">CALLS</button>
+            <button class="chain-cp-btn" id="cp-puts">PUTS</button>
+          </div>
+          <select id="chain-sort" class="chain-sort-sel">
+            <option value="iv_desc">IV ↓</option>
+            <option value="iv_asc">IV ↑</option>
+            <option value="strike_asc">Strike ↑</option>
+            <option value="strike_desc">Strike ↓</option>
+            <option value="exp_asc">Expiry ↑</option>
+            <option value="delta_desc">|Δ| ↓</option>
+            <option value="bid_desc">Bid ↓</option>
+          </select>
+          <input id="chain-strike-filter" class="chain-strike-input" type="number"
+                 placeholder="Strike…" min="0" step="1"/>
+        </div>
+        <div class="table-scroll chain-table-scroll" id="options-table-wrap">
+          <table class="data-table" id="options-table">
+            <thead><tr>
+              <th class="th-sortable" data-col="symbol">SYMBOL</th>
+              <th class="th-sortable" data-col="exp">EXP</th>
+              <th class="th-sortable" data-col="strike">STRIKE</th>
+              <th>C/P</th><th>BID</th><th>ASK</th>
+              <th class="th-sortable th-sort-active" data-col="iv">IV ▾</th>
+              <th class="th-sortable" data-col="delta">Δ</th>
+              <th>Γ</th><th>Θ</th><th>V</th>
+            </tr></thead>
+            <tbody id="options-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Stock info -->
+      <div id="stock-info-panel" class="stock-info-panel">
+        <div class="si-tabs">
+          <button class="si-tab si-tab-active" data-tab="fundamentals">Fundamentals</button>
+          <button class="si-tab" data-tab="peers">Peers</button>
+          <button class="si-tab" data-tab="ecosystem">Ecosystem</button>
+        </div>
+        <div id="si-fundamentals" class="si-section si-section-active">
+          <div class="si-name-row">
+            <span id="si-name" class="si-name">—</span>
+            <span id="si-sector" class="si-sector-badge">—</span>
+          </div>
+          <div class="si-grid">
+            <div class="si-cell"><span class="si-lab">MKT CAP</span><span id="si-mktcap" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">P/E</span><span id="si-pe" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">FWD P/E</span><span id="si-fpe" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">PEG</span><span id="si-peg" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">EPS TTM</span><span id="si-eps" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">REVENUE</span><span id="si-rev" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">GROSS MGN</span><span id="si-gm" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">NET MGN</span><span id="si-nm" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">BETA</span><span id="si-beta" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">DIV YIELD</span><span id="si-div" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">52W HIGH</span><span id="si-52h" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">52W LOW</span><span id="si-52l" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">ROE</span><span id="si-roe" class="si-val">—</span></div>
+            <div class="si-cell"><span class="si-lab">ANALYST</span><span id="si-rec" class="si-val">—</span></div>
+          </div>
+          <div id="si-desc" class="si-desc">—</div>
+        </div>
+        <div id="si-peers" class="si-section">
+          <div class="si-subsection-label">COMPETITORS</div>
+          <div id="si-competitors" class="si-chips"></div>
+          <div class="si-subsection-label mt4">SIMILAR</div>
+          <div id="si-similar" class="si-chips"></div>
+        </div>
+        <div id="si-ecosystem" class="si-section">
+          <div class="si-subsection-label">UPSTREAM SUPPLIERS</div>
+          <div id="si-depends-on" class="si-chips si-chips-upstream"></div>
+          <div class="si-subsection-label mt4">KEY CUSTOMERS</div>
+          <div id="si-depended-by" class="si-chips si-chips-downstream"></div>
+        </div>
+      </div>
+      </div><!-- /#col-left-scroll -->
+    </section>
+
+          </section>
+
+          <section class="cr-module cr-module-portfolio" aria-label="Portfolio module">
+
+    <!-- ═══ Centre — Account + Portfolio + Positions + News ══════════════ -->
+    <section id="col-centre">
+      <div id="col-centre-scroll">
+
+        <!-- Account strip -->
+        <div id="account-strip" class="account-strip">
+          <div class="metric-card">
+            <div class="metric-label">CASH</div>
+            <div class="metric-value" id="acct-cash">—</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">BUYING POWER</div>
+            <div class="metric-value" id="acct-bp">—</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">EQUITY</div>
+            <div class="metric-value" id="acct-equity">—</div>
+          </div>
+        </div>
+
+        <!-- P&L strip -->
+        <div id="pnl-strip">
+          <div class="metric-card pnl-card" id="card-daily-pnl">
+            <div class="metric-label">DAILY P&amp;L <span class="metric-trend" id="trend-daily-pnl"></span></div>
+            <div class="metric-value" id="daily-pnl">$0.00</div>
+          </div>
+          <div class="metric-card pnl-card" id="card-port-delta">
+            <div class="metric-label">Δ PORTFOLIO <span class="metric-trend" id="trend-port-delta"></span></div>
+            <div class="metric-value" id="port-delta">0.000</div>
+          </div>
+          <div class="metric-card pnl-card" id="card-port-vega">
+            <div class="metric-label">V PORTFOLIO <span class="metric-trend" id="trend-port-vega"></span></div>
+            <div class="metric-value" id="port-vega">0.00</div>
+          </div>
+          <div class="metric-card pnl-card" id="card-drawdown">
+            <div class="metric-label">DRAWDOWN <span class="metric-trend" id="trend-drawdown"></span></div>
+            <div class="metric-value" id="drawdown">0.00%</div>
+          </div>
+          <div class="metric-card pnl-card" id="card-sentiment">
+            <div class="metric-label">SENTIMENT <span class="metric-trend" id="trend-sentiment"></span></div>
+            <div class="metric-value" id="sentiment">0.00</div>
+          </div>
+        </div>
+
+        <!-- Agent Recommendations -->
+        <div class="panel-header" id="ph-recommendations">
+          <span>RECOMMENDATIONS</span>
+          <span id="rec-count" class="panel-header-sub"></span>
+        </div>
+        <div id="recommendations-panel" class="recommendations-panel">
+          <div class="rec-empty">No pending recommendations</div>
+        </div>
+
+        <!-- Stock positions -->
+        <div class="panel-header collapsible" data-target="stock-pos-body-wrap">
+          <span>STOCK POSITIONS</span>
+          <button id="refresh-positions-btn" class="header-action-btn" title="Sync positions">⟳ SYNC</button>
+          <span class="ph-arrow">▾</span>
+        </div>
+        <div class="collapsible-body" id="stock-pos-body-wrap">
+          <div class="table-scroll" style="max-height:130px">
+            <table class="data-table">
+              <thead><tr>
+                <th>SYMBOL</th><th>QTY</th><th>AVG</th><th>MKT VALUE</th><th>U. P&amp;L</th>
+              </tr></thead>
+              <tbody id="stock-positions-body">
+                <tr><td colspan="5" class="empty-row">No positions</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Option positions -->
+        <div class="panel-header collapsible" data-target="opt-pos-body-wrap">
+          <span>OPTION POSITIONS</span>
+          <span class="ph-arrow">▾</span>
+        </div>
+        <div class="collapsible-body" id="opt-pos-body-wrap">
+          <div class="table-scroll" style="max-height:150px">
+            <table class="data-table">
+              <thead><tr>
+                <th>SYMBOL</th><th>C/P</th><th>STRIKE</th><th>EXP</th>
+                <th>QTY</th><th>COST</th><th>P&amp;L</th>
+              </tr></thead>
+              <tbody id="positions-body">
+                <tr><td colspan="7" class="empty-row">No positions</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Portfolio chart -->
+        <div class="panel-header chart-panel-head">
+          <span>PORTFOLIO</span>
+          <div class="chart-toolbar">
+            <select id="portfolio-chart-metric">
+              <option value="equity" selected>Equity (NAV)</option>
+              <option value="daily_pnl">Daily P&amp;L</option>
+              <option value="delta">Δ Portfolio</option>
+              <option value="vega">Vega ($)</option>
+              <option value="drawdown_pct">Drawdown %</option>
+            </select>
+            <span id="portfolio-chart-count" class="chart-meta">—</span>
+          </div>
+        </div>
+        <div id="portfolio-chart" class="chart-wrap chart-wrap-portfolio"></div>
+
+        <!-- News -->
+        <div class="panel-header collapsible" data-target="news-tape">
+          <span>NEWS TAPE</span>
+          <span id="news-feed-status" class="news-feed-badge">●</span>
+          <span id="news-processed-count" class="panel-header-sub"></span>
+          <span class="ph-arrow">▾</span>
+        </div>
+        <div id="news-impact-strip" class="news-impact-strip"></div>
+        <div id="news-tape" class="collapsible-body"></div>
+
+      </div>
+    </section>
+
+          </section>
+
+          <aside class="cr-module cr-module-inspector" aria-label="Inspector module">
+
+    <!-- ═══ Right — Order ticket + Agent log + Blotter ═══════════════════ -->
+    <section id="col-right">
+
+      <!-- Order ticket (pinned) -->
+      <div id="order-ticket" class="order-ticket">
+        <div class="ot-header">
+          ORDER TICKET
+          <div class="ot-tabs">
+            <button class="ot-tab ot-tab-active" data-otab="stock">STOCK</button>
+            <button class="ot-tab" data-otab="option">OPTION</button>
+          </div>
+        </div>
+
+        <div id="ot-stock" class="ot-section ot-section-active">
+          <div class="ot-fields">
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-s-ticker">TICKER</label>
+              <input id="ot-s-ticker" class="ot-input" value="SPY" maxlength="10" autocomplete="off" spellcheck="false"/>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab">SIDE</label>
+              <div class="ot-side-group">
+                <button class="ot-side-btn ot-btn-buy ot-side-active" id="ot-s-side-buy" data-side="buy">BUY</button>
+                <button class="ot-side-btn ot-btn-sell" id="ot-s-side-sell" data-side="sell">SELL</button>
+              </div>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-s-qty">SHARES</label>
+              <input id="ot-s-qty" class="ot-input" type="number" min="1" step="1" value="1"/>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-s-type">TYPE</label>
+              <select id="ot-s-type" class="ot-select">
+                <option value="market">MKT</option>
+                <option value="limit">LMT</option>
+              </select>
+            </div>
+            <div class="ot-field" id="ot-s-lmt-row" style="display:none">
+              <label class="ot-lab" for="ot-s-lmt">LIMIT $</label>
+              <input id="ot-s-lmt" class="ot-input" type="number" min="0.01" step="0.01" placeholder="0.00"/>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-s-tif">TIF</label>
+              <select id="ot-s-tif" class="ot-select">
+                <option value="day">DAY</option>
+                <option value="gtc">GTC</option>
+                <option value="ioc">IOC</option>
+              </select>
+            </div>
+          </div>
+          <div id="ot-s-status" class="ot-status"></div>
+          <button id="ot-s-submit" class="ot-submit ot-submit-buy">PLACE BUY ORDER</button>
+        </div>
+
+        <div id="ot-option" class="ot-section">
+          <div class="ot-opt-preview" id="ot-opt-preview">
+            <span class="ot-opt-hint">← click a row in the options chain</span>
+          </div>
+          <div class="ot-fields">
+            <div class="ot-field ot-field-wide">
+              <label class="ot-lab" for="ot-o-symbol">SYMBOL</label>
+              <input id="ot-o-symbol" class="ot-input ot-mono" readonly placeholder="select from chain"/>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab">SIDE</label>
+              <div class="ot-side-group">
+                <button class="ot-side-btn ot-btn-buy ot-side-active" id="ot-o-side-buy" data-side="buy">BUY</button>
+                <button class="ot-side-btn ot-btn-sell" id="ot-o-side-sell" data-side="sell">SELL</button>
+              </div>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-o-qty">CONTRACTS</label>
+              <input id="ot-o-qty" class="ot-input" type="number" min="1" step="1" value="1"/>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-o-type">TYPE</label>
+              <select id="ot-o-type" class="ot-select">
+                <option value="limit">LMT</option>
+                <option value="market">MKT</option>
+              </select>
+            </div>
+            <div class="ot-field" id="ot-o-lmt-row">
+              <label class="ot-lab" for="ot-o-lmt">LIMIT $</label>
+              <input id="ot-o-lmt" class="ot-input" type="number" min="0.01" step="0.01" placeholder="mid"/>
+            </div>
+            <div class="ot-field">
+              <label class="ot-lab" for="ot-o-tif">TIF</label>
+              <select id="ot-o-tif" class="ot-select">
+                <option value="day">DAY</option>
+                <option value="gtc">GTC</option>
+              </select>
+            </div>
+          </div>
+          <div id="ot-o-status" class="ot-status"></div>
+          <button id="ot-o-submit" class="ot-submit ot-submit-buy">PLACE BUY ORDER</button>
+        </div>
+      </div>
+
+      <!-- Scrollable right area -->
+      <div id="col-right-scroll">
+
+        <!-- Agent reasoning log -->
+        <div class="panel-header">
+          <span>AGENT LOG</span>
+          <span id="agent-indicator" class="agent-dot dot-idle"></span>
+        </div>
+        <div id="reasoning-panel"></div>
+
+        <!-- Order blotter -->
+        <div class="panel-header collapsible" data-target="blotter-body">
+          <span>ORDER BLOTTER</span>
+          <button id="refresh-orders-btn" class="header-action-btn blotter-refresh-btn" title="Refresh">↺</button>
+          <span class="ph-arrow">▾</span>
+        </div>
+        <div class="collapsible-body" id="blotter-body">
+          <div class="table-scroll" style="max-height:220px">
+            <table class="data-table">
+              <thead><tr>
+                <th>TIME</th><th>SYMBOL</th><th>SIDE</th><th>QTY</th>
+                <th>TYPE</th><th>PRICE</th><th>STATUS</th><th></th>
+              </tr></thead>
+              <tbody id="orders-body"><tr><td colspan="8" class="empty-row">No orders</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+          </aside>
+        </div>
+
+        <footer class="cr-timeline" aria-label="Activity timeline">
+          <div class="cr-tl-item cr-tl-live"><span class="cr-tl-dot" aria-hidden="true"></span><span class="cr-tl-lab">FEED</span></div>
+          <div class="cr-tl-item"><span class="cr-tl-dot" aria-hidden="true"></span><span class="cr-tl-lab">SCANNER</span></div>
+          <div class="cr-tl-item"><span class="cr-tl-dot" aria-hidden="true"></span><span class="cr-tl-lab">RESEARCH</span></div>
+          <div class="cr-tl-item"><span class="cr-tl-dot" aria-hidden="true"></span><span class="cr-tl-lab">ORDERS</span></div>
+          <div class="cr-tl-spacer"></div>
+          <div class="cr-tl-item cr-tl-quiet"><span class="cr-tl-dot" aria-hidden="true"></span><span class="cr-tl-lab">AUTOPILOT</span></div>
+        </footer>
+      </section>
+    </div>
+  </main>
+
+  <!-- News modal -->
+  <div id="news-modal" class="news-modal-overlay" role="dialog" aria-modal="true" hidden>
+    <div class="news-modal-card">
+      <div class="news-modal-header">
+        <div class="news-modal-meta" id="news-modal-meta"></div>
+        <button class="news-modal-close" id="news-modal-close">✕</button>
+      </div>
+      <h2 class="news-modal-headline" id="news-modal-headline"></h2>
+      <div class="news-modal-badges" id="news-modal-badges"></div>
+      <div class="news-modal-summary" id="news-modal-summary"></div>
+      <div class="news-modal-footer" id="news-modal-footer"></div>
+    </div>
+  </div>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>

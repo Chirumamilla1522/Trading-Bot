@@ -6,14 +6,16 @@ Run from project root: ``python3 agents/api_server.py`` or ``python -m agents.ap
 Endpoints:
   GET  /state              – FirmState JSON + `agent_runtime` (UI polling)
   GET  /news               – latest 50 news items
-  GET  /reasoning_log      – today's XAI log
+  GET  /reasoning_log      – today's XAI log (?tail=…&agent=ExactAgentId optional)
   GET  /scanner            – S&P 500 options scanner (?sort=iv|pc|oi|ticker|price|chg) + live quotes
   GET  /scanner/quotes     – live last / change only (fast; used for 1 Hz price refresh)
   GET  /scanner/tickers    – full list of tracked tickers
+  GET  /quotes/benchmarks  – live last / day %% for index & sector ETF strip (roster prefix order)
   GET  /options/{ticker}   – options chain for a specific ticker (drilldown)
   GET  /bars/{ticker}      – Underlying stock OHLC + summary (Alpaca → Alpha Vantage → Yahoo when configured)
   GET  /quote/{ticker}     – Stock last / day change (Alpaca snapshot → Alpha Vantage → Yahoo; AV is delayed)
   GET  /stock_info/{ticker}– Fundamentals, peers, competitors, and dependency map (yfinance)
+  GET  /perception/{ticker} — Phases 0–2 perception bundle (technical, fundamental, events, sentiment, news)
   WS   /ws/market          – Alpaca trades + quotes for embedded L2/L3 panel (see agents/data/alpaca_market_bridge.py)
   GET  /portfolio_series   – rolling NAV / greeks samples for portfolio chart
   POST /set_ticker         – change active ticker (also triggers drilldown cache)
@@ -34,10 +36,11 @@ if str(_project_root) not in _sys.path:
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, date, timezone
 from dataclasses import dataclass, asdict
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -74,6 +77,10 @@ _scanner = SP500Scanner()
 
 # Rolling snapshots for portfolio / Greeks charts (UI polls /portfolio_series)
 _PORTFOLIO_HISTORY: deque[dict] = deque(maxlen=2000)
+
+# Targeted option-leg quote prewarm cache (avoid hammering Alpaca on /recommendations poll).
+# symbol -> last_prewarm_unix
+_LEG_QUOTE_PREWARM_AT: dict[str, float] = {}
 
 # ── WebSocket connection manager ──────────────────────────────────────────────
 
@@ -144,6 +151,8 @@ class _WSManager:
                     "t1_active":         firm_state.tier1_active,
                     "t3_active":         firm_state.tier3_active,
                     "sentiment_signal":  round(firm_state.sentiment_monitor_score, 4),
+                    "sentiment_monitor_confidence": round(firm_state.sentiment_monitor_confidence, 4),
+                    "sentiment_monitor_source":     firm_state.sentiment_monitor_source,
                     "movement_signal":   round(firm_state.movement_signal, 4),
                     "movement_anomaly":  firm_state.movement_anomaly,
                     "price_change_pct":  round(firm_state.price_change_pct * 100, 3),
@@ -249,23 +258,38 @@ async def _post_order_sync():
         log.debug("post-order sync error: %s", e)
 
 
+async def _persist_firm_state() -> None:
+    """Write firm_state snapshot (includes recommendation history when configured)."""
+    try:
+        from agents.state_persistence import save_state
+
+        await asyncio.to_thread(save_state, firm_state)
+    except Exception:
+        pass
+
+
 async def _portfolio_history_task():
-    """Append NAV / greeks points for charting (~every 20s)."""
+    """Append NAV / greeks points for charting (~every 20s); also writes SQLite for restart durability."""
     while True:
         await asyncio.sleep(20)
         try:
             r = firm_state.risk
             nav = float(r.current_nav or r.opening_nav or 0.0)
-            _PORTFOLIO_HISTORY.append(
-                {
-                    "time": time.time(),
-                    "equity": nav,
-                    "delta": float(r.portfolio_delta),
-                    "vega": float(r.portfolio_vega),
-                    "daily_pnl": float(r.daily_pnl),
-                    "drawdown_pct": float(r.drawdown_pct),
-                }
-            )
+            row = {
+                "time": time.time(),
+                "equity": nav,
+                "delta": float(r.portfolio_delta),
+                "vega": float(r.portfolio_vega),
+                "daily_pnl": float(r.daily_pnl),
+                "drawdown_pct": float(r.drawdown_pct),
+            }
+            _PORTFOLIO_HISTORY.append(row)
+            try:
+                from agents.data.portfolio_history_db import append_portfolio_point
+
+                await asyncio.to_thread(append_portfolio_point, row)
+            except Exception as db_exc:
+                log.debug("portfolio_history_db append: %s", db_exc)
         except Exception as e:
             log.debug("portfolio snapshot skipped: %s", e)
 
@@ -288,8 +312,11 @@ class AgentRuntimeStatus:
 
     def to_dict(self) -> dict:
         now = time.time()
+        from agents.config import llm_models_snapshot
+
         d = asdict(self)
         d["now"] = now
+        d["llm_models"] = llm_models_snapshot()
         # Use > 0, not truthiness: 0.0 is a valid float but means "never set" here
         d["age_since_success_s"] = (
             (now - self.last_success_at) if self.last_success_at > 0 else None
@@ -324,10 +351,29 @@ async def _tick_ingestion_task():
             log.info("Active ticker changed to %s – fetching options chain", ticker)
         try:
             snaps = await asyncio.to_thread(feed._fetch_snapshots, ticker)
-            firm_state.latest_greeks = snaps
             if snaps:
                 atm = min(snaps, key=lambda g: abs(abs(g.delta) - 0.5))
-                firm_state.underlying_price = (atm.bid + atm.ask) / 2 or atm.strike
+                # Prefer stock quote for spot; only fall back to option-derived proxy.
+                spot = None
+                try:
+                    from agents.data.equity_snapshot import fetch_stock_quote
+
+                    q = await asyncio.to_thread(fetch_stock_quote, str(ticker or "").upper())
+                    if isinstance(q, dict) and q.get("last") is not None:
+                        spot = float(q["last"])
+                except Exception:
+                    spot = None
+                if not spot or spot <= 0:
+                    mid = (atm.bid + atm.ask) / 2 if (atm.bid or atm.ask) else 0.0
+                    spot = float(mid or atm.strike or 0.0)
+                firm_state.underlying_price = float(spot or 0.0)
+                from agents.data.options_chain_filter import filter_greeks_for_agents
+
+                firm_state.latest_greeks = filter_greeks_for_agents(
+                    snaps, firm_state.underlying_price
+                )
+            else:
+                firm_state.latest_greeks = []
         except Exception as e:
             log.warning("Tick ingestion error for %s: %s", ticker, e)
         await asyncio.sleep(15)
@@ -442,6 +488,11 @@ async def _news_task():
 
     async for item in unified_news_stream(_current_tickers, _portfolio_tickers):
         firm_state.news_feed.append(item)
+        try:
+            from agents.data.news_priority_queue import get_queue
+            get_queue().push(item)
+        except Exception as _exc:
+            log.debug("NewsPriorityQueue push failed: %s", _exc)
         if len(firm_state.news_feed) > 300:
             # Keep last 300 but always preserve HIGH-priority items
             highs  = [n for n in firm_state.news_feed if n.priority == "HIGH"]
@@ -453,6 +504,17 @@ async def _news_task():
             item.source, item.category, item.priority,
             item.sentiment, item.headline[:60],
         )
+        # Fast-track: urgent news jumps to UI immediately via /ws (delta update)
+        try:
+            if getattr(item, "urgency_tier", "T2") == "T0":
+                await _ws_manager.broadcast({
+                    "type": "news",
+                    "tier": "T0",
+                    "item": item.model_dump(mode="json"),
+                    "ts": time.time(),
+                })
+        except Exception:
+            pass
 
 
 async def _run_one_cycle(ticker_override: str | None = None):
@@ -465,13 +527,31 @@ async def _run_one_cycle(ticker_override: str | None = None):
         log.debug("Cycle already in progress — skipping")
         return
     async with _cycle_lock:
+        cycle_err = None
+        cycle_run_started = False
         original_ticker = firm_state.ticker
         if ticker_override:
             firm_state.ticker = ticker_override
+        # Ensure underlying_price is current for the active ticker before running the graph.
+        try:
+            from agents.data.equity_snapshot import fetch_stock_quote
+
+            q = await asyncio.to_thread(fetch_stock_quote, str(firm_state.ticker or "").upper())
+            if isinstance(q, dict) and q.get("last") is not None:
+                firm_state.underlying_price = float(q["last"])
+        except Exception:
+            pass
 
         agent_status.in_progress = True
         agent_status.last_cycle_started_at = time.time()
         try:
+            # Optional MLflow parent run for this cycle (enables per-agent nested runs).
+            try:
+                from agents.tracking.mlflow_tracing import start_cycle_run
+                cycle_run_started = bool(start_cycle_run(firm_state))
+            except Exception:
+                cycle_run_started = False
+
             result, cycle_err = await run_cycle_async(firm_state)
             for fld in FirmState.model_fields:
                 setattr(firm_state, fld, getattr(result, fld))
@@ -500,6 +580,7 @@ async def _run_one_cycle(ticker_override: str | None = None):
             except Exception:
                 pass
         except Exception as e:
+            cycle_err = e
             agent_status.cycles_total += 1
             agent_status.cycles_error += 1
             agent_status.last_error_at = time.time()
@@ -515,6 +596,12 @@ async def _run_one_cycle(ticker_override: str | None = None):
             agent_status.last_cycle_duration_s  = max(
                 0.0, agent_status.last_cycle_finished_at - agent_status.last_cycle_started_at
             )
+            try:
+                if cycle_run_started:
+                    from agents.tracking.mlflow_tracing import end_cycle_run
+                    end_cycle_run(firm_state, cycle_err, agent_status.last_cycle_duration_s)
+            except Exception:
+                log.debug("MLflow cycle log skipped", exc_info=True)
             if ticker_override:
                 firm_state.ticker = original_ticker
 
@@ -602,9 +689,165 @@ async def _ws_broadcast_task():
         await _ws_manager.push_state()
 
 
+async def _ws_quote_push_task():
+    """
+    Push active ticker quote to UI via /ws.
+    Goal: remove the “wait for REST poll” feel on ticker switches.
+    Rate limited (default 1s) to avoid hammering providers.
+    """
+    from agents.data.equity_snapshot import fetch_stock_quote
+
+    min_s = float(os.getenv("WS_QUOTE_MIN_S", "1.0"))
+    last_sent_t = ""
+    last_sent_at = 0.0
+    last_payload = None
+
+    while True:
+        await asyncio.sleep(0.10)
+        t = (firm_state.ticker or "").upper().strip()
+        if not t:
+            continue
+        now = time.time()
+        if t == last_sent_t and (now - last_sent_at) < min_s:
+            continue
+
+        try:
+            q = await asyncio.to_thread(fetch_stock_quote, t)
+        except Exception:
+            continue
+
+        try:
+            from agents.data.warehouse.postgres import enqueue_quote
+
+            enqueue_quote(
+                t,
+                {
+                    "bid": q.get("bid"),
+                    "ask": q.get("ask"),
+                    "last": q.get("last"),
+                    "prev_close": q.get("prev_close"),
+                    "change_pct": q.get("change_pct"),
+                    "source": q.get("source"),
+                },
+            )
+        except Exception:
+            pass
+
+        payload = {
+            "type": "quote",
+            "ticker": t,
+            "bid": q.get("bid"),
+            "ask": q.get("ask"),
+            "last": q.get("last"),
+            "prev_close": q.get("prev_close"),
+            "change_pct": q.get("change_pct"),
+            "source": q.get("source"),
+            "session": q.get("session"),
+            "trade_time": q.get("trade_time"),
+            "ts": time.time(),
+        }
+
+        # Avoid spamming identical payloads
+        if payload == last_payload and t == last_sent_t:
+            last_sent_at = now
+            continue
+
+        last_payload = payload
+        last_sent_t = t
+        last_sent_at = now
+        try:
+            await _ws_manager.broadcast(payload)
+        except Exception:
+            pass
+
+
 async def _scanner_task():
     """Continuously scans all S&P 500 tickers in the background."""
     await _scanner.run_forever()
+
+
+async def _warm_fundamentals_cache_task():
+    """
+    Warm SQLite fundamentals cache in the background so UI clicks are instant.
+    Rate-limited and low-concurrency to avoid hammering Yahoo/yfinance.
+    """
+    from agents.data.fundamentals import fetch_stock_info
+    from agents.data.fundamentals_db import get_stock_info_cached, upsert_stock_info
+    from agents.data.sp500 import SP500_TOP50
+
+    # Delay a bit so startup critical paths (UI, state sync) aren't impacted.
+    await asyncio.sleep(4)
+
+    max_to_warm = int(float(os.getenv("FUNDAMENTALS_WARM_MAX", "40")))
+    per_item_delay_s = float(os.getenv("FUNDAMENTALS_WARM_DELAY_S", "0.35"))
+
+    def _candidate_tickers() -> list[str]:
+        out: list[str] = []
+        try:
+            out.append(str(firm_state.ticker or "SPY").upper())
+        except Exception:
+            pass
+        try:
+            for p in list(getattr(firm_state, "stock_positions", []) or []):
+                t = getattr(p, "ticker", None) or getattr(p, "symbol", None)
+                if t:
+                    out.append(str(t).upper())
+        except Exception:
+            pass
+        try:
+            for p in list(getattr(firm_state, "open_positions", []) or []):
+                t = getattr(p, "ticker", None) or getattr(p, "symbol", None)
+                if t:
+                    out.append(str(t).upper())
+        except Exception:
+            pass
+        try:
+            out.extend([str(t).upper() for t in SP500_TOP50[: max(0, max_to_warm - len(out))]])
+        except Exception:
+            pass
+        # De-dupe while preserving order
+        dedup = []
+        seen = set()
+        for t in out:
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            dedup.append(t)
+        return dedup[:max_to_warm]
+
+    tickers = _candidate_tickers()
+    if not tickers:
+        return
+
+    warmed = 0
+    for t in tickers:
+        try:
+            cached, fetched_at = await asyncio.to_thread(get_stock_info_cached, t)
+            if cached and fetched_at:
+                continue
+            fresh = await asyncio.to_thread(fetch_stock_info, t)
+            await asyncio.to_thread(upsert_stock_info, t, fresh)
+            warmed += 1
+        except Exception:
+            pass
+        await asyncio.sleep(per_item_delay_s)
+
+    if warmed:
+        log.info("Fundamentals cache warmed: %d tickers", warmed)
+
+
+async def _warm_daily_bars_cache_task():
+    """
+    Download Yahoo **daily** OHLC for SP500_TOP50 into SQLite so /bars serves plots
+    without a per-click network call (fixes flaky desktop WebView “Load failed”).
+    """
+    await asyncio.sleep(2)
+    try:
+        from agents.data.bars_cache_db import warm_sp500_top50_daily
+
+        await asyncio.to_thread(warm_sp500_top50_daily)
+    except Exception as e:
+        log.warning("Daily bars cache warm skipped: %s", e)
 
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
@@ -625,19 +868,121 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.debug("state load skipped: %s", e)
 
-    # Seed portfolio chart
+    # Guardrails: drop expired greeks + mark expired recommendations after restore.
     try:
-        r0 = firm_state.risk
-        _PORTFOLIO_HISTORY.append({
-            "time": time.time(),
-            "equity": float(r0.current_nav or r0.opening_nav or 0.0),
-            "delta": float(r0.portfolio_delta),
-            "vega": float(r0.portfolio_vega),
-            "daily_pnl": float(r0.daily_pnl),
-            "drawdown_pct": float(r0.drawdown_pct),
-        })
-    except Exception:
-        pass
+        from datetime import date as _date
+        from agents.data.options_chain_filter import parse_greeks_expiry_str
+        from agents.data.opra_client import occ_expiry_as_date
+
+        today = _date.today()
+        # latest_greeks: remove anything clearly expired
+        cleaned = []
+        for g in (firm_state.latest_greeks or []):
+            sym = str(getattr(g, "symbol", "") or "").strip()
+            exp_d = occ_expiry_as_date(sym) or parse_greeks_expiry_str(str(getattr(g, "expiry", "") or ""))
+            if exp_d is not None and exp_d < today:
+                continue
+            cleaned.append(g)
+        firm_state.latest_greeks = cleaned
+
+        # open_positions: drop expired legs so agents never see them
+        try:
+            pos_clean = []
+            for p in (firm_state.open_positions or []):
+                exp_d = parse_greeks_expiry_str(str(getattr(p, "expiry", "") or ""))
+                if exp_d is not None and exp_d < today:
+                    continue
+                pos_clean.append(p)
+            firm_state.open_positions = pos_clean
+        except Exception:
+            pass
+
+        # pending_proposal: clear if it contains any expired leg
+        try:
+            prop = getattr(firm_state, "pending_proposal", None)
+            if prop and getattr(prop, "legs", None):
+                bad = False
+                for leg in prop.legs:
+                    sym = str(getattr(leg, "symbol", "") or "").strip()
+                    exp_d = occ_expiry_as_date(sym) or parse_greeks_expiry_str(str(getattr(leg, "expiry", "") or ""))
+                    if exp_d is not None and exp_d < today:
+                        bad = True
+                        break
+                if bad:
+                    firm_state.pending_proposal = None
+        except Exception:
+            pass
+
+        # pending_recommendations: remove any rec that contains expired legs
+        try:
+            recs = list(firm_state.pending_recommendations or [])
+            kept = []
+            for r in recs:
+                legs = (r.proposal.legs or []) if getattr(r, "proposal", None) else []
+                expired = False
+                for leg in legs:
+                    sym = str(getattr(leg, "symbol", "") or "").strip()
+                    exp_d = occ_expiry_as_date(sym) or parse_greeks_expiry_str(str(getattr(leg, "expiry", "") or ""))
+                    if exp_d is not None and exp_d < today:
+                        expired = True
+                        break
+                if not expired:
+                    kept.append(r)
+            firm_state.pending_recommendations = kept
+        except Exception:
+            pass
+
+        # Persist the cleaned snapshot so old expired contracts don't keep returning.
+        try:
+            from agents.state_persistence import save_state
+
+            await asyncio.to_thread(save_state, firm_state)
+        except Exception:
+            pass
+    except Exception as e:
+        log.debug("post-restore expiry cleanup skipped: %s", e)
+
+    # Optional PostgreSQL warehouse: durable copy of pulled data via background queue (SQLite stays UI L1).
+    try:
+        from agents.data.warehouse import (
+            ensure_schema,
+            is_postgres_enabled,
+            start_warehouse_writer,
+        )
+
+        wh_auto = os.getenv("WAREHOUSE_AUTO_SCHEMA", "1").strip().lower() not in ("0", "false", "no")
+        if is_postgres_enabled():
+            if wh_auto:
+                try:
+                    await asyncio.to_thread(ensure_schema)
+                except Exception as e:
+                    log.warning("PostgreSQL warehouse schema ensure failed: %s", e)
+            start_warehouse_writer()
+            log.info("PostgreSQL warehouse writer started (non-blocking queue)")
+    except Exception as e:
+        log.debug("warehouse startup skipped: %s", e)
+
+    # Restore portfolio chart from SQLite, or seed one point from current risk
+    try:
+        from agents.data.portfolio_history_db import load_portfolio_points
+
+        loaded_pts = await asyncio.to_thread(load_portfolio_points, 2000)
+        if loaded_pts:
+            _PORTFOLIO_HISTORY.clear()
+            for p in loaded_pts:
+                _PORTFOLIO_HISTORY.append(p)
+        else:
+            r0 = firm_state.risk
+            _PORTFOLIO_HISTORY.append({
+                "time": time.time(),
+                "equity": float(r0.current_nav or r0.opening_nav or 0.0),
+                "delta": float(r0.portfolio_delta),
+                "vega": float(r0.portfolio_vega),
+                "daily_pnl": float(r0.daily_pnl),
+                "drawdown_pct": float(r0.drawdown_pct),
+            })
+    except Exception as exc:
+        log.debug("portfolio history restore: %s", exc)
 
     # ── Probe local llama.cpp and log the active LLM backend ──────────────────
     await _probe_llama_cpp()
@@ -646,7 +991,10 @@ async def lifespan(app: FastAPI):
     #    + fundamentals refresher + T3 auto-trigger watchdog) ─────────────────
     from agents.tiers import start_tier_loops
     await start_tier_loops(firm_state)
-    log.info("Agent tier loops started (T1: SentimentMonitor + MovementTracker; T2: Fundamentals)")
+    log.info(
+        "Agent tier loops started (T1: SentimentMonitor/structured LLM + MovementTracker; "
+        "T2: Fundamentals + NewsProcessor)"
+    )
 
     from agents.research.universe_service import start_universe_research
     start_universe_research(firm_state, _scanner)
@@ -662,6 +1010,9 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_portfolio_history_task()),
         asyncio.create_task(_equity_sync_task()),
         asyncio.create_task(_ws_broadcast_task()),
+        asyncio.create_task(_ws_quote_push_task()),
+        asyncio.create_task(_warm_fundamentals_cache_task()),
+        asyncio.create_task(_warm_daily_bars_cache_task()),
     ]
     if ENABLE_NEWS_FEED:
         tasks.insert(1, asyncio.create_task(_news_task()))
@@ -676,7 +1027,17 @@ async def lifespan(app: FastAPI):
         log.warning("Initial Alpaca sync error: %s", exc)
 
     yield
-    # Shutdown: stop universe workers, tier loops, then cancel asyncio tasks
+    # Shutdown: persist firm state, then warehouse writer, universe workers, tier loops, cancel tasks
+    try:
+        await _persist_firm_state()
+    except Exception as exc:
+        log.debug("shutdown persist firm_state: %s", exc)
+    try:
+        from agents.data.warehouse import stop_warehouse_writer
+
+        stop_warehouse_writer()
+    except Exception as exc:
+        log.debug("stop_warehouse_writer: %s", exc)
     try:
         from agents.research.universe_service import stop_universe_research
         stop_universe_research()
@@ -706,7 +1067,8 @@ async def root():
         "endpoints": [
             "/state", "/news", "/reasoning_log", "/agent_status",
             "/scanner", "/scanner/quotes", "/scanner/tickers", "/options/{ticker}",
-            "/bars/{ticker}", "/quote/{ticker}", "/stock_info/{ticker}", "/portfolio_series",
+            "/bars/{ticker}", "/quote/{ticker}", "/stock_info/{ticker}", "/perception/{ticker}",
+            "/portfolio_series",
             "/set_ticker", "/kill_switch", "/run_cycle",
             "/order/stock", "/order/option", "/orders", "/order/{id}",
             "/positions/refresh", "/positions/debug", "/market/clock",
@@ -847,6 +1209,36 @@ async def get_news(limit: int = Query(80, ge=1, le=300)):
     return [n.model_dump() for n in items[:limit]]
 
 
+@app.get("/news/queue")
+async def get_news_queue(limit: int = Query(20, ge=1, le=200)):
+    """
+    Snapshot of the NewsPriorityQueue (FinBERT-scored backlog).
+    Shows queue stats + the highest-priority items currently waiting.
+    """
+    try:
+        from agents.data.news_priority_queue import get_queue
+
+        q = get_queue()
+        top = q.peek_top(limit)
+        return {
+            "stats": q.stats(),
+            "items": [
+                {
+                    "id": qn.id,
+                    "priority": round(qn.priority, 4),
+                    "added_at": qn.added_at.isoformat(),
+                    "seen": sorted(list(qn.seen)),
+                    "item": qn.item.model_dump(mode="json")
+                    if hasattr(qn.item, "model_dump")
+                    else {"headline": getattr(qn.item, "headline", "")},
+                }
+                for qn in top
+            ],
+        }
+    except Exception as exc:
+        return {"error": str(exc), "stats": {}, "items": []}
+
+
 @app.get("/research/{ticker}")
 async def get_research_ticker(ticker: str):
     """Cached per-ticker agent brief (universe precompute)."""
@@ -876,9 +1268,17 @@ async def post_research_refresh(ticker: str):
 
 
 @app.get("/reasoning_log")
-async def reasoning_log(tail: int = Query(500, ge=1, le=5000)):
-    """Recent reasoning rows from today's JSONL (default last 500)."""
-    return get_today_log(tail=tail)
+async def reasoning_log(
+    tail: int = Query(500, ge=1, le=5000),
+    agent: str | None = Query(
+        None,
+        description="If set, only rows where the `agent` field matches exactly (e.g. DeskHead, BullResearcher).",
+        max_length=160,
+    ),
+):
+    """Recent reasoning rows from today's JSONL (default last 500). Optional per-agent filter."""
+    a = agent.strip() if agent else None
+    return get_today_log(tail=tail, agent=a or None)
 
 @app.get("/agent_status")
 async def get_agent_status():
@@ -947,10 +1347,51 @@ async def get_scanner_tickers():
     return {"tickers": _scanner.all_tickers(), "count": len(_scanner.all_tickers())}
 
 
+@app.get("/quotes/benchmarks")
+async def get_benchmark_quotes():
+    """
+    Batch equity quotes for the index / sector / macro ETF prefix (see
+    ``agents.data.sp500.INDEX_SECTOR_ETF_TICKERS``). Used by the Atlas context strip.
+
+    Returns ``sections`` (grouped labels + quotes) and flat ``items`` (backward compatible).
+    """
+    from agents.data.sp500 import BENCHMARK_SCANNER_SECTIONS, INDEX_SECTOR_ETF_TICKERS
+
+    tickers = list(INDEX_SECTOR_ETF_TICKERS)
+    if not tickers:
+        return {"items": [], "sections": []}
+    batch = await asyncio.to_thread(fetch_stock_quotes_batch, tickers)
+
+    def _one(u: str) -> dict:
+        q = batch.get(u) if isinstance(batch, dict) else None
+        if isinstance(q, dict):
+            return {
+                "ticker":       u,
+                "last":         q.get("last"),
+                "change_pct":   q.get("change_pct"),
+                "quote_source": q.get("source"),
+                "session":      q.get("session"),
+            }
+        return {"ticker": u, "last": None, "change_pct": None, "quote_source": None, "session": None}
+
+    items: list[dict] = [_one(t.upper()) for t in tickers]
+    sections: list[dict] = []
+    for sec in BENCHMARK_SCANNER_SECTIONS:
+        st = sec.get("tickers") or []
+        if not isinstance(st, list):
+            continue
+        sections.append({
+            "id":    sec.get("id", ""),
+            "label": sec.get("label", ""),
+            "items": [_one(str(x).upper()) for x in st],
+        })
+    return {"items": items, "sections": sections}
+
+
 _ALLOWED_BAR_TF = frozenset({
     "1D",
     "1Day", "1Hour", "15Min", "5Min", "1Min",
-    "5D", "1M", "3M", "6M", "1Y",
+    "5D", "1M", "3M", "6M", "1Y", "2Y", "5Y", "MAX",
 })
 
 
@@ -994,6 +1435,23 @@ async def llm_status():
     return status
 
 
+@app.get("/perception/{ticker}")
+async def get_perception(ticker: str):
+    """
+    Phases 0–2 perception bundle: technical, fundamental, events, sentiment, news.
+    Uses the in-memory news feed for sentiment/news layers. Persists to ``cache/perception.sqlite3``.
+    """
+    from agents.perception.pipeline import run_perception_bundle
+
+    t = ticker.upper().strip()
+    bundle = await asyncio.to_thread(
+        run_perception_bundle,
+        t,
+        list(firm_state.news_feed),
+    )
+    return bundle.model_dump(mode="json")
+
+
 @app.get("/quote/{ticker}")
 async def get_quote(ticker: str):
     """Stock NBBO / last trade / vs prev close — for the equity quote strip."""
@@ -1021,19 +1479,120 @@ async def get_quote(ticker: str):
 async def get_stock_info(ticker: str):
     """
     Fundamental data + peer/competitor/dependency map for the given ticker.
-    Data sourced from yfinance (free). Cached server-side for 1 hour.
+    Data sourced from yfinance (free) and cached in SQLite.
+    Behavior:
+      - Return cached payload immediately when available (fast UI clicks).
+      - If cached payload is stale (dynamic TTL), refresh in background.
+      - If missing, fetch now and persist.
     """
     from agents.data.fundamentals import fetch_stock_info
+    from agents.data.fundamentals_db import get_stock_info_cached, upsert_stock_info
 
-    info = await asyncio.to_thread(fetch_stock_info, ticker.upper())
-    return info
+    t = ticker.upper().strip()
+    # Description, peers, ecosystem maps, and most fundamentals change rarely.
+    # SQLite already stores the full payload; this TTL controls how often we hit yfinance
+    # for background refresh (default 7 days). Lower for more frequent P/E etc.
+    dynamic_ttl_s = int(float(os.getenv("FUNDAMENTALS_DYNAMIC_TTL_S", "604800")))
+
+    cached, fetched_at = await asyncio.to_thread(get_stock_info_cached, t)
+    now = int(time.time())
+
+    # Serve cached immediately when present.
+    if cached and fetched_at:
+        age = max(0, now - int(fetched_at))
+
+        # Stale-while-revalidate: refresh in background, but don't block UI.
+        if age >= dynamic_ttl_s:
+            if not hasattr(get_stock_info, "_refreshing"):
+                get_stock_info._refreshing = set()  # type: ignore[attr-defined]
+            refreshing = get_stock_info._refreshing  # type: ignore[attr-defined]
+            if t in refreshing:
+                return cached
+            refreshing.add(t)
+
+            async def _refresh():
+                try:
+                    fresh = await asyncio.to_thread(fetch_stock_info, t)
+                    await asyncio.to_thread(upsert_stock_info, t, fresh)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        refreshing.discard(t)
+                    except Exception:
+                        pass
+
+            try:
+                asyncio.create_task(_refresh())
+            except Exception:
+                pass
+
+        return cached
+
+    # Cache miss:
+    # Default to "fast miss" so UI clicks feel instant even when yfinance is slow.
+    # The UI already handles "pending" responses by retrying shortly after.
+    fast_miss = (os.getenv("FUNDAMENTALS_FAST_MISS", "true") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+    if fast_miss:
+        if not hasattr(get_stock_info, "_refreshing"):
+            get_stock_info._refreshing = set()  # type: ignore[attr-defined]
+        refreshing = get_stock_info._refreshing  # type: ignore[attr-defined]
+        if t not in refreshing:
+            refreshing.add(t)
+
+            async def _refresh_missing():
+                try:
+                    fresh = await asyncio.to_thread(fetch_stock_info, t)
+                    await asyncio.to_thread(upsert_stock_info, t, fresh)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        refreshing.discard(t)
+                    except Exception:
+                        pass
+
+            try:
+                asyncio.create_task(_refresh_missing())
+            except Exception:
+                refreshing.discard(t)
+
+        return {
+            "ticker": t,
+            "name": t,
+            "description": "Loading fundamentals…",
+            "sector": "",
+            "industry": "",
+            "data_source": "pending",
+        }
+
+    # Legacy behavior (if FUNDAMENTALS_FAST_MISS=false): block until we have a real payload.
+    try:
+        fresh = await asyncio.to_thread(fetch_stock_info, t)
+        await asyncio.to_thread(upsert_stock_info, t, fresh)
+        return fresh
+    except Exception as exc:
+        log.warning("stock_info initial fetch failed for %s: %s", t, exc)
+        return {
+            "ticker": t,
+            "name": t,
+            "description": "Fundamentals unavailable (yfinance/network error). Retry or check logs.",
+            "sector": "",
+            "industry": "",
+            "data_source": "error",
+        }
 
 
 @app.get("/bars/{ticker}")
 async def get_bars(
     ticker: str,
     timeframe: str = Query("5D"),
-    limit: int = Query(120, ge=10, le=2000),
+    limit: int = Query(120, ge=10, le=10000),
     bust: bool = Query(False),
 ):
     """
@@ -1042,6 +1601,9 @@ async def get_bars(
     Timeframes: intraday (1Min…1Day bar size) or multi-session history (5D, 1M, 3M, 6M, 1Y daily).
     Response includes `underlying` summary (last, range, period change, volume when available).
     Pass `?bust=true` to bypass the short-lived server cache.
+
+    Historic source: ``CHART_HISTORY_PREFERENCE`` in ``chart_data`` (default: Yahoo first to spare
+    Alpaca limits; use ``alpaca_first`` for broker-quality history). Real-time quotes use ``/quote`` / WS.
     """
     from agents.data.chart_data import fetch_bars, summary_from_bars, _bars_cache
 
@@ -1056,7 +1618,9 @@ async def get_bars(
         key = (ticker.upper(), tf, int(limit))
         _bars_cache.pop(key, None)
 
-    bars, source = await asyncio.to_thread(fetch_bars, ticker.upper(), tf, limit)
+    bars, source = await asyncio.to_thread(
+        lambda: fetch_bars(ticker.upper(), tf, limit, bypass_disk=bust),
+    )
     summary = summary_from_bars(bars, ticker.upper())
     return {
         "ticker": ticker.upper(),
@@ -1089,7 +1653,126 @@ async def get_options(ticker: str):
     chain = _scanner.get_chain(t)
     if not chain:
         chain = await _scanner.fetch_drilldown(t)
-    return {"ticker": t, "count": len(chain), "contracts": chain}
+
+    # Max DTE + asymmetric strikes (same rules as ``filter_greeks_for_agents``). When UI env
+    # vars are unset, use agent defaults so behaviour matches the graph for every ticker.
+    from agents.data.options_chain_filter import (
+        agent_options_max_dte_days,
+        agent_options_strike_band_pct,
+        strike_bounds_for_contract,
+    )
+
+    try:
+        raw_d = os.getenv("OPTIONS_MAX_DTE_DAYS", "").strip()
+        days = int(float(raw_d)) if raw_d else agent_options_max_dte_days()
+    except Exception:
+        days = agent_options_max_dte_days()
+    try:
+        raw_b = os.getenv("OPTIONS_STRIKE_PCT_BAND", "").strip()
+        strike_pct = float(raw_b) if raw_b else agent_options_strike_band_pct()
+        strike_pct = max(0.05, min(0.95, strike_pct))
+    except Exception:
+        strike_pct = agent_options_strike_band_pct()
+
+    # Spot for strike bands: **live equity quote for this ticker** first (works for any symbol),
+    # then desk state / scanner / option-delta fallback.
+    spot = 0.0
+    try:
+        from agents.data.equity_snapshot import fetch_stock_quote
+
+        q = await asyncio.to_thread(fetch_stock_quote, t)
+        last = q.get("last")
+        if last is None:
+            bid, ask = q.get("bid"), q.get("ask")
+            if bid is not None and ask is not None and float(bid) > 0 and float(ask) > 0:
+                last = (float(bid) + float(ask)) / 2.0
+        if last is not None and float(last) > 0:
+            spot = float(last)
+    except Exception:
+        pass
+    if spot <= 0:
+        try:
+            if firm_state.ticker and firm_state.ticker.upper() == t:
+                spot = float(firm_state.underlying_price or 0.0)
+        except Exception:
+            spot = 0.0
+    if spot <= 0:
+        try:
+            scan = _scanner.get_scan(t) or {}
+            spot = float(scan.get("underlying_price") or 0.0)
+        except Exception:
+            spot = 0.0
+    if spot <= 0 and chain:
+        # Fallback: estimate underlying from contract closest to |delta|≈0.5
+        try:
+            best = None
+            best_diff = 9e9
+            for c in chain:
+                k = c.get("strike")
+                d = c.get("delta")
+                if k is None or d is None:
+                    continue
+                strike = float(k)
+                if strike <= 0:
+                    continue
+                diff = abs(abs(float(d)) - 0.5)
+                if diff < best_diff:
+                    best_diff = diff
+                    best = strike
+            if best and best > 0:
+                spot = float(best)
+        except Exception:
+            pass
+
+    today = date.today()
+
+    def _parse_expiry(s: str) -> date | None:
+        try:
+            s = (s or "").strip()
+            if len(s) == 6:  # YYMMDD
+                return date(int("20" + s[:2]), int(s[2:4]), int(s[4:6]))
+            if len(s) == 8:  # YYYYMMDD
+                return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+        except Exception:
+            return None
+        return None
+
+    filtered = []
+    for c in chain or []:
+        try:
+            exp = _parse_expiry(str(c.get("expiry") or ""))
+            if exp:
+                dte = (exp - today).days
+                if dte < 0 or dte > days:
+                    continue
+            # If expiry missing/unparseable, keep it (avoid hiding data due to schema mismatch)
+            k = c.get("strike")
+            strike = float(k) if k is not None else None
+            occ = str(c.get("symbol") or "").strip()
+            low, high = strike_bounds_for_contract(
+                c.get("right"), spot, strike_pct, occ_symbol=occ or None
+            )
+            if strike is not None and low is not None and high is not None:
+                if strike < low or strike > high:
+                    continue
+            filtered.append(c)
+        except Exception:
+            continue
+
+    # Hard cap payload for UI perf (client also caps, but server cap saves bandwidth).
+    try:
+        max_contracts = int(float(os.getenv("OPTIONS_MAX_CONTRACTS", "800")))
+        max_contracts = max(200, min(3000, max_contracts))
+    except Exception:
+        max_contracts = 800
+    if len(filtered) > max_contracts:
+        try:
+            filtered.sort(key=lambda c: (str(c.get("expiry") or ""), float(c.get("strike") or 0.0)))
+        except Exception:
+            pass
+        filtered = filtered[:max_contracts]
+
+    return {"ticker": t, "count": len(filtered), "contracts": filtered}
 
 
 # ── Order request models ──────────────────────────────────────────────────────
@@ -1237,6 +1920,15 @@ async def set_ticker(req: TickerRequest):
     t = req.ticker.upper()
     market_activity.touch(t)
     firm_state.ticker = t
+    # Always refresh spot on ticker switch so chain filters + agents start from real stock price.
+    try:
+        from agents.data.equity_snapshot import fetch_stock_quote
+
+        q = await asyncio.to_thread(fetch_stock_quote, t)
+        if isinstance(q, dict) and q.get("last") is not None:
+            firm_state.underlying_price = float(q["last"])
+    except Exception:
+        pass
     try:
         get_market_hub().resubscribe_on_focus_change(t)
     except Exception as e:
@@ -1301,6 +1993,20 @@ async def tiers_trigger_endpoint():
     return {"status": "tier3 triggered", "source": "manual"}
 
 
+@app.get("/agents/flow")
+async def agents_flow_endpoint():
+    """How data moves through tiers and the T3 LangGraph (for UI diagram + integrations)."""
+    from agents.agent_flow_spec import AGENT_FLOW_RESPONSE
+    return AGENT_FLOW_RESPONSE
+
+
+@app.get("/agents/mlflow_status")
+async def agents_mlflow_status_endpoint():
+    """Whether MLflow logging is active and where runs are stored (no secrets)."""
+    from agents.tracking.mlflow_tracing import mlflow_status_dict
+    return mlflow_status_dict()
+
+
 # ── AI-Processed News & Cross-Stock Impacts ────────────────────────────────────
 
 @app.get("/news/processed")
@@ -1334,6 +2040,93 @@ async def get_news_affecting_ticker(ticker: str, limit: int = 20):
     return get_articles_affecting_ticker(ticker, limit)
 
 
+@app.get("/news/digests/{ticker}")
+async def get_news_digests_for_ticker(ticker: str, limit: int = 12):
+    """
+    Return token-efficient LLM context for a ticker using a decaying lookback window.
+    - recent (last 24–72h): primary context (digests)
+    - week (2–7d): secondary context (digests)
+    - rollup (8–30d): meta context (daily rollups)
+    """
+    from agents.data.news_processed_db import get_tiered_llm_context
+
+    # Back-compat: `limit` roughly maps to (recent+week). Keep it simple.
+    lim = max(4, min(30, int(limit)))
+    ctx = get_tiered_llm_context(
+        ticker,
+        recent_hours=72,
+        days_detail=7,
+        days_rollup=30,
+        limit_recent=min(10, max(4, lim // 2)),
+        limit_week=min(16, max(4, lim)),
+    )
+    return ctx
+
+
+# ── DB Explorer (SQLite + Postgres warehouse introspection) ────────────────────
+
+@app.get("/db/sources")
+async def db_sources():
+    """List known data stores (SQLite files + optional Postgres warehouse)."""
+    from agents.db_explorer import list_sources
+    out = []
+    for s in list_sources():
+        d = {"key": s.key, "kind": s.kind, "label": s.label}
+        if s.kind == "sqlite":
+            d["path"] = s.target
+            try:
+                from pathlib import Path
+                d["exists"] = Path(s.target).exists()
+            except Exception:
+                d["exists"] = None
+        else:
+            # never return secrets
+            from agents.db_explorer import _postgres_redact_dsn
+            d["dsn"] = _postgres_redact_dsn(s.target)
+        out.append(d)
+    return {"sources": out}
+
+
+@app.get("/db/{source_key}/tables")
+async def db_tables(source_key: str):
+    """List tables in a source."""
+    from agents.db_explorer import list_tables
+    try:
+        return list_tables(source_key)
+    except KeyError:
+        raise HTTPException(404, f"Unknown source: {source_key}")
+
+
+@app.get("/db/{source_key}/table/{table}/schema")
+async def db_table_schema(source_key: str, table: str):
+    """Return columns + foreign keys for a table."""
+    from agents.db_explorer import table_schema
+    try:
+        return table_schema(source_key, table)
+    except KeyError:
+        raise HTTPException(404, f"Unknown source: {source_key}")
+
+
+@app.get("/db/{source_key}/table/{table}/rows")
+async def db_table_rows(source_key: str, table: str, limit: int = 100, offset: int = 0):
+    """Return sample rows for a table."""
+    from agents.db_explorer import table_rows
+    try:
+        return table_rows(source_key, table, limit=limit, offset=offset)
+    except KeyError:
+        raise HTTPException(404, f"Unknown source: {source_key}")
+
+
+@app.get("/db/{source_key}/graph")
+async def db_graph(source_key: str):
+    """Return a simple table relationship graph (FK edges)."""
+    from agents.db_explorer import relationship_graph
+    try:
+        return relationship_graph(source_key)
+    except KeyError:
+        raise HTTPException(404, f"Unknown source: {source_key}")
+
+
 # ── Trading Mode & Recommendations ─────────────────────────────────────────────
 
 class _ModeBody(BaseModel):
@@ -1355,7 +2148,202 @@ async def get_mode():
 
 @app.get("/recommendations")
 async def list_recommendations():
-    return [r.model_dump() for r in firm_state.pending_recommendations]
+    # Enrich with live quotes (latest_greeks) so the UI can explain:
+    # - why approvals may not execute (missing bid/ask → no mid → no limit price)
+    # - where max_risk/target_return came from vs quote-based estimates
+    def _mid(bid: float, ask: float) -> float | None:
+        try:
+            bid = float(bid)
+            ask = float(ask)
+        except Exception:
+            return None
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        return round((bid + ask) / 2.0, 2)
+
+    greeks_by_symbol = {g.symbol: g for g in (firm_state.latest_greeks or [])}
+
+    def _quote_for_symbol(sym: str) -> dict:
+        g = greeks_by_symbol.get(sym)
+        if not g:
+            return {"symbol": sym, "bid": None, "ask": None, "mid": None, "age_s": None}
+        m = _mid(g.bid, g.ask)
+        try:
+            age_s = max(0.0, (datetime.utcnow() - g.timestamp).total_seconds())
+        except Exception:
+            age_s = None
+        return {
+            "symbol": sym,
+            "bid": round(float(g.bid), 2),
+            "ask": round(float(g.ask), 2),
+            "mid": m,
+            "age_s": round(age_s, 1) if age_s is not None else None,
+            "ts": g.timestamp.isoformat() if getattr(g, "timestamp", None) else None,
+        }
+
+    def _pricing_summary(rec_dict: dict) -> dict:
+        from agents.data.opra_client import occ_expiry_as_date
+
+        proposal = rec_dict.get("proposal") or {}
+        legs = proposal.get("legs") or []
+        today = date.today()
+
+        def _build_quotes() -> tuple[list[dict], list[str], float]:
+            leg_quotes: list[dict] = []
+            missing: list[str] = []
+            net_premium_mid = 0.0
+            for leg in legs:
+                sym = str(leg.get("symbol") or "")
+                q = _quote_for_symbol(sym)
+                side = str(leg.get("side") or "").upper()
+                qty = int(leg.get("qty") or 1)
+                exp_d = occ_expiry_as_date(sym)
+                expired = exp_d is not None and exp_d < today
+                leg_quotes.append({
+                    "symbol": sym,
+                    "side": side,
+                    "qty": qty,
+                    "right": leg.get("right"),
+                    "strike": leg.get("strike"),
+                    "expiry": leg.get("expiry"),
+                    "bid": q.get("bid"),
+                    "ask": q.get("ask"),
+                    "mid": q.get("mid"),
+                    "age_s": q.get("age_s"),
+                    "expired": expired,
+                    "occ_expiry": exp_d.isoformat() if exp_d else None,
+                })
+                m = q.get("mid")
+                if m is None:
+                    missing.append(sym)
+                    continue
+                # SELL collects premium (+), BUY pays (-)
+                sign = 1.0 if side.startswith("S") else -1.0
+                net_premium_mid += sign * float(m) * float(qty) * 100.0
+            return leg_quotes, missing, net_premium_mid
+
+        leg_quotes, missing, net_premium_mid = _build_quotes()
+
+        # If quotes are missing, attempt a targeted snapshot prewarm (best-effort).
+        # This reduces user-facing "—" when the rolling chain snapshot didn't include the exact leg strikes.
+        need = []
+        if missing:
+            now = time.time()
+            for sym in missing:
+                exp_d = occ_expiry_as_date(sym)
+                if exp_d is not None and exp_d < today:
+                    continue
+                last = _LEG_QUOTE_PREWARM_AT.get(sym, 0.0)
+                if now - last >= 15.0:
+                    need.append(sym)
+            need = need[:20]
+        if need:
+            try:
+                from alpaca.data.historical.option import OptionHistoricalDataClient
+                from alpaca.data.requests import OptionSnapshotRequest
+                from agents.config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+                from agents.data.opra_client import _alpaca_chain_to_greeks
+
+                if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+                    client = OptionHistoricalDataClient(
+                        api_key=ALPACA_API_KEY, secret_key=ALPACA_SECRET_KEY
+                    )
+                    raw = client.get_option_snapshot(
+                        OptionSnapshotRequest(symbol_or_symbols=list(need))
+                    )
+                    snaps = []
+                    if isinstance(raw, dict):
+                        for occ, snap in raw.items():
+                            try:
+                                snaps.append(_alpaca_chain_to_greeks(str(occ), snap))
+                            except Exception:
+                                continue
+                    if snaps:
+                        gmap = {g.symbol: g for g in (firm_state.latest_greeks or [])}
+                        for s in snaps:
+                            gmap[s.symbol] = s
+                        firm_state.latest_greeks = list(gmap.values())
+                        # Refresh local lookup for this response
+                        greeks_by_symbol.clear()
+                        greeks_by_symbol.update({g.symbol: g for g in (firm_state.latest_greeks or [])})
+                        for sym in need:
+                            _LEG_QUOTE_PREWARM_AT[sym] = time.time()
+                        # Rebuild after prewarm
+                        leg_quotes, missing, net_premium_mid = _build_quotes()
+            except Exception:
+                pass
+
+        expired_syms = sorted({str(lq["symbol"]) for lq in leg_quotes if lq.get("expired")})
+        out: dict = {
+            "legs": leg_quotes,
+            "missing_quotes": sorted(list(set(missing))),
+            "expired_leg_symbols": expired_syms,
+            "net_premium_mid_usd": round(net_premium_mid, 2) if not missing else None,
+        }
+        if expired_syms:
+            out["quote_note"] = (
+                "Some legs use expired OCC symbols — brokers do not publish bid/ask on expired series. "
+                "Dismiss this recommendation and run a fresh cycle so strikes match the live chain."
+            )
+
+        # Pattern-based max-loss estimate (only when we have complete mids).
+        try:
+            if not missing and legs:
+                puts = [l for l in legs if str(l.get("right") or "").upper().startswith("P")]
+                calls = [l for l in legs if str(l.get("right") or "").upper().startswith("C")]
+                # Iron condor heuristic: 2 puts + 2 calls, same expiry, qty 1.
+                if len(puts) == 2 and len(calls) == 2:
+                    exp = {str(l.get("expiry") or "") for l in legs}
+                    if len(exp) == 1:
+                        put_strikes = sorted([float(l.get("strike") or 0) for l in puts])
+                        call_strikes = sorted([float(l.get("strike") or 0) for l in calls])
+                        width_put = abs(put_strikes[1] - put_strikes[0])
+                        width_call = abs(call_strikes[1] - call_strikes[0])
+                        credit = max(0.0, net_premium_mid / 100.0)  # per 1-lot in option price units
+                        max_loss_est = (max(width_put, width_call) - credit) * 100.0
+                        out["max_loss_estimate_usd"] = round(max(0.0, max_loss_est), 2)
+                        out["risk_math"] = (
+                            "Estimate (Iron Condor): max_loss ≈ max(put_width, call_width)×100 − net_credit×100 "
+                            f"(put_width={width_put:.2f}, call_width={width_call:.2f}, "
+                            f"net_credit≈${credit:.2f})."
+                        )
+                # Vertical debit/credit spread heuristic: 2 legs, same right+expiry.
+                if "max_loss_estimate_usd" not in out and len(legs) == 2:
+                    exp = {str(l.get("expiry") or "") for l in legs}
+                    rights = {str(l.get("right") or "").upper() for l in legs}
+                    if len(exp) == 1 and len(rights) == 1:
+                        strikes = sorted([float(l.get("strike") or 0) for l in legs])
+                        width = abs(strikes[1] - strikes[0])
+                        # net premium: +credit or -debit (USD)
+                        if net_premium_mid >= 0:
+                            # credit spread max loss = width*100 - credit
+                            max_loss_est = width * 100.0 - net_premium_mid
+                            out["max_loss_estimate_usd"] = round(max(0.0, max_loss_est), 2)
+                            out["risk_math"] = (
+                                "Estimate (Credit spread): max_loss ≈ width×100 − net_credit "
+                                f"(width={width:.2f}, net_credit≈${net_premium_mid:.2f})."
+                            )
+                        else:
+                            # debit spread max loss = debit
+                            out["max_loss_estimate_usd"] = round(abs(net_premium_mid), 2)
+                            out["risk_math"] = (
+                                "Estimate (Debit spread): max_loss ≈ net_debit "
+                                f"(net_debit≈${abs(net_premium_mid):.2f})."
+                            )
+        except Exception as exc:
+            out["pricing_error"] = str(exc)[:200]
+
+        return out
+
+    enriched: list[dict] = []
+    for r in firm_state.pending_recommendations:
+        d = r.model_dump(mode="json")
+        try:
+            d["pricing"] = _pricing_summary(d)
+        except Exception as exc:
+            d["pricing"] = {"error": str(exc)[:200]}
+        enriched.append(d)
+    return enriched
 
 
 @app.post("/recommendations/{rec_id}/approve")
@@ -1372,15 +2360,90 @@ async def approve_recommendation(rec_id: str):
     # Execute the proposal by temporarily setting autopilot and running the trader node
     try:
         from agents.agents.trader import _validate_and_build_legs
+        from agents.state import GreeksSnapshot
 
         proposal = rec.proposal
+
+        from agents.data.opra_client import occ_expiry_as_date
+
+        expired_meta: list[dict[str, str]] = []
+        for leg in proposal.legs:
+            exp_d = occ_expiry_as_date(leg.symbol)
+            if exp_d is not None and exp_d < date.today():
+                expired_meta.append({"symbol": leg.symbol, "expired_on": exp_d.isoformat()})
+        if expired_meta:
+            return {
+                "error": (
+                    "Recommendation uses expired OCC legs; brokers cannot quote them. "
+                    "Dismiss this recommendation and run a fresh cycle so legs match the live chain."
+                ),
+                "expired_legs": expired_meta,
+            }
+
         greeks_by_symbol = {g.symbol: g for g in firm_state.latest_greeks}
         legs_payload, warnings = _validate_and_build_legs(proposal, greeks_by_symbol)
 
         legs_without_price = [l["symbol"] for l in legs_payload if l["limit_price"] is None]
         if legs_without_price:
-            rec.status = "approved"
-            return {"status": "approved", "note": f"Missing quotes for legs: {legs_without_price}"}
+            # Attempt a targeted quote prewarm for the missing OCC symbols, then retry once.
+            # This avoids user-facing "missing quotes" when the rolling chain snapshot didn't include a leg.
+            try:
+                from alpaca.data.historical.option import OptionHistoricalDataClient
+                from alpaca.data.requests import OptionSnapshotRequest
+                from agents.config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+                from agents.data.opra_client import _alpaca_chain_to_greeks
+
+                if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+                    client = OptionHistoricalDataClient(
+                        api_key=ALPACA_API_KEY, secret_key=ALPACA_SECRET_KEY
+                    )
+                    raw = client.get_option_snapshot(
+                        OptionSnapshotRequest(symbol_or_symbols=list(legs_without_price))
+                    )
+                    # alpaca-py returns dict[occ_symbol, OptionSnapshot]
+                    snaps: list[GreeksSnapshot] = []
+                    if isinstance(raw, dict):
+                        for occ, snap in raw.items():
+                            try:
+                                snaps.append(_alpaca_chain_to_greeks(str(occ), snap))
+                            except Exception:
+                                continue
+                    if snaps:
+                        # Merge into latest_greeks (replace per symbol)
+                        gmap = {g.symbol: g for g in (firm_state.latest_greeks or [])}
+                        for s in snaps:
+                            gmap[s.symbol] = s
+                        firm_state.latest_greeks = list(gmap.values())
+
+                        # Retry build
+                        greeks_by_symbol = {g.symbol: g for g in firm_state.latest_greeks}
+                        legs_payload, warnings2 = _validate_and_build_legs(proposal, greeks_by_symbol)
+                        warnings = list(warnings) + list(warnings2)
+                        legs_without_price = [l["symbol"] for l in legs_payload if l["limit_price"] is None]
+            except Exception:
+                # Fall back to user-facing missing quotes message.
+                pass
+
+            if legs_without_price:
+                # Don't mark as approved if we didn't actually submit an order.
+                hint: list[str] = []
+                for sym in legs_without_price:
+                    ed = occ_expiry_as_date(sym)
+                    if ed is not None and ed < date.today():
+                        hint.append(f"{sym} expired {ed.isoformat()}")
+                return {
+                    "error": (
+                        "Missing bid/ask (limit price) for legs: "
+                        f"{legs_without_price}. "
+                        + (
+                            "Some appear expired — " + "; ".join(hint)
+                            if hint
+                            else "Check options data subscription / chain cache, or dismiss and regenerate."
+                        )
+                    ),
+                    "missing_legs": legs_without_price,
+                    **({"expired_hint": hint} if hint else {}),
+                }
 
         order_payload = {
             "order_type": "MULTI_LEG",
@@ -1397,6 +2460,7 @@ async def approve_recommendation(rec_id: str):
         ems = _get_ems()
         result = await asyncio.to_thread(ems.submit, order_payload, firm_state)
         rec.status = "approved"
+        rec.resolved_at = datetime.now(timezone.utc)
 
         from agents.state import ReasoningEntry
         firm_state.reasoning_log.append(ReasoningEntry(
@@ -1406,6 +2470,7 @@ async def approve_recommendation(rec_id: str):
             outputs={"order_result": str(result)[:200]},
         ))
         asyncio.create_task(_post_order_sync())
+        await _persist_firm_state()
         return {"status": "approved", "order_result": str(result)[:200]}
     except Exception as exc:
         log.error("Failed to execute approved recommendation %s: %s", rec_id, exc)
@@ -1418,6 +2483,7 @@ async def dismiss_recommendation(rec_id: str):
     if not rec:
         raise HTTPException(404, f"Recommendation {rec_id} not found")
     rec.status = "dismissed"
+    rec.resolved_at = datetime.now(timezone.utc)
     from agents.state import ReasoningEntry
     firm_state.reasoning_log.append(ReasoningEntry(
         agent="System", action="INFO",
@@ -1425,6 +2491,7 @@ async def dismiss_recommendation(rec_id: str):
         inputs={"recommendation_id": rec.id},
         outputs={},
     ))
+    await _persist_firm_state()
     return {"status": "dismissed"}
 
 

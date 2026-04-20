@@ -68,6 +68,16 @@ Template: `config/.env.example`
 
 ### Persistence
 
-- `FIRM_STATE_FILE` (optional override for `agents/_firm_state.json` location)
-- `XAI_LOG_DIR` (default `logs/xai`)
+- **App DB (SQLite)**:
+  - `APP_DB_PATH` — path to the unified SQLite DB (default `cache/app.sqlite3`)
+  - `AGENTIC_DATA_DIR` — if set and `APP_DB_PATH` is unset, DB paths are placed under this directory
+
+- **Legacy JSON migration**:
+  - `FIRM_STATE_FILE` — if set to a `.json` path, it is treated as a *legacy* state snapshot and imported once into SQLite.
+    (After migration you can remove it.)
+
+- **Optional debug mirrors (off by default)**:
+  - `XAI_JSONL=1` — mirror XAI rows to `logs/xai/*.jsonl`
+  - `NEWS_JSONL=1` — mirror processed news to `logs/news/processed_YYYYMMDD.jsonl`
+  - `MARKET_DATA_JSONL=1` — mirror market hub events to `logs/market_data/*.jsonl`
 

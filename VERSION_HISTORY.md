@@ -6,15 +6,10 @@ After each **chat/session** that ships meaningful changes to the app, bump the v
 
 | Version | Date (UTC) | Summary |
 |---------|------------|---------|
-| 0.2.0 | 2026-04-09 | UI: Midnight Meridian + experimental themes (CRT / Neon / Raw), theme toggle + `localStorage`, typography and atmosphere updates; version tracking added. |
-
-### How to bump
-
-1. Edit **`VERSION`** (e.g. `0.2.0` → `0.2.1`).
-2. Set the same string in:
-   - `ui/package.json` → `"version"`
-   - `ui/src-tauri/tauri.conf.json` → `"version"`
-   - `ui/src-tauri/Cargo.toml` → `version = "..."` under `[package]`
-3. Add a row to the table above with today’s date and a one-line summary.
-
-Use **patch** (`0.2.1`) for small fixes; **minor** (`0.3.0`) for features; **major** (`1.0.0`) for breaking or product-level changes.
+| 0.2.5 | 2026-04-09 | UI: backup before Atlas zero-match rebuild: `ui/index-v0.2.5-pre-atlas.html`, `ui/src/main-v0.2.5-pre-atlas.js`, `ui/src/terminal-v0.2.5-pre-atlas.css`. |
+| 0.2.4 | 2026-04-09 | UI: backup before Control Room (non-terminal) rebuild: `ui/src/terminal-v0.2.4-pre-controlroom.css`, `ui/index-v0.2.4-pre-controlroom.html`. |
+| 0.2.3 | 2026-04-09 | UI: backup before Starship‑OS shell rewrite: `ui/src/terminal-v0.2.3-pre-starshipos.css`, `ui/index-v0.2.3-pre-starshipos.html`. |
+| 0.2.2 | 2026-04-09 | UI: backup before v4 Spatial HUD rebuild: `ui/src/terminal-v0.2.2-pre-v4-hud.css`, `ui/index-v0.2.2-pre-v4-hud.html`. |
+| 0.2.2 | 2026-04-09 | UI: backup before macOS-style Orchard layout revamp: `ui/src/terminal-v0.2.2-pre-orchard-layout.css`, `ui/index-v0.2.2-pre-orchard-layout.html`. |
+| 0.2.2 | 2026-04-09 | UI: snapshot before Light/Dark: `ui/src/terminal-v0.2.2-pre-darklight.css`, `ui/src/index-v0.2.2-pre-darklight.html`; then add Light/Dark toggle (persisted) and refine Nuke styling. |
+| 0.2.2 | 2026-04-09 | UI: backup before Apple “Liquid Glass” revamp: `ui/src/terminal-v0.2.2-pre-apple-glass.css`, `ui/index-v0.2.2-pre-apple-glass.html`. |

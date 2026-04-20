@@ -24,7 +24,8 @@ Weighting guide (higher weight = more authoritative):
 - RiskManager ABORT → always override to ABORT (non-negotiable)
 - Debate verdict (weight 0.35): most balanced view, includes full debate
 - OptionsSpecialist (weight 0.25): structural IV opportunity
-- Sentiment (weight 0.20): news-driven directional bias
+- Sentiment (weight 0.20): headline-driven bias when news_timing is fresh; down-weight
+  stale headline narratives — then lean on market_bias, IV, and movement in the report.
 - Strategy confidence (weight 0.20): how good the specific proposal is
 
 Decision rules:
@@ -32,7 +33,15 @@ Decision rules:
 2. If debate_verdict == ABORT → output ABORT.
 3. If all three (analyst, sentiment, debate) == PROCEED with confidence > 0.6 → PROCEED.
 4. Any ABORT among analyst, sentiment, or strategy_confidence < 0.45 → HOLD.
-5. Otherwise: weigh signals and use judgment. Capital preservation > returns.
+5. If news_timing_regime is stale/moderate, do not PROCEED solely on bullish headline
+   sentiment if price has already moved — require structure (IV/momentum/bias) alignment.
+6. Otherwise: weigh signals and use judgment. Capital preservation > returns.
+
+STRICTNESS (must follow):
+- Use ONLY the provided report JSON. Do NOT invent prices, regimes, earnings dates, or liquidity.
+- If any critical fields are missing/unknown (e.g. underlying_price <= 0, iv_regime missing, pending_proposal missing),
+  you MUST output HOLD and explicitly list what is missing.
+- If you PROCEED, you must mention the proposal's max_risk (USD) and why it is acceptable vs drawdown/position cap in the report.
 
 Output STRICT JSON:
 {
@@ -46,6 +55,7 @@ Do not output anything except the JSON object."""
 
 
 def desk_head_node(state: FirmState) -> FirmState:
+    _t0 = __import__("time").time()
     # Hard gate: RiskManager ABORT is unconditional
     if state.risk_decision == AgentDecision.ABORT:
         decision   = AgentDecision.ABORT
@@ -62,6 +72,16 @@ def desk_head_node(state: FirmState) -> FirmState:
             inputs={"risk_decision": "ABORT"},
             outputs={"confidence": confidence},
         ))
+        try:
+            from agents.tracking.mlflow_tracing import log_agent_step
+            log_agent_step(
+                "desk_head",
+                inputs={"ticker": state.ticker, "risk_decision": "ABORT"},
+                outputs={"decision": decision.value, "confidence": float(confidence)},
+                duration_s=max(0.0, __import__("time").time() - _t0),
+            )
+        except Exception:
+            pass
         return state
 
     # Also gate on circuit breaker
@@ -126,6 +146,19 @@ def desk_head_node(state: FirmState) -> FirmState:
             "drawdown_pct": f"{state.risk.drawdown_pct:.2%}",
         },
         "strategy_confidence": state.strategy_confidence,
+        "desk_context": {
+            "news_timing_regime":      state.news_timing_regime,
+            "news_newest_age_minutes": state.news_newest_age_minutes,
+            "market_bias_score":       state.market_bias_score,
+            "movement_signal":         state.movement_signal,
+            "movement_anomaly":        state.movement_anomaly,
+            "sentiment_monitor": {
+                "score": state.sentiment_monitor_score,
+                "source": state.sentiment_monitor_source,
+                "confidence": state.sentiment_monitor_confidence,
+            },
+            "structured_digest_count": len(state.tier3_structured_digests),
+        },
     }
 
     messages = [
@@ -176,4 +209,19 @@ def desk_head_node(state: FirmState) -> FirmState:
         inputs=context,
         outputs={"confidence": confidence},
     ))
+    try:
+        from agents.tracking.mlflow_tracing import log_agent_step
+        log_agent_step(
+            "desk_head",
+            inputs={
+                "ticker": state.ticker,
+                "sub_agent_verdicts": context.get("sub_agent_verdicts"),
+                "debate_verdict": (context.get("debate") or {}).get("verdict"),
+                "strategy_confidence": float(state.strategy_confidence or 0.0),
+            },
+            outputs={"decision": decision.value, "confidence": float(confidence or 0.0)},
+            duration_s=max(0.0, __import__("time").time() - _t0),
+        )
+    except Exception:
+        pass
     return state

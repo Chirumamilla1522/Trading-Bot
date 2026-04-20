@@ -29,6 +29,10 @@ GROUNDING REQUIREMENTS:
   iv_regime and iv_atm, skew_ratio, term_structure, aggregate_sentiment, plus movement_signal or price_change_pct.
 - Point out why the proposal’s structure matches IV/skew/term (not vibes).
 
+STRICTNESS:
+- Do NOT invent earnings dates, catalysts, or liquidity facts. If not provided, say “not provided”.
+- If the proposal details are inconsistent with the context (e.g., far-from-spot strikes), call it out but still argue the best case.
+
 Output: 4-6 sentences, no lists. End with exactly: CONVICTION: X/10 (X=1..10).
 Do NOT discuss risk controls (Bear handles that)."""
 
@@ -40,6 +44,10 @@ GROUNDING REQUIREMENTS:
 - Cite at least 6 concrete fields from market context and proposal (e.g., max_risk vs cap, regime,
   iv_regime/iv_atm, skew_ratio, term_structure, drawdown_pct, portfolio delta/vega, sentiment/tail_risks).
 - Attack the Bull’s weakest claim directly and explain what would invalidate it.
+
+STRICTNESS:
+- Use ONLY the proposal + context. Do NOT invent “upcoming earnings” or macro events unless explicitly present.
+- If critical context is missing (e.g., no term structure), say “not provided” and focus on what is knowable.
 
 Output: 4-6 sentences, no lists. End with exactly: CONVICTION: X/10 (X=1..10)."""
 
@@ -58,7 +66,11 @@ Output STRICT JSON:
   "winning_side":   "BULL" | "BEAR" | "TIE",
   "summary":        "<4-6 sentences: MUST cite concrete fields from market context (price, iv_regime/iv_atm/skew_ratio, aggregate_sentiment, portfolio delta/vega) and 1-2 key debate claims.>",
   "confidence":     0.0-1.0
-}}"""
+}}
+
+STRICTNESS:
+- Use ONLY the provided market context and transcript. Do NOT invent missing numbers.
+- If the proposal is missing/invalid or key fields are unknown, default to HOLD with low confidence and say why."""
 
 
 def _extract_conviction(text: str) -> int:

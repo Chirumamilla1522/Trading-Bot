@@ -38,6 +38,12 @@ Think step-by-step:
 4. OPPORTUNITY: Given regime + skew + term structure, what is the best structural trade?
 5. CONFIDENCE: How clean is the signal? Conflicting signals → lower confidence.
 
+STRICTNESS (must follow):
+- Use ONLY the provided JSON context. Do NOT use outside market knowledge, do NOT assume earnings dates.
+- Do NOT invent liquidity/spread facts; if not provided, say “not provided”.
+- If key fields are missing/zero/unknown (e.g., underlying_price <= 0, no near_atm_contracts, iv_regime missing),
+  you MUST choose HOLD with low confidence and state exactly what is missing.
+
 GROUNDING REQUIREMENTS (must follow):
 - Your reasoning MUST cite at least 4 concrete fields from the context, including:
   underlying_price, atm_iv, skew_ratio, iv_regime, and one term-structure detail.
@@ -56,10 +62,12 @@ Output STRICT JSON:
   "reasoning":     "<3-5 sentences: cite numbers and explain the structure you’d prefer>"
 }
 
-ABORT only for: extreme IV spike (>80%), no liquidity (spread > $5 ATM), gamma event imminent."""
+ABORT only for: (a) system-level trading halt flags in context, or (b) truly extreme stress clearly evidenced in the provided fields
+(e.g., iv_regime=EXTREME with atm_iv >= 0.80 AND term_signal=BACKWARDATION). Otherwise HOLD/PROCEED."""
 
 
 def options_specialist_node(state: FirmState) -> FirmState:
+    _t0 = __import__("time").time()
     llm = chat_llm(
         MODELS.options_specialist.active,
         agent_role="options_specialist",
@@ -79,6 +87,13 @@ def options_specialist_node(state: FirmState) -> FirmState:
         "portfolio_theta":   state.risk.portfolio_theta,
         "open_positions":    len(state.open_positions),
         "chain_analytics":   analytics,
+        "desk": {
+            "sentiment_monitor_score":    round(state.sentiment_monitor_score, 4),
+            "sentiment_monitor_source":   state.sentiment_monitor_source,
+            "news_timing_regime":        state.news_timing_regime,
+            "market_bias_score":         round(state.market_bias_score, 4),
+        },
+        "tier3_structured_digests": state.tier3_structured_digests[:8],
     }
 
     messages = [
@@ -152,4 +167,25 @@ def options_specialist_node(state: FirmState) -> FirmState:
             "opportunity": opportunity,
         },
     ))
+    try:
+        from agents.tracking.mlflow_tracing import log_agent_step
+        log_agent_step(
+            "options_specialist",
+            inputs={
+                "ticker": state.ticker,
+                "underlying_price": float(state.underlying_price or 0.0),
+                "iv_regime": str(state.iv_regime),
+                "atm_iv": float(state.iv_atm or 0.0),
+                "skew_ratio": float(state.iv_skew_ratio or 0.0),
+                "near_atm_contracts_n": len((analytics or {}).get("near_atm_contracts") or []),
+            },
+            outputs={
+                "decision": decision.value,
+                "confidence": float(confidence or 0.0),
+                "opportunity": opportunity,
+            },
+            duration_s=max(0.0, __import__("time").time() - _t0),
+        )
+    except Exception:
+        pass
     return state

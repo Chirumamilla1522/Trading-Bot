@@ -10,70 +10,112 @@
  *   • Follow-live on periodic refresh (only if the user is at the right edge)
  */
 import { createChart, ColorType, CrosshairMode, TickMarkType } from "lightweight-charts";
+import { $ as el } from "./ui_bindings.js";
 
 const BACKEND = "http://localhost:8000";
 
+/** WebKit/Tauri-safe timeouts.
+ * Important: even when AbortSignal.timeout exists, some WebKit builds abort fetches unexpectedly.
+ * So we always use our own AbortController timer.
+ */
+function fetchWithTimeout(url, init = {}, ms = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    try { controller.abort(); } catch { /* ignore */ }
+  }, ms);
+  return fetch(url, { ...init, signal: init.signal ?? controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
 const US_STOCK_TZ = "America/New_York";
 
-// ── Shared chart theme ────────────────────────────────────────────────────────
-// Palette: TradingView professional standard
-const _UP   = "#089981";   // teal-green  (TradingView default)
-const _DOWN = "#f23645";   // vivid red   (TradingView default)
-const _BG   = "#0b0b13";
-const _TEXT = "#787b86";   // muted axis labels
-const _GRID = "#161622";   // barely-there grid
-const _BORDER = "#1f1f2e";
+// ── Shared chart theme (Atlas-driven) ─────────────────────────────────────────
+// Pull from CSS variables so charts match Atlas light/dark + palette.
+function _cssVar(name, fallback) {
+  const v = getComputedStyle(document.body).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+function atlasChartColors() {
+  const isDark = document.body.classList.contains("theme-dark");
+  const bg = _cssVar("--atlas-bg", isDark ? "#121110" : "#faf8f5");
+  const ink = _cssVar("--atlas-ink", isDark ? "#fafaf9" : "#1c1917");
+  const line = _cssVar("--atlas-line", isDark ? "rgba(250,250,249,0.1)" : "rgba(28,25,23,0.09)");
+  const accent = _cssVar("--atlas-accent", isDark ? "#fb923c" : "#c2410c");
+  return {
+    bg,
+    text: isDark ? "rgba(250,250,249,0.55)" : "rgba(28,25,23,0.55)",
+    grid: line,
+    border: line,
+    up: _cssVar("--atlas-up", "#15803d"),
+    down: _cssVar("--atlas-down", "#b91c1c"),
+    crosshair: isDark ? "rgba(250,250,249,0.14)" : "rgba(28,25,23,0.14)",
+    crosshairLabel: isDark ? "rgba(38,34,32,0.92)" : "rgba(255,255,255,0.92)",
+    accent,
+  };
+}
+
+// Cache semantic series colors (used by bars + volume).
+const _C0 = atlasChartColors();
+const _UP = _C0.up || "#059669";
+const _DOWN = _C0.down || "#dc2626";
 
 const crosshairLine = {
-  color: "rgba(255, 255, 255, 0.12)",
+  color: atlasChartColors().crosshair,
   width: 1,
   style: 3,   // dashed
   visible: true,
   labelVisible: true,
-  labelBackgroundColor: "#1c1c2e",
+  labelBackgroundColor: atlasChartColors().crosshairLabel,
 };
 
-const chartLayout = {
-  layout: {
-    background: { type: ColorType.Solid, color: _BG },
-    textColor: _TEXT,
-    fontSize: 11,
-    fontFamily: '"IBM Plex Mono", monospace',
-    attributionLogo: false,
-  },
-  grid: {
-    vertLines: { color: _GRID, style: 0 },
-    horzLines: { color: _GRID, style: 0 },
-  },
-  crosshair: {
-    mode: CrosshairMode.Normal,
-    vertLine: crosshairLine,
-    horzLine: { ...crosshairLine },
-  },
-  rightPriceScale: {
-    borderColor: _BORDER,
-    scaleMargins: { top: 0.06, bottom: 0.22 },
-    entireTextOnly: false,
-    autoScale: true,
-    mode: 0,
-    ticksVisible: false,
-  },
-  timeScale: {
-    borderColor: _BORDER,
-    lockVisibleTimeRangeOnResize: true,
-    rightOffset: 10,
-    barSpacing: 7,
-    fixLeftEdge: false,
-    fixRightEdge: false,
-    visible: true,
-    timeVisible: true,
-    secondsVisible: false,
-    ticksVisible: false,
-  },
-  handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
-  handleScale:  { mouseWheel: true, pinch: true, axisPressedMouseMove: true, axisDoubleClickReset: true },
-  kineticScroll: { touch: true, mouse: true },
-};
+function chartLayout() {
+  const c = atlasChartColors();
+  return {
+    layout: {
+      background: { type: ColorType.Solid, color: c.bg },
+      textColor: c.text,
+      fontSize: 11,
+      fontFamily: '"JetBrains Mono", ui-monospace, monospace',
+      attributionLogo: false,
+    },
+    grid: {
+      vertLines: { color: c.grid, style: 0 },
+      horzLines: { color: c.grid, style: 0 },
+    },
+    crosshair: {
+      mode: CrosshairMode.Normal,
+      vertLine: { ...crosshairLine, color: c.crosshair, labelBackgroundColor: c.crosshairLabel },
+      horzLine: { ...crosshairLine, color: c.crosshair, labelBackgroundColor: c.crosshairLabel },
+    },
+    rightPriceScale: {
+      borderColor: c.border,
+      scaleMargins: { top: 0.06, bottom: 0.22 },
+      entireTextOnly: false,
+      autoScale: true,
+      mode: 0,
+      ticksVisible: false,
+    },
+    timeScale: {
+      borderColor: c.border,
+      lockVisibleTimeRangeOnResize: true,
+      rightOffset: 10,
+      barSpacing: 7,
+      fixLeftEdge: false,
+      fixRightEdge: false,
+      visible: true,
+      timeVisible: true,
+      secondsVisible: false,
+      ticksVisible: true,
+      /** Default is 8 — our ET time strings need a bit more room or ticks get suppressed. */
+      tickMarkMaxCharacterLength: 14,
+      minimumHeight: 28,
+    },
+    handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
+    handleScale:  { mouseWheel: true, pinch: true, axisPressedMouseMove: true, axisDoubleClickReset: true },
+    kineticScroll: { touch: true, mouse: true },
+  };
+}
 
 // ── Module state ──────────────────────────────────────────────────────────────
 let tickerChart  = null;
@@ -84,6 +126,10 @@ let tickerSeriesMode = "candles";
 let portfolioChart  = null;
 let portfolioSeries = null;
 
+// ── Request coalescing (prevents WebKit abort storms) ─────────────────────────
+let _barsFetchController = null;
+let _barsFetchSeq = 0;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function _chartDims(el, fallbackH) {
   const w = Math.max(el?.clientWidth || el?.offsetWidth || 0, 300);
@@ -93,8 +139,8 @@ function _chartDims(el, fallbackH) {
 }
 
 export function resizeTerminalCharts() {
-  const tc = document.getElementById("ticker-chart");
-  const pc = document.getElementById("portfolio-chart");
+  const tc = el("ticker-chart");
+  const pc = el("portfolio-chart");
   if (tc && tickerChart) {
     const { width, height } = _chartDims(tc, 360);
     tickerChart.resize(width, height);
@@ -114,7 +160,7 @@ function fitTickerTimeScale() {
 }
 
 // ── Daily-mode: use YYYY-MM-DD string, not unix, so library handles weekends ─
-const DAILY_CHART_TIMEFRAMES = new Set(["5D", "1M", "3M", "6M", "1Y", "1Day"]);
+const DAILY_CHART_TIMEFRAMES = new Set(["5D", "1M", "3M", "6M", "1Y", "2Y", "5Y", "MAX", "1Day"]);
 
 function barChartTime(timeframe, unixSec) {
   const t = Math.floor(Number(unixSec));
@@ -129,8 +175,42 @@ function barChartTime(timeframe, unixSec) {
   return t;   // UTCTimestamp (integer seconds)
 }
 
-function normalizeBars(bars) {
+function _utcDayKey(unixSec) {
+  const t = Math.floor(Number(unixSec));
+  if (!Number.isFinite(t) || t <= 0) return null;
+  const d = new Date(t * 1000);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/**
+ * Dedupe by unix second; for daily chart modes also collapse rows that share the same UTC calendar day
+ * (Yahoo occasionally returns two rows for one session → lightweight-charts requires strictly increasing time).
+ */
+function normalizeBars(bars, timeframe) {
   if (!bars?.length) return [];
+  const tf = timeframe || "";
+  const dailyMode = tf && DAILY_CHART_TIMEFRAMES.has(tf);
+
+  if (dailyMode) {
+    const byDay = new Map();
+    for (const b of bars) {
+      const t = Math.floor(Number(b.time));
+      if (!Number.isFinite(t) || t <= 0) continue;
+      const dk = _utcDayKey(t);
+      if (!dk) continue;
+      const prev = byDay.get(dk);
+      if (!prev || t >= Math.floor(Number(prev.time))) {
+        byDay.set(dk, b);
+      }
+    }
+    return [...byDay.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([, v]) => v);
+  }
+
   const byTime = new Map();
   for (const b of bars) {
     const t = Math.floor(Number(b.time));
@@ -138,6 +218,38 @@ function normalizeBars(bars) {
     byTime.set(t, b);
   }
   return [...byTime.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+}
+
+/** Merge rows that share the same logical chart `time` (strictly increasing for lightweight-charts). */
+function _dedupeChartRows(rows, mode) {
+  const m = new Map();
+  for (const r of rows) {
+    const key = typeof r.time === "string" ? `s:${r.time}` : `n:${Number(r.time)}`;
+    const prev = m.get(key);
+    if (!prev) {
+      m.set(key, { ...r });
+      continue;
+    }
+    if (mode === "candles") {
+      m.set(key, {
+        time: r.time,
+        open: prev.open,
+        high: Math.max(Number(prev.high), Number(r.high)),
+        low: Math.min(Number(prev.low), Number(r.low)),
+        close: r.close,
+      });
+    } else {
+      m.set(key, { time: r.time, value: r.value });
+    }
+  }
+  const out = [...m.values()];
+  out.sort((a, b) => {
+    if (typeof a.time === "string" && typeof b.time === "string") {
+      return a.time.localeCompare(b.time);
+    }
+    return Number(a.time) - Number(b.time);
+  });
+  return out;
 }
 
 function chartTimeToUnixSec(t) {
@@ -162,19 +274,34 @@ function shouldFollowRealtimeAfterRefresh(visibleRange, previousLastBarUnix) {
 }
 
 function barLimitForTimeframe(tf) {
-  const m = { "1Min": 500, "5Min": 500, "1D": 500, "15Min": 350, "1Hour": 180, "1Day": 260 };
+  const m = {
+    "1Min": 500,
+    "5Min": 500,
+    "1D": 500,
+    "15Min": 350,
+    "1Hour": 180,
+    "1Day": 8000,
+    "5D": 40,
+    "1M": 260,
+    "3M": 400,
+    "6M": 500,
+    "1Y": 800,
+    "2Y": 520,
+    "5Y": 1300,
+    "MAX": 8000,
+  };
   return m[tf] ?? 180;
 }
 
 const _barSizeLabels = {
-  "5D": "1d", "1M": "1d", "3M": "1d", "6M": "1d", "1Y": "1d",
+  "5D": "1d", "1M": "1d", "3M": "1d", "6M": "1d", "1Y": "1d", "2Y": "1d", "5Y": "1d", "MAX": "1d",
   "1D": "5m", "1Day": "1d", "1Hour": "1h", "15Min": "15m", "5Min": "5m", "1Min": "1m",
 };
 function chartBarSizeLabel(tf) { return _barSizeLabels[tf] || tf || "—"; }
 
-function updateChartBarSizeLabel(tf) {
-  const el = document.getElementById("ticker-chart-bar-size");
-  if (el) el.textContent = chartBarSizeLabel(tf);
+export function updateChartBarSizeLabel(tf) {
+  const bar = el("ticker-chart-bar-size");
+  if (bar) bar.textContent = chartBarSizeLabel(tf);
 }
 
 // ── X-axis tick mark formatter ────────────────────────────────────────────────
@@ -183,16 +310,19 @@ function makeTickMarkFormatter(tf) {
   return function tickMarkFormatter(time, type) {
     const isDaily = DAILY_CHART_TIMEFRAMES.has(tf);
     if (isDaily) {
-      // time is a "YYYY-MM-DD" string or BusinessDay object
+      // `time` is usually YYYY-MM-DD, BusinessDay, or unix from the library — normalize to ms.
       let ms;
       if (typeof time === "string") {
-        ms = Date.parse(time + "T00:00:00Z");
-      } else if (typeof time === "object" && time.year) {
+        ms = Date.parse(time.includes("T") ? time : `${time}T00:00:00Z`);
+      } else if (time && typeof time === "object" && "year" in time) {
         ms = Date.UTC(time.year, time.month - 1, time.day);
       } else {
-        ms = Number(time) * 1000;
+        const n = Number(time);
+        ms = Number.isFinite(n) ? n * 1000 : NaN;
       }
+      if (!Number.isFinite(ms)) return null;
       const d = new Date(ms);
+      if (!Number.isFinite(d.getTime())) return null;
       if (type === TickMarkType.Year) {
         return String(d.getUTCFullYear());
       }
@@ -201,8 +331,11 @@ function makeTickMarkFormatter(tf) {
       }
       return d.toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" });
     }
-    // Intraday: time is integer unix seconds
-    const d = new Date(Number(time) * 1000);
+    // Intraday: UTCTimestamp as number (or string); fall back to default formatter if unsure.
+    const sec = typeof time === "number" ? time : typeof time === "string" ? Number(time) : NaN;
+    if (!Number.isFinite(sec)) return null;
+    const d = new Date(sec * 1000);
+    if (!Number.isFinite(d.getTime())) return null;
     if (type === TickMarkType.DayOfMonth) {
       return d.toLocaleDateString("en-US", { timeZone: US_STOCK_TZ, month: "short", day: "numeric" });
     }
@@ -212,7 +345,7 @@ function makeTickMarkFormatter(tf) {
       timeZone: US_STOCK_TZ,
       hour: "2-digit", minute: "2-digit",
       hourCycle: "h23",
-    }).format(d);  // e.g. "13:30"
+    }).format(d); // e.g. "13:30"
   };
 }
 
@@ -227,14 +360,19 @@ function fmtCrosshairTime(tf, time) {
     if (typeof time === "string") ms = Date.parse(time + "T00:00:00Z");
     else if (typeof time === "object" && time.year) ms = Date.UTC(time.year, time.month - 1, time.day);
     else ms = Number(time) * 1000;
+    if (!Number.isFinite(ms)) return "";
     const d = new Date(ms);
+    if (!Number.isFinite(d.getTime())) return "";
     const parts = new Intl.DateTimeFormat("en-US", {
       timeZone: "UTC", month: "short", day: "numeric", year: "numeric",
     }).formatToParts(d);
     const p = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
     return `${p.month} ${p.day}, ${p.year}`;
   }
-  const d = new Date(Number(time) * 1000);
+  const ms = Number(time) * 1000;
+  if (!Number.isFinite(ms)) return "";
+  const d = new Date(ms);
+  if (!Number.isFinite(d.getTime())) return "";
   const opts = {
     timeZone: US_STOCK_TZ,
     month: "short", day: "numeric",
@@ -242,10 +380,15 @@ function fmtCrosshairTime(tf, time) {
     hourCycle: "h23",
   };
   if (tf === "1Min") opts.second = "2-digit";
-  const parts = new Intl.DateTimeFormat("en-US", opts).formatToParts(d);
-  const p = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
-  const hms = tf === "1Min" ? `${p.hour}:${p.minute}:${p.second}` : `${p.hour}:${p.minute}`;
-  return `${p.month} ${Number(p.day)}  ${hms} ET`;
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", opts).formatToParts(d);
+    const p = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+    const hms = tf === "1Min" ? `${p.hour}:${p.minute}:${p.second}` : `${p.hour}:${p.minute}`;
+    return `${p.month} ${Number(p.day)}  ${hms} ET`;
+  } catch {
+    // If WebView Intl chokes on an edge-case date, fail soft.
+    return "";
+  }
 }
 
 // ── Price formatter ───────────────────────────────────────────────────────────
@@ -281,24 +424,37 @@ function priceFormat(price) {
 
 // ── Chart init ────────────────────────────────────────────────────────────────
 export function initTerminalCharts() {
-  const tc = document.getElementById("ticker-chart");
-  const pc = document.getElementById("portfolio-chart");
-  if (!tc || !pc) return;
+  const tc = el("ticker-chart");
+  const pc = el("portfolio-chart");
+  // Always render the main ticker plot even if the portfolio panel is hidden/removed.
+  if (!tc) return;
 
   tc.style.height = "400px";
-  pc.style.height = "180px";
+  if (pc) pc.style.height = "180px";
 
   const d1 = _chartDims(tc, 400);
-  const d2 = _chartDims(pc, 180);
+  const d2 = pc ? _chartDims(pc, 180) : null;
 
-  const tf = document.getElementById("ticker-chart-tf")?.value || "5D";
+  // Guard: if we ever initialize with a 0px container in WebView, the chart can render invisible.
+  // Wait a frame and try again (Tauri layout sometimes settles after initial JS).
+  if (d1.width <= 320 || d1.height <= 200) {
+    requestAnimationFrame(() => {
+      try {
+        const d = _chartDims(tc, 400);
+        if (tickerChart && d.width > 320 && d.height > 200) tickerChart.resize(d.width, d.height);
+      } catch { /* ignore */ }
+    });
+  }
 
+  const tf = el("ticker-chart-tf")?.value || "5D";
+
+  const layout = chartLayout();
   tickerChart = createChart(tc, {
-    ...chartLayout,
+    ...layout,
     width: d1.width,
     height: d1.height,
     timeScale: {
-      ...chartLayout.timeScale,
+      ...layout.timeScale,
       tickMarkFormatter: makeTickMarkFormatter(tf),
     },
     localization: {
@@ -310,19 +466,21 @@ export function initTerminalCharts() {
     },
   });
 
-  portfolioChart = createChart(pc, {
-    ...chartLayout,
-    width: d2.width,
-    height: d2.height,
-  });
+  if (pc && d2) {
+    portfolioChart = createChart(pc, {
+      ...layout,
+      width: d2.width,
+      height: d2.height,
+    });
+  }
 
   const ro = new ResizeObserver(() => resizeTerminalCharts());
   ro.observe(tc);
-  ro.observe(pc);
+  if (pc) ro.observe(pc);
 
-  const styleSel = document.getElementById("ticker-chart-style");
-  const tfSel    = document.getElementById("ticker-chart-tf");
-  const portSel  = document.getElementById("portfolio-chart-metric");
+  const styleSel = el("ticker-chart-style");
+  const tfSel    = el("ticker-chart-tf");
+  const portSel  = el("portfolio-chart-metric");
 
   styleSel?.addEventListener("change", () => {
     tickerSeriesMode = styleSel.value || "candles";
@@ -340,7 +498,7 @@ export function initTerminalCharts() {
   updateChartBarSizeLabel(tf);
 
   tickerChart.subscribeCrosshairMove((param) => {
-    const hint = document.getElementById("ticker-chart-crosshair");
+    const hint = el("ticker-chart-crosshair");
     if (!hint) return;
     if (!param.point || param.time === undefined || !tickerSeries) {
       // Crosshair left — restore the last bar summary
@@ -364,7 +522,7 @@ export function initTerminalCharts() {
 
 // ── OHLCV hint helper ─────────────────────────────────────────────────────────
 function _showOhlcvHint(bar, rawBar, tf) {
-  const hint = document.getElementById("ticker-chart-crosshair");
+  const hint = el("ticker-chart-crosshair");
   if (!hint || !bar) return;
   const tlab = fmtCrosshairTime(tf || window.__lastTickerTf || "5D", bar.time);
   let line = tlab;
@@ -395,10 +553,10 @@ function applyTickerBars(bars, opts = {}) {
   if (!tickerChart) return;
 
   if (!bars?.length) { clearTickerSeries(); return; }
-  const clean = normalizeBars(bars);
+  const tf   = window.__lastTickerTf || "5D";
+  const clean = normalizeBars(bars, tf);
   if (!clean.length) { clearTickerSeries(); return; }
 
-  const tf   = window.__lastTickerTf || "5D";
   const toT  = (unix) => barChartTime(tf, unix);
   const mode = tickerSeriesMode || "candles";
   const intraday = !DAILY_CHART_TIMEFRAMES.has(tf);
@@ -410,6 +568,10 @@ function applyTickerBars(bars, opts = {}) {
       secondsVisible: intraday && tf === "1Min",
       rightOffset: intraday ? 10 : 6,
       tickMarkFormatter: makeTickMarkFormatter(tf),
+      tickMarkMaxCharacterLength: 14,
+      minimumHeight: 28,
+      ticksVisible: true,
+      visible: true,
     },
     localization: {
       locale: "en-US",
@@ -440,15 +602,30 @@ function applyTickerBars(bars, opts = {}) {
   }
   if (!rows.length) { clearTickerSeries(); return; }
 
-  // Build volume rows — match candle colors
-  const volRows = [];
+  const priceRows = _dedupeChartRows(rows, mode);
+
+  // Build volume rows — match candle colors; dedupe/sum volume per chart time
+  const volMap = new Map();
   for (const b of clean) {
     const time = toT(b.time);
     const vol  = Number(b.volume);
     if (time == null || !Number.isFinite(vol) || vol <= 0) continue;
     const up = Number(b.close) >= Number(b.open);
-    volRows.push({ time, value: vol, color: up ? `${_UP}55` : `${_DOWN}55` });
+    const key = typeof time === "string" ? `s:${time}` : `n:${Number(time)}`;
+    const prev = volMap.get(key);
+    const color = up ? `${_UP}55` : `${_DOWN}55`;
+    if (!prev) {
+      volMap.set(key, { time, value: vol, color });
+    } else {
+      volMap.set(key, { time, value: prev.value + vol, color });
+    }
   }
+  const volRows = [...volMap.values()].sort((a, b) => {
+    if (typeof a.time === "string" && typeof b.time === "string") {
+      return a.time.localeCompare(b.time);
+    }
+    return Number(a.time) - Number(b.time);
+  });
 
   // Build lookup for crosshair tooltip
   const lookup = new Map();
@@ -506,8 +683,14 @@ function applyTickerBars(bars, opts = {}) {
       lastValueVisible: true,
     });
   }
-  tickerSeries.setData(rows);
-  _showOhlcvHint(rows[rows.length - 1], clean[clean.length - 1], tf);
+  tickerSeries.setData(priceRows);
+  const lastPr = priceRows[priceRows.length - 1];
+  const lastRaw =
+    clean.find(b => {
+      const to = toT(b.time);
+      return to === lastPr.time || String(to) === String(lastPr.time);
+    }) || clean[clean.length - 1];
+  _showOhlcvHint(lastPr, lastRaw, tf);
 
   // Volume histogram on a separate price scale so it doesn't overlap candles
   if (volRows.length) {
@@ -545,10 +728,10 @@ function applyTickerBars(bars, opts = {}) {
 // ── Underlying stats strip ────────────────────────────────────────────────────
 function renderUnderlyingDetail(u) {
   const set = (id, text, cls) => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.textContent = text;
-    el.className = cls ? `sd-val ${cls}` : "sd-val";
+    const node = el(id);
+    if (!node) return;
+    node.textContent = text;
+    node.className = cls ? `sd-val ${cls}` : "sd-val";
   };
   if (!u || !u.has_data) {
     ["sd-last","sd-chg1","sd-chgper","sd-hl","sd-vol"].forEach(id => set(id, "—"));
@@ -567,7 +750,7 @@ function renderUnderlyingDetail(u) {
 // ── Public: load bars from backend ───────────────────────────────────────────
 export async function loadTickerBars(ticker, timeframe, opts = {}) {
   const { preserveRange = false, followRealtime = false, bust = false, limit: limitOverride } = opts;
-  const srcEl = document.getElementById("ticker-chart-source");
+  const srcEl = el("ticker-chart-source");
   const tf    = timeframe || "5D";
   window.__lastTickerTf = tf;
   updateChartBarSizeLabel(tf);
@@ -578,12 +761,25 @@ export async function loadTickerBars(ticker, timeframe, opts = {}) {
   const lim = limitOverride ?? barLimitForTimeframe(tf);
 
   try {
+    // Cancel any in-flight request: we only care about the latest user intent.
+    _barsFetchSeq += 1;
+    const seq = _barsFetchSeq;
+    try { _barsFetchController?.abort(); } catch { /* ignore */ }
+    _barsFetchController = new AbortController();
+
     const bustParam = bust ? "&bust=true" : "";
-    const r = await fetch(
+    const r = await fetchWithTimeout(
       `${BACKEND}/bars/${encodeURIComponent(ticker)}?timeframe=${encodeURIComponent(tf)}&limit=${lim}${bustParam}`,
-      { signal: AbortSignal.timeout(30000) },
+      { signal: _barsFetchController.signal },
+      45000,
     );
-    if (!r.ok) throw new Error(String(r.status));
+    // If a newer request started while this was in-flight, drop this response.
+    if (seq !== _barsFetchSeq) return;
+    if (!r.ok) {
+      let detail = "";
+      try { detail = await r.text(); } catch { /* ignore */ }
+      throw new Error(`bars ${r.status}${detail ? ` · ${detail.slice(0, 180)}` : ""}`);
+    }
     const data = await r.json();
 
     const prevBars = window.__lastTickerBars;
@@ -592,7 +788,14 @@ export async function loadTickerBars(ticker, timeframe, opts = {}) {
     window.__lastTickerBars = data.bars || [];
 
     if (srcEl) {
-      const labels = { alpaca: "Alpaca", alphavantage: "AlphaVantage", yfinance: "Yahoo", synthetic: "Synthetic", no_data: "No data" };
+      const labels = {
+        alpaca: "Alpaca",
+        alphavantage: "AlphaVantage",
+        yfinance: "Yahoo",
+        sqlite_daily: "Local DB",
+        synthetic: "Synthetic",
+        no_data: "No data",
+      };
       srcEl.textContent = labels[data.source] || data.source || "—";
     }
 
@@ -603,9 +806,16 @@ export async function loadTickerBars(ticker, timeframe, opts = {}) {
       previousLastBarUnix,
     });
   } catch (e) {
+    // Abort is expected during rapid clicking / range switching; don't treat as a failure.
+    if (e?.name === "AbortError" || String(e?.message || e).toLowerCase().includes("aborted")) {
+      return;
+    }
     if (srcEl) srcEl.textContent = "err";
     renderUnderlyingDetail(null);
     console.warn("loadTickerBars", e);
+    try {
+      window.__showToast?.(`Chart data error: ${String(e?.message || e)}`, "err", 7000);
+    } catch { /* ignore */ }
   }
 }
 
@@ -640,17 +850,17 @@ export function applyPortfolioPoints(points, metric) {
 }
 
 export async function loadPortfolioSeries() {
-  const el = document.getElementById("portfolio-chart-count");
+  const countEl = el("portfolio-chart-count");
   try {
-    const r = await fetch(`${BACKEND}/portfolio_series?points=300`, { signal: AbortSignal.timeout(5000) });
+    const r = await fetchWithTimeout(`${BACKEND}/portfolio_series?points=300`, {}, 8000);
     if (!r.ok) throw new Error(String(r.status));
     const data = await r.json();
     window.__lastPortfolioPoints = data.points || [];
-    if (el) el.textContent = `${window.__lastPortfolioPoints.length} pts`;
-    const metric = document.getElementById("portfolio-chart-metric")?.value || "equity";
+    if (countEl) countEl.textContent = `${window.__lastPortfolioPoints.length} pts`;
+    const metric = el("portfolio-chart-metric")?.value || "equity";
     applyPortfolioPoints(window.__lastPortfolioPoints, metric);
   } catch (e) {
-    if (el) el.textContent = "—";
+    if (countEl) countEl.textContent = "—";
     console.warn("loadPortfolioSeries", e);
   }
 }

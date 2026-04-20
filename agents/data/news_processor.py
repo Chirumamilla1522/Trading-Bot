@@ -14,7 +14,8 @@ Every 5 minutes:
   4. Write cross-stock impact map to firm_state for other agents
 
 The LLM output is structured JSON — cached per headline SHA to avoid reprocessing.
-Storage: logs/news/processed_YYYYMMDD.jsonl (one line per article, rotated daily)
+Storage: SQLite (default) via ``agents/data/news_processed_db.py``.
+Optional legacy JSONL mirror can be enabled for debugging.
 """
 from __future__ import annotations
 
@@ -27,6 +28,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+from agents.config import NEWS_PROCESSOR_MAX_ARTICLES_PER_CYCLE, NEWS_PROCESSOR_MIN_IMPACT
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +70,8 @@ class ProcessedArticle(BaseModel):
     processed:        bool  = False
     llm_model:        str   = ""
     processing_time_ms: int = 0
+    # Token-efficient representation for other agents (built deterministically).
+    llm_digest:       str   = ""
 
 
 class CrossStockImpact(BaseModel):
@@ -98,11 +103,74 @@ def _today_file() -> pathlib.Path:
 
 
 def _append_to_disk(article: ProcessedArticle) -> None:
+    # Optional debug mirror
+    if os.getenv("NEWS_JSONL", "0").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            with open(_today_file(), "a", encoding="utf-8") as f:
+                f.write(article.model_dump_json() + "\n")
+        except Exception as exc:
+            log.debug("Failed to persist article %s: %s", article.id, exc)
     try:
-        with open(_today_file(), "a", encoding="utf-8") as f:
-            f.write(article.model_dump_json() + "\n")
-    except Exception as exc:
-        log.debug("Failed to persist article %s: %s", article.id, exc)
+        from agents.data.news_processed_db import upsert_processed_article
+
+        upsert_processed_article(article.model_dump(mode="json"))
+    except Exception:
+        pass
+
+
+def _compact_text(s: str, max_chars: int) -> str:
+    if not s:
+        return ""
+    x = " ".join(str(s).replace("\n", " ").split())
+    if len(x) <= max_chars:
+        return x
+    return x[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _build_llm_digest(a: ProcessedArticle) -> str:
+    """
+    Compact, low-token representation: one line with the fields agents actually use.
+    Keep this short so prompts stay cheap.
+    """
+    try:
+        pub = a.published_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+    except Exception:
+        pub = ""
+    tickers = ",".join([t for t in (a.original_tickers or [])[:4] if t])  # cap
+    impacts = []
+    for af in (a.affected_tickers or [])[:3]:
+        t = (af.get("ticker") or "").upper().strip()
+        imp = af.get("impact")
+        rel = af.get("relationship") or ""
+        if not t:
+            continue
+        try:
+            imp_f = float(imp)
+            imp_s = f"{imp_f:+.2f}"
+        except Exception:
+            imp_s = ""
+        rel_s = _compact_text(rel, 46)
+        impacts.append(f"{t}{imp_s}" + (f"({rel_s})" if rel_s else ""))
+    impacts_s = ";".join(impacts)
+    themes = ",".join([(x or "").strip() for x in (a.themes or [])[:3] if (x or "").strip()])
+    risks = ",".join([(x or "").strip() for x in (a.tail_risks or [])[:2] if (x or "").strip()])
+    head = _compact_text(a.headline, 140)
+    summ = _compact_text(a.summary, 120)
+    core = f"{pub} {a.source or ''} [{a.category}|imp{a.impact_magnitude}|sent{a.sentiment:+.2f}] {head}"
+    bits = []
+    if tickers:
+        bits.append(f"t:{tickers}")
+    if impacts_s:
+        bits.append(f"aff:{impacts_s}")
+    if themes:
+        bits.append(f"th:{themes}")
+    if risks:
+        bits.append(f"risk:{risks}")
+    if summ:
+        bits.append(f"sum:{summ}")
+    tail = " | ".join(bits)
+    out = (core + (" | " + tail if tail else "")).strip()
+    return _compact_text(out, 420)
 
 
 def load_today_articles() -> list[ProcessedArticle]:
@@ -162,6 +230,12 @@ IMPORTANT for cross-stock impacts:
 - Only include S&P 500 tickers in affected_tickers
 
 Our trading universe (top 50 S&P 500): {universe}
+
+STRICTNESS (must follow):
+- Use ONLY the provided headline/summary text; do NOT inject outside knowledge or “known” relationships.
+- If you are unsure about an affected ticker, omit it (prefer false negatives over false positives).
+- `impact` must be a JSON number in [-1.0, 1.0] (no strings, no expressions).
+- `affected_tickers` MUST include only tickers from the provided universe list; otherwise omit.
 
 Output STRICT JSON array, one object per headline:
 [
@@ -290,33 +364,74 @@ def process_new_headlines(
     universe: list[str],
 ) -> tuple[list[ProcessedArticle], dict[str, CrossStockImpact]]:
     """
-    Process any unprocessed headlines from the news feed.
-    Returns (newly_processed, updated_cross_impact_map).
+    Drain the NewsPriorityQueue in priority order (highest FinBERT/heuristic
+    score first). Every cycle the Tier-2 LLM processes up to
+    ``NEWS_PROCESSOR_MAX_ARTICLES_PER_CYCLE`` unseen items and marks them seen,
+    so over successive cycles **all** ingested news is eventually enriched —
+    with the most market-relevant items processed first.
 
-    Called by the tier-2 loop every 5 minutes.
+    Falls back to the raw ``news_feed`` (legacy behavior) if the queue is
+    unavailable or empty, to keep dry-runs and offline paths working.
     """
     global _processed_articles, _cross_impact_map
 
-    # Find unprocessed articles
-    new_articles: list[ProcessedArticle] = []
-    for item in news_feed:
-        aid = _article_id(item.headline)
-        if aid in _processed_ids:
-            continue
-        _processed_ids.add(aid)
-        new_articles.append(ProcessedArticle(
-            id               = aid,
-            headline         = item.headline,
-            source           = getattr(item, "source", ""),
-            url              = getattr(item, "url", ""),
-            summary          = getattr(item, "summary", ""),
-            published_at     = item.published_at,
-            original_tickers = getattr(item, "tickers", []),
-            sentiment        = getattr(item, "sentiment", 0.0),
-        ))
+    # 1) Prefer the priority queue (production + dry-run both push to it).
+    picked_items: list[Any] = []
+    picked_ids: list[str] = []
+    queue = None
+    try:
+        from agents.data.news_priority_queue import AGENT_NEWS_ANALYST, get_queue
 
-    if not new_articles:
-        return [], _cross_impact_map
+        queue = get_queue()
+        max_n = max(5, int(NEWS_PROCESSOR_MAX_ARTICLES_PER_CYCLE))
+        for q in queue.take_unseen(AGENT_NEWS_ANALYST, max_n):
+            if _article_id(q.item.headline) in _processed_ids:
+                queue.mark_seen(AGENT_NEWS_ANALYST, [q.id])
+                continue
+            picked_items.append(q.item)
+            picked_ids.append(q.id)
+    except Exception as exc:
+        log.debug("NewsPriorityQueue unavailable (%s) — falling back to news_feed.", exc)
+
+    # 2) Fallback: legacy impact-gate over raw feed (only if queue yielded nothing).
+    if not picked_items:
+        candidates: list[tuple[float, Any]] = []
+        for item in news_feed:
+            aid = _article_id(item.headline)
+            if aid in _processed_ids:
+                continue
+            impact = float(getattr(item, "impact_score", 0.0) or 0.0)
+            urg = (getattr(item, "urgency_tier", "T2") or "T2").upper()
+            conf = float(getattr(item, "confidence", 0.0) or 0.0)
+            sent = float(getattr(item, "sentiment", 0.0) or 0.0)
+            volp = float(getattr(item, "vol_prob", 0.0) or 0.0)
+            if urg != "T0" and impact < float(NEWS_PROCESSOR_MIN_IMPACT):
+                continue
+            urg_bonus = 10.0 if urg == "T0" else 5.0 if urg == "T1" else 0.0
+            score = urg_bonus + impact + 0.35 * volp + 0.25 * abs(sent) * (0.25 + min(1.0, conf))
+            candidates.append((score, item))
+        if not candidates:
+            return [], _cross_impact_map
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        max_n = max(5, int(NEWS_PROCESSOR_MAX_ARTICLES_PER_CYCLE))
+        picked_items = [it for _, it in candidates[:max_n]]
+
+    new_articles: list[ProcessedArticle] = []
+    for item in picked_items:
+        aid = _article_id(item.headline)
+        _processed_ids.add(aid)
+        new_articles.append(
+            ProcessedArticle(
+                id=aid,
+                headline=item.headline,
+                source=getattr(item, "source", ""),
+                url=getattr(item, "url", ""),
+                summary=getattr(item, "summary", ""),
+                published_at=item.published_at,
+                original_tickers=getattr(item, "tickers", []),
+                sentiment=getattr(item, "sentiment", 0.0),
+            )
+        )
 
     # Process through LLM (batches of 15)
     BATCH_SIZE = 15
@@ -329,8 +444,35 @@ def process_new_headlines(
 
     # Persist to disk and memory
     for a in processed:
+        # Build a compact representation that downstream agents can paste into prompts.
+        # This is deterministic (no extra LLM calls).
+        try:
+            a.llm_digest = _build_llm_digest(a)
+        except Exception:
+            a.llm_digest = ""
         _append_to_disk(a)
         _processed_articles.append(a)
+
+    # Maintenance: keep DB lean and rollups fresh (best-effort).
+    try:
+        from agents.data.news_processed_db import purge_older_than, rebuild_rollups_for_ticker
+
+        # Keep 90 days so we can compute week-over-week / month-over-month.
+        purge_older_than(90)
+        # Update rollups only for tickers we touched in this batch.
+        touched: set[str] = set()
+        for a in processed:
+            for t in (a.original_tickers or [])[:10]:
+                if t:
+                    touched.add(str(t).upper().strip())
+            for af in (a.affected_tickers or [])[:20]:
+                tt = (af.get("ticker") or "").upper().strip()
+                if tt:
+                    touched.add(tt)
+        for t in list(touched)[:60]:
+            rebuild_rollups_for_ticker(t, lookback_days=90)
+    except Exception:
+        pass
 
     # Trim memory buffer
     if len(_processed_articles) > MAX_MEMORY_ARTICLES:
@@ -338,6 +480,15 @@ def process_new_headlines(
 
     # Rebuild cross-stock impact map from recent processed articles
     _rebuild_cross_impact_map()
+
+    # Tell the priority queue these items were analyzed (so next cycle drains lower-priority tail).
+    if queue is not None and picked_ids:
+        try:
+            from agents.data.news_priority_queue import AGENT_NEWS_ANALYST
+
+            queue.mark_seen(AGENT_NEWS_ANALYST, picked_ids)
+        except Exception:
+            pass
 
     return processed, _cross_impact_map
 
@@ -409,3 +560,30 @@ def get_articles_affecting_ticker(ticker: str, limit: int = 20) -> list[dict]:
         if len(matching) >= limit:
             break
     return [a.model_dump(mode="json") for a in matching]
+
+
+def get_llm_news_digests(ticker: str, limit: int = 12) -> list[str]:
+    """
+    Token-efficient news context for prompts.
+    Pulls from the SQLite store (preferred) and falls back to in-memory buffer.
+    """
+    t = ticker.upper().strip()
+    try:
+        from agents.data.news_processed_db import get_llm_digests_for_ticker
+
+        rows = get_llm_digests_for_ticker(t, limit=limit)
+        if rows:
+            return rows
+    except Exception:
+        pass
+    out: list[str] = []
+    for a in reversed(_processed_articles):
+        if t in (a.original_tickers or []):
+            if a.llm_digest:
+                out.append(a.llm_digest)
+        elif any(af.get("ticker") == t for af in (a.affected_tickers or [])):
+            if a.llm_digest:
+                out.append(a.llm_digest)
+        if len(out) >= limit:
+            break
+    return out
