@@ -1915,6 +1915,11 @@ class TickerRequest(BaseModel):
 class OptionRightsRequest(BaseModel):
     rights: str  # CALL | PUT | BOTH
 
+
+class RiskLimitsRequest(BaseModel):
+    max_drawdown_pct: float | None = None  # percent (0-100) in UI
+    position_cap_pct: float | None = None  # percent (0-100) in UI
+
 @app.post("/set_ticker")
 async def set_ticker(req: TickerRequest):
     from agents.data import market_activity
@@ -1958,6 +1963,35 @@ async def set_option_rights(req: OptionRightsRequest):
     except Exception:
         pass
     return {"ok": True, "allowed_option_rights": firm_state.allowed_option_rights}
+
+
+@app.post("/risk/limits")
+async def set_risk_limits(req: RiskLimitsRequest):
+    """
+    User-provided risk inputs for RiskManager hard gates.
+    Values are percentages in the UI (0-100). Stored as fractions (0-1).
+    """
+    r = firm_state.risk
+    if req.max_drawdown_pct is not None:
+        v = max(0.0, min(100.0, float(req.max_drawdown_pct)))
+        r.max_drawdown_pct = v / 100.0
+    if req.position_cap_pct is not None:
+        v = max(0.0, min(100.0, float(req.position_cap_pct)))
+        r.position_cap_pct = v / 100.0
+    firm_state.risk = r
+    try:
+        from agents.state_persistence import save_state
+
+        await asyncio.to_thread(save_state, firm_state)
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "risk": {
+            "max_drawdown_pct": firm_state.risk.max_drawdown_pct,
+            "position_cap_pct": firm_state.risk.position_cap_pct,
+        },
+    }
 
 
 @app.post("/state/reset")
