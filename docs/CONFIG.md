@@ -68,7 +68,18 @@ Template: `config/.env.example`
 
 ### Persistence
 
-- **App DB (SQLite)**:
+- **PostgreSQL (recommended for moving machines / multi-device)**:
+  - `WAREHOUSE_POSTGRES_URL` (or `DATABASE_URL`) — `postgresql://user:pass@host:5432/dbname`
+  - `WAREHOUSE_AUTO_SCHEMA` — default `1` (true). Set `0` to disable automatic DDL on startup.
+
+  When `WAREHOUSE_POSTGRES_URL` is set, the app will prefer PostgreSQL for:
+  - app key/value snapshots (`FirmState`)
+  - XAI reasoning log
+  - processed news store + rollups
+  - portfolio series
+  - daily bars + fundamentals (via warehouse tables)
+
+- **Local DB (SQLite; fallback / single-machine)**:
   - `APP_DB_PATH` — path to the unified SQLite DB (default `cache/app.sqlite3`)
   - `AGENTIC_DATA_DIR` — if set and `APP_DB_PATH` is unset, DB paths are placed under this directory
 
