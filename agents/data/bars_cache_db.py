@@ -18,6 +18,15 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+def _pg_enabled() -> bool:
+    try:
+        from agents.data.warehouse import postgres as wh
+
+        return wh.is_postgres_enabled()
+    except Exception:
+        return False
+
+
 
 def _root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -93,6 +102,16 @@ def _connect() -> sqlite3.Connection:
 def upsert_daily_bars(ticker: str, bars: list[dict[str, Any]]) -> None:
     t = ticker.upper().strip()
     raw = json.dumps(bars, separators=(",", ":"), ensure_ascii=False)
+    # If Postgres warehouse is configured, treat it as the primary store.
+    if _pg_enabled():
+        try:
+            from agents.data.warehouse.postgres import enqueue_daily_bars, ensure_schema
+
+            ensure_schema()
+            enqueue_daily_bars(t, bars, "pg_primary")
+        except Exception:
+            pass
+        return
     con = _connect()
     try:
         con.execute(
@@ -107,17 +126,43 @@ def upsert_daily_bars(ticker: str, bars: list[dict[str, Any]]) -> None:
         con.commit()
     finally:
         con.close()
-    try:
-        from agents.data.warehouse.postgres import enqueue_daily_bars
-
-        enqueue_daily_bars(t, bars, "sqlite_daily")
-    except Exception:
-        pass
 
 
 def get_daily_bars(ticker: str) -> tuple[list[dict[str, Any]] | None, int | None]:
     """Return (bars oldest→newest, fetched_at_unix) or (None, None)."""
     t = ticker.upper().strip()
+    if _pg_enabled():
+        try:
+            from agents.data.warehouse import postgres as wh
+
+            with wh.connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT bar_date, open, high, low, close, volume, EXTRACT(EPOCH FROM ingested_at)::bigint
+                        FROM ohlc_1d
+                        WHERE symbol = %s
+                        ORDER BY bar_date ASC
+                        """,
+                        (t,),
+                    )
+                    rows = cur.fetchall()
+            if not rows:
+                return None, None
+            bars: list[dict[str, Any]] = []
+            fetched_at = None
+            for d, o, h, lo, c, v, ing in rows:
+                # Convert date to UTC midnight unix for chart compatibility
+                ts = int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
+                entry: dict[str, Any] = {"time": ts, "open": float(o), "high": float(h), "low": float(lo), "close": float(c)}
+                if v is not None:
+                    entry["volume"] = float(v)
+                bars.append(entry)
+                if fetched_at is None or int(ing) > int(fetched_at):
+                    fetched_at = int(ing)
+            return bars, fetched_at
+        except Exception:
+            return None, None
     con = _connect()
     try:
         row = con.execute(
