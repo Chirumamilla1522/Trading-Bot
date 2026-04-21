@@ -1912,6 +1912,9 @@ async def cancel_order(order_id: str):
 class TickerRequest(BaseModel):
     ticker: str
 
+class OptionRightsRequest(BaseModel):
+    rights: str  # CALL | PUT | BOTH
+
 @app.post("/set_ticker")
 async def set_ticker(req: TickerRequest):
     from agents.data import market_activity
@@ -1936,6 +1939,25 @@ async def set_ticker(req: TickerRequest):
     # Pre-warm the drilldown cache for the new ticker
     asyncio.create_task(_scanner.fetch_drilldown(t))
     return {"ticker": firm_state.ticker}
+
+
+@app.post("/set_option_rights")
+async def set_option_rights(req: OptionRightsRequest):
+    """
+    Persist a user preference restricting what option rights are considered for new proposals.
+    Values: CALL | PUT | BOTH.
+    """
+    val = (req.rights or "").strip().upper()
+    if val not in ("CALL", "PUT", "BOTH"):
+        raise HTTPException(status_code=400, detail={"error": "rights must be CALL|PUT|BOTH"})
+    firm_state.allowed_option_rights = val
+    try:
+        from agents.state_persistence import save_state
+
+        await asyncio.to_thread(save_state, firm_state)
+    except Exception:
+        pass
+    return {"ok": True, "allowed_option_rights": firm_state.allowed_option_rights}
 
 
 @app.post("/state/reset")
