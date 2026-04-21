@@ -315,6 +315,14 @@ PROCEED:
 Do not output anything except the JSON object."""
 
 
+def _build_strategist_system_prompt(state: FirmState) -> str:
+    guide = _build_regime_strategy_guide(
+        state.allowed_option_rights,
+        state.allowed_option_structures,
+    )
+    return STRATEGIST_PROMPT_HEAD + guide + STRATEGIST_PROMPT_TAIL
+
+
 def strategist_node(state: FirmState) -> FirmState:
     # Gate: need specialist conviction OR non-news structure (bias / anomaly)
     if (
