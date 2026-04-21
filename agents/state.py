@@ -273,6 +273,15 @@ class FirmState(BaseModel):
     # "BOTH" (default) means no restriction.
     allowed_option_rights: str = "BOTH"   # "CALL" | "PUT" | "BOTH"
 
+    # Restrict which option *structures* the Strategist may propose.
+    # Values:
+    # - "SINGLE"        (1-leg long/short option)
+    # - "VERTICAL"      (2-leg same right+expiry spread)
+    # - "IRON_CONDOR"   (4 legs: 2 puts + 2 calls, same expiry)
+    # - "CALENDAR"      (2 legs, same right+strike, different expiry)
+    # "ALL" (default) means no restriction.
+    allowed_option_structures: list[str] = Field(default_factory=lambda: ["ALL"])
+
     # Risk
     risk:             RiskMetrics = Field(default_factory=RiskMetrics)
 
