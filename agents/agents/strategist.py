@@ -36,7 +36,7 @@ REGIME-TO-STRATEGY MATRIX (follow this unless contradicted by skew/sentiment):
 │-────────────────┴────────────────┴────────────────────────────────────────────────────────┘
 
 Skew modifiers:
-- skew_ratio > 1.25 (fear bid): prefer put credit spreads, iron condors weighted to put side
+- skew_ratio > 1.25 (fear bid): prefer put credit spreads, 
 - skew_ratio < 0.85 (call bid): prefer call credit spreads, bearish positioning
 - sentiment > 0.4: lean bullish; sentiment < -0.3: lean bearish
 """
@@ -45,6 +45,7 @@ Skew modifiers:
 # │ HIGH_VOL        │ ELEVATED/EXTREME│ Iron Condor (wide wings), HOLD                        │
 # │ LOW_VOL         │ LOW            │ Long Straddle, Long Strangle, Calendar Spread          │
 # └─
+# iron condors weighted to put side
 SYSTEM_PROMPT = f"""ROLE: Strategist (Strategy selection + proposal assembly)
 You are the strategy constructor for an autonomous options desk. Your job is to choose ONE
 options strategy that fits THIS ticker RIGHT NOW, using the provided context (price/IV/skew/regime,
