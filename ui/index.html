@@ -545,6 +545,25 @@
           <div class="rec-empty">No pending recommendations</div>
         </div>
 
+        <!-- Risk limits (user input to RiskManager hard gates) -->
+        <div class="panel-header">
+          <span>RISK LIMITS</span>
+          <span class="panel-header-sub" style="opacity:.7">used by RiskManager</span>
+        </div>
+        <div class="risk-limits">
+          <div class="risk-grid">
+            <label class="risk-lab" for="atlas-risk-max-dd">Max drawdown %</label>
+            <input id="atlas-risk-max-dd" class="risk-input" type="number" min="0" max="100" step="0.1" value="5.0"/>
+
+            <label class="risk-lab" for="atlas-risk-pos-cap">Position cap %</label>
+            <input id="atlas-risk-pos-cap" class="risk-input" type="number" min="0" max="100" step="0.1" value="2.0"/>
+          </div>
+          <div class="risk-actions">
+            <button id="atlas-risk-save" class="risk-save">Save</button>
+            <span id="atlas-risk-status" class="risk-status"></span>
+          </div>
+        </div>
+
         <!-- Buy/Sell (order ticket) below account data -->
         <div id="atlas-order-ticket" class="order-ticket">
           <div class="ot-header">
