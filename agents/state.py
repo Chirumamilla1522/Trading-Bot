@@ -141,6 +141,19 @@ class StockPosition(BaseModel):
     cost_basis:    float = 0.0
 
 
+class StockTradeProposal(BaseModel):
+    """Single-lot stock order recommendation (used in advisory mode)."""
+
+    side:        OrderSide
+    qty:         float = 0.0
+    order_type:  str = "market"          # "market" | "limit"
+    limit_price: float | None = None
+    rationale:   str = ""
+    confidence:  float = 0.0
+    stop_loss_pct: float | None = None   # optional guidance (not enforced by broker order)
+    take_profit_pct: float | None = None # optional guidance (not enforced by broker order)
+
+
 # ─── Proposed trade ─────────────────────────────────────────────────────────────
 
 class TradeLeg(BaseModel):
@@ -185,8 +198,10 @@ class Recommendation(BaseModel):
     """
     id:                   str   = Field(default_factory=lambda: str(uuid.uuid4())[:12])
     ticker:               str
+    asset_type:           str = "option"   # "option" | "stock"
     strategy_name:        str
-    proposal:             TradeProposal
+    proposal:             TradeProposal | None = None
+    stock_proposal:       StockTradeProposal | None = None
     bull_conviction:      int   = 0
     bear_conviction:      int   = 0
     desk_head_reasoning:  str   = ""
@@ -250,6 +265,7 @@ class FirmState(BaseModel):
     buying_power:     float = 0.0
     account_equity:   float = 0.0  # broker total equity (cash + positions); 0 = unknown
     pending_proposal: TradeProposal | None = None
+    pending_stock_proposal: StockTradeProposal | None = None
     debate_record:    DebateRecord | None = None
 
     # User / desk preferences
@@ -262,12 +278,14 @@ class FirmState(BaseModel):
 
     # Agent decisions (written by each agent, read by supervisor)
     analyst_decision:   AgentDecision = AgentDecision.HOLD
+    stock_decision:     AgentDecision = AgentDecision.HOLD
     sentiment_decision: AgentDecision = AgentDecision.HOLD
     risk_decision:      AgentDecision = AgentDecision.HOLD
     trader_decision:    AgentDecision = AgentDecision.HOLD
 
     # Agent confidence scores (0.0–1.0)
     analyst_confidence:    float = 0.0
+    stock_confidence:      float = 0.0
     sentiment_confidence:  float = 0.0
     risk_confidence:       float = 0.0
     strategy_confidence:   float = 0.0
