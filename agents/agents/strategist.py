@@ -79,11 +79,10 @@ _STRATEGY_DEFS: dict[str, tuple[str, str]] = {
     "Iron Condor": ("IRON_CONDOR", "MIXED"),
     "Iron Butterfly": ("IRON_CONDOR", "MIXED"),
     "Iron Condor (wide wings)": ("IRON_CONDOR", "MIXED"),
-    # Multi-right 2L structures: classifier often returns OTHER — recommend only when ALL structures.
+    # Multi-right 2L structures: classifier often returns OTHER — show in guide only when ALL structures.
     "Short Strangle": ("VERTICAL", "MIXED"),
     "Long Straddle": ("VERTICAL", "MIXED"),
     "Long Strangle": ("VERTICAL", "MIXED"),
-    "Protective Collar (long put + short OTM call)": ("VERTICAL", "MIXED"),
     "Call Calendar": ("CALENDAR", "CALL"),
     "Put Calendar": ("CALENDAR", "PUT"),
 }
