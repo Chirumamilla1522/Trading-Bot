@@ -1516,11 +1516,11 @@ function updateMetrics(state) {
 
   // Option structure preference (SINGLE / VERTICAL / IRON_CONDOR / CALENDAR / ALL).
   try {
-    const want = Array.isArray(state.allowed_option_structures) ? state.allowed_option_structures : ["ALL"];
+    const want = Array.isArray(state.allowed_option_structures) ? state.allowed_option_structures : ["SINGLE"];
     const vals = (want || []).map(x => String(x || "").toUpperCase()).filter(Boolean);
     const sel = el("ot-structures");
     if (sel && sel.options?.length) {
-      const normalized = vals.includes("ALL") || !vals.length ? ["ALL"] : vals;
+      const normalized = vals.includes("ALL") || !vals.length ? (vals.includes("ALL") ? ["ALL"] : ["SINGLE"]) : vals;
       const set = new Set(normalized);
       // Avoid fighting user mid-selection.
       if (document.activeElement !== sel) {
@@ -3886,7 +3886,7 @@ el("ot-structures")?.addEventListener("change", async () => {
     await fetchWithTimeout(`${BACKEND}/set_option_structures`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ structures: structures.length ? structures : ["ALL"] }),
+      body: JSON.stringify({ structures: structures.length ? structures : ["SINGLE"] }),
     }, 5000);
     try { pollState(); } catch { /* ignore */ }
   } catch { /* ignore */ }
