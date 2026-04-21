@@ -71,6 +71,11 @@ def _connect():
     return psycopg.connect(_dsn(), autocommit=True)
 
 
+def connect():
+    """Public connection helper (autocommit)."""
+    return _connect()
+
+
 def _split_ddl(sql_text: str) -> list[str]:
     """psycopg executes one statement per call; split on statement boundaries."""
     parts: list[str] = []
