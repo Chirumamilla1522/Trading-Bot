@@ -2379,8 +2379,35 @@ async def approve_recommendation(rec_id: str):
     if firm_state.kill_switch_active or firm_state.circuit_breaker_tripped:
         return {"error": "Cannot execute: kill switch or circuit breaker active"}
 
-    # Execute the proposal by temporarily setting autopilot and running the trader node
+    # Execute the recommendation (options multi-leg OR stock order)
     try:
+        if getattr(rec, "asset_type", "option") == "stock":
+            sp = rec.stock_proposal
+            if sp is None:
+                return {"error": "Stock recommendation missing stock_proposal"}
+            result = await asyncio.to_thread(
+                _get_ems().place_stock_order,
+                rec.ticker,
+                sp.side.value.lower(),
+                float(sp.qty),
+                str(sp.order_type),
+                float(sp.limit_price) if sp.limit_price is not None else None,
+                "day",
+            )
+            if "error" in (result or {}):
+                return {"error": str(result)[:200]}
+            rec.status = "approved"
+            rec.resolved_at = datetime.now(timezone.utc)
+            firm_state.reasoning_log.append(ReasoningEntry(
+                agent="System", action="PROCEED",
+                reasoning=f"User approved STOCK recommendation for {rec.ticker}. Order submitted.",
+                inputs={"recommendation_id": rec.id},
+                outputs={"order_result": str(result)[:200]},
+            ))
+            asyncio.create_task(_post_order_sync())
+            await _persist_firm_state()
+            return {"status": "approved", "order_result": str(result)[:200]}
+
         from agents.agents.trader import _validate_and_build_legs
         from agents.state import GreeksSnapshot
 
