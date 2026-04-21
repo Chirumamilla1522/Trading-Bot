@@ -275,7 +275,9 @@ RESEARCHER DEBATE GUIDANCE:
   researcher agents. Use their conviction scores (1-10) to calibrate your confidence.
 - If bull_conviction > bear_conviction by ≥3 → lean bullish strategy.
 - If bear_conviction > bull_conviction by ≥3 → lean bearish or HOLD.
-- If convictions are equal → favour market-neutral (iron condor, butterfly).
+- If convictions are equal → favour market-neutral structures that are still allowed by
+  `allowed_option_structures` (e.g. iron condor / iron butterfly when IRON_CONDOR or ALL is allowed);
+  otherwise prefer HOLD.
 
 TIMING (multi-horizon, not HFT):
 - If `news_timing_regime` is fresh, headline+price narratives may justify directional risk.
