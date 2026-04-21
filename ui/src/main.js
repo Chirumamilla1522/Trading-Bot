@@ -3003,6 +3003,7 @@ function _fmtRecAge(iso) {
 }
 
 function _renderRecCard(rec) {
+  const asset = String(rec.asset_type || "option");
   const confClass = rec.confidence >= 0.7 ? "rec-conf-high"
                   : rec.confidence >= 0.4 ? "rec-conf-mid"
                   : "rec-conf-low";
@@ -3031,11 +3032,17 @@ function _renderRecCard(rec) {
 
   const maxRisk = rec.proposal ? Number(rec.proposal.max_risk || 0) : 0;
   const target = rec.proposal ? Number(rec.proposal.target_return || 0) : 0;
+  const stockQty = rec.stock_proposal ? Number(rec.stock_proposal.qty || 0) : 0;
+  const stockSide = rec.stock_proposal ? String(rec.stock_proposal.side || "") : "";
   const statsHtml = rec.proposal
     ? `<div class="rec-card-stats">
          <div class="rec-stat"><span class="rec-stat-label">Max risk</span><span class="rec-stat-val">$${maxRisk.toFixed(0)}</span></div>
          <div class="rec-stat"><span class="rec-stat-label">Target</span><span class="rec-stat-val">$${target.toFixed(0)}</span></div>
        </div>`
+    : rec.stock_proposal
+      ? `<div class="rec-card-stats">
+           <div class="rec-stat"><span class="rec-stat-label">Order</span><span class="rec-stat-val">${esc(stockSide)} ${Number.isFinite(stockQty) ? stockQty : 0} sh</span></div>
+         </div>`
     : "";
 
   const reasoning = esc(rec.desk_head_reasoning || "").slice(0, 900);
@@ -3088,6 +3095,7 @@ function _renderRecCard(rec) {
   const maxLossEst = rec.pricing?.max_loss_estimate_usd;
   const riskMath = rec.pricing?.risk_math;
   const proposalRationale = esc(rec.proposal?.rationale || "").slice(0, 2000);
+  const stockRationale = esc(rec.stock_proposal?.rationale || "").slice(0, 2000);
   const sl = rec.proposal?.stop_loss_pct != null ? Number(rec.proposal.stop_loss_pct) : null;
   const tp = rec.proposal?.take_profit_pct != null ? Number(rec.proposal.take_profit_pct) : null;
 
@@ -3106,6 +3114,17 @@ function _renderRecCard(rec) {
          </div>
          ${riskMath ? `<div class="rec-details-sub">${esc(String(riskMath))}</div>` : ""}
        </div>`
+    : rec.stock_proposal
+      ? `<div class="rec-details-block">
+           <div class="rec-details-title">Stock order</div>
+           <div class="rec-details-text">
+             <div><b>Side</b>: ${esc(stockSide)} · <b>Qty</b>: ${Number.isFinite(stockQty) ? stockQty : 0} shares</div>
+             <div class="rec-details-sub">Order type: ${esc(String(rec.stock_proposal.order_type || "market"))}${rec.stock_proposal.limit_price != null ? ` · Limit $${Number(rec.stock_proposal.limit_price).toFixed(2)}` : ""}</div>
+             ${(rec.stock_proposal.stop_loss_pct != null || rec.stock_proposal.take_profit_pct != null)
+               ? `<div class="rec-details-sub">Guidance: stop‑loss ${rec.stock_proposal.stop_loss_pct != null ? `${Math.round(Number(rec.stock_proposal.stop_loss_pct)*100)}%` : "—"} · take‑profit ${rec.stock_proposal.take_profit_pct != null ? `${Math.round(Number(rec.stock_proposal.take_profit_pct)*100)}%` : "—"}.</div>`
+               : ""}
+           </div>
+         </div>`
     : "";
 
   const rationaleBlock = proposalRationale
@@ -3113,6 +3132,11 @@ function _renderRecCard(rec) {
          <div class="rec-details-title">Strategist rationale</div>
          <div class="rec-details-text rec-details-text--mono">${proposalRationale}</div>
        </div>`
+    : stockRationale
+      ? `<div class="rec-details-block">
+           <div class="rec-details-title">StockSpecialist rationale</div>
+           <div class="rec-details-text rec-details-text--mono">${stockRationale}</div>
+         </div>`
     : "";
 
   const detailsHtml = (legsTable || riskExplain || rationaleBlock)
@@ -3142,6 +3166,7 @@ function _renderRecCard(rec) {
         </div>
         <div class="rec-card-badges">
           ${timeBadges}
+          <span class="rec-card-asset" title="Asset type">${esc(asset.toUpperCase())}</span>
           <span class="rec-card-confidence ${confClass}" title="Desk confidence">${pct}%</span>
         </div>
       </div>
