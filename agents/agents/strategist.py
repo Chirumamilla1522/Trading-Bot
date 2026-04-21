@@ -61,36 +61,178 @@ def _classify_option_structure(proposal: TradeProposal) -> str:
     except Exception:
         return "OTHER"
 
-# Regime → strategy recommendation table (injected into prompt)
-_REGIME_STRATEGY_GUIDE = """
-REGIME-TO-STRATEGY MATRIX (follow this unless contradicted by skew/sentiment):
-┌─────────────────┬────────────────┬────────────────────────────────────────────────────────┐
-│ Market Regime   │ IV Regime      │ Preferred Strategies                                   │
-├─────────────────┼────────────────┼────────────────────────────────────────────────────────┤
-│ TRENDING_UP     │ LOW/NORMAL     │ Bull Call Spread, Long Call, Bull Put Spread (credit)  │
-│ TRENDING_UP     │ ELEVATED       │ Bull Put Spread (collect premium), Cash-secured Put    │
-│ TRENDING_DOWN   │ ELEVATED       │ Bear Put Spread, Long Put, Protective Collar           │
-│ TRENDING_DOWN   │ EXTREME        │ HOLD or Bear Put Spread (small size)                   │
-│-────────────────┴────────────────┴────────────────────────────────────────────────────────┘
 
-Skew modifiers:
-- skew_ratio > 1.25 (fear bid): prefer put credit spreads, 
-- skew_ratio < 0.85 (call bid): prefer call credit spreads, bearish positioning
-- sentiment > 0.4: lean bullish; sentiment < -0.3: lean bearish
-"""
+# Strategy catalog: display label → (structure bucket for user filter, leg-rights family)
+# structure must match FirmState / enforcement: SINGLE | VERTICAL | IRON_CONDOR | CALENDAR
+# rights: CALL | PUT | MIXED (multi-leg strategies that require both calls and puts)
+_STRATEGY_DEFS: dict[str, tuple[str, str]] = {
+    "Long Call": ("SINGLE", "CALL"),
+    "Long Put": ("SINGLE", "PUT"),
+    "Short Put (premium / cash-secured style)": ("SINGLE", "PUT"),
+    "Bull Call Spread": ("VERTICAL", "CALL"),
+    "Bear Call Spread": ("VERTICAL", "CALL"),
+    "Bull Put Spread (credit)": ("VERTICAL", "PUT"),
+    "Bull Put Spread (collect premium)": ("VERTICAL", "PUT"),
+    "Bear Put Spread": ("VERTICAL", "PUT"),
+    "Bear Put Spread (small size)": ("VERTICAL", "PUT"),
+    "Protective Collar (long put + short OTM call)": ("VERTICAL", "MIXED"),
+    "Iron Condor": ("IRON_CONDOR", "MIXED"),
+    "Iron Butterfly": ("IRON_CONDOR", "MIXED"),
+    "Iron Condor (wide wings)": ("IRON_CONDOR", "MIXED"),
+    "Short Strangle": ("VERTICAL", "MIXED"),  # 2 legs; desk may classify as OTHER — use only when ALL
+    "Long Straddle": ("VERTICAL", "MIXED"),
+    "Long Strangle": ("VERTICAL", "MIXED"),
+    "Call Calendar": ("CALENDAR", "CALL"),
+    "Put Calendar": ("CALENDAR", "PUT"),
+}
 
-# MEAN_REVERTING  │ ELEVATED       │ Iron Condor, Iron Butterfly, Short Strangle            │
-# │ HIGH_VOL        │ ELEVATED/EXTREME│ Iron Condor (wide wings), HOLD                        │
-# │ LOW_VOL         │ LOW            │ Long Straddle, Long Strangle, Calendar Spread          │
-# └─
-# iron condors weighted to put side
-SYSTEM_PROMPT = f"""ROLE: Strategist (Strategy selection + proposal assembly)
+# Full regime matrix: (market_regime, iv_regime, [strategy labels])
+_REGIME_MATRIX_ROWS: list[tuple[str, str, list[str]]] = [
+    (
+        "TRENDING_UP",
+        "LOW/NORMAL",
+        ["Bull Call Spread", "Long Call", "Bull Put Spread (credit)"],
+    ),
+    (
+        "TRENDING_UP",
+        "ELEVATED",
+        ["Bull Put Spread (collect premium)", "Short Put (premium / cash-secured style)"],
+    ),
+    (
+        "TRENDING_DOWN",
+        "ELEVATED",
+        ["Bear Put Spread", "Long Put", "Protective Collar (long put + short OTM call)"],
+    ),
+    (
+        "TRENDING_DOWN",
+        "EXTREME",
+        ["Bear Put Spread (small size)", "Long Put"],
+    ),
+    (
+        "MEAN_REVERTING",
+        "ELEVATED",
+        ["Iron Condor", "Iron Butterfly", "Short Strangle"],
+    ),
+    (
+        "HIGH_VOL",
+        "ELEVATED/EXTREME",
+        ["Iron Condor (wide wings)", "Long Put"],
+    ),
+    (
+        "LOW_VOL",
+        "LOW",
+        ["Long Straddle", "Long Strangle", "Call Calendar", "Put Calendar"],
+    ),
+]
+
+
+def _normalize_allowed_structures(structs: list[str] | None) -> set[str]:
+    vals = [str(x or "").strip().upper() for x in (structs or []) if str(x or "").strip()]
+    if not vals:
+        return {"SINGLE"}
+    if "ALL" in vals:
+        return {"ALL"}
+    return set(vals)
+
+
+def _strategy_allowed(
+    label: str,
+    allowed_structs: set[str],
+    allowed_rights: str,
+) -> bool:
+    """Whether this strategy label may appear in the regime guide."""
+    spec = _STRATEGY_DEFS.get(label)
+    if not spec:
+        return False
+    sk, rk = spec
+    if "ALL" not in allowed_structs and sk not in allowed_structs:
+        return False
+    ar = (allowed_rights or "BOTH").strip().upper()
+    if ar == "BOTH":
+        return True
+    if ar not in ("CALL", "PUT"):
+        return True
+    if rk == "MIXED":
+        return False
+    return rk == ar
+
+
+def _filter_row_strategies(
+    labels: list[str],
+    allowed_structs: set[str],
+    allowed_rights: str,
+) -> list[str]:
+    return [lb for lb in labels if _strategy_allowed(lb, allowed_structs, allowed_rights)]
+
+
+def _build_regime_strategy_guide(
+    allowed_option_rights: str | None,
+    allowed_option_structures: list[str] | None,
+) -> str:
+    """
+    Regime → strategy table filtered by user preference (option rights + allowed structures).
+    """
+    ar = (allowed_option_rights or "BOTH").strip().upper()
+    if ar not in ("CALL", "PUT", "BOTH"):
+        ar = "BOTH"
+    allowed_structs = _normalize_allowed_structures(allowed_option_structures)
+
+    lines: list[str] = [
+        "REGIME-TO-STRATEGY MATRIX (filtered to your `allowed_option_rights` and "
+        "`allowed_option_structures` in context — follow unless contradicted by skew/sentiment):",
+        "┌─────────────────┬──────────────────┬────────────────────────────────────────────────────────┐",
+        "│ Market Regime   │ IV Regime        │ Preferred Strategies                                   │",
+        "├─────────────────┼──────────────────┼────────────────────────────────────────────────────────┤",
+    ]
+
+    any_cell = False
+    for mreg, ivreg, labels in _REGIME_MATRIX_ROWS:
+        kept = _filter_row_strategies(labels, allowed_structs, ar)
+        if not kept:
+            cell = "HOLD (no allowed structure/rights match for this row)"
+        else:
+            any_cell = True
+            cell = ", ".join(kept)
+        # Keep table readable: truncate long cells for the box (LLM still gets full names)
+        display = cell if len(cell) <= 54 else cell[:51] + "..."
+        lines.append(f"│ {mreg:<15} │ {ivreg:<16} │ {display:<54} │")
+
+    lines.append("└─────────────────┴──────────────────┴────────────────────────────────────────────────────────┘")
+
+    if not any_cell:
+        lines.insert(
+            1,
+            "NOTE: With your current structure/rights filters, every regime row fell back to HOLD; "
+            "still obey skew/sentiment and prefer HOLD unless a row above lists concrete strategies.",
+        )
+
+    lines.append("")
+    lines.append("Skew / sentiment modifiers (apply only when they match your allowed rights/structures):")
+    if ar in ("PUT", "BOTH") and ("ALL" in allowed_structs or "VERTICAL" in allowed_structs):
+        lines.append(
+            "- skew_ratio > 1.25 (fear bid): lean put credit / put-side verticals where allowed."
+        )
+    if ar in ("CALL", "BOTH") and ("ALL" in allowed_structs or "VERTICAL" in allowed_structs):
+        lines.append(
+            "- skew_ratio < 0.85 (call bid): lean call credit / call-side verticals where allowed."
+        )
+    lines.append("- sentiment > 0.4: lean bullish; sentiment < -0.3: lean bearish")
+    if "ALL" in allowed_structs or "IRON_CONDOR" in allowed_structs:
+        lines.append(
+            "- In range-bound / elevated IV regimes, iron condors are often put-wing heavy when "
+            "skew is bid to the downside (when IC is allowed)."
+        )
+    return "\n".join(lines)
+
+
+STRATEGIST_PROMPT_HEAD = """ROLE: Strategist (Strategy selection + proposal assembly)
 You are the strategy constructor for an autonomous options desk. Your job is to choose ONE
 options strategy that fits THIS ticker RIGHT NOW, using the provided context (price/IV/skew/regime,
 sentiment, researcher conviction, portfolio risk limits), and then assemble a valid proposal.
 
-{_REGIME_STRATEGY_GUIDE}
+"""
 
+STRATEGIST_PROMPT_TAIL = """
 OPTION-RIGHTS CONSTRAINT (must follow):
 - The context includes `allowed_option_rights` which is one of: CALL | PUT | BOTH.
 - If CALL: all legs MUST be CALL.
