@@ -82,6 +82,66 @@ class OptionsSpecialistOutput(BaseModel):
     def norm_conf(cls, v): return _clamp_confidence(v)
 
 
+# ─── Stock Specialist ─────────────────────────────────────────────────────────
+
+class StockSpecialistOutput(BaseModel):
+    decision:     str   = "HOLD"
+    side:         str   = "BUY"    # BUY | SELL (ignored if HOLD)
+    qty:          float = 0.0
+    order_type:   str   = "market" # market | limit
+    limit_price:  float | None = None
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+    confidence:   float = 0.5
+    reasoning:    str   = ""
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def norm_decision(cls, v): return _coerce_decision(v)
+
+    @field_validator("side", mode="before")
+    @classmethod
+    def norm_side(cls, v):
+        s = str(v or "").strip().upper()
+        return "SELL" if s.startswith("S") else "BUY"
+
+    @field_validator("qty", mode="before")
+    @classmethod
+    def norm_qty(cls, v):
+        try:
+            return max(0.0, float(v))
+        except Exception:
+            return 0.0
+
+    @field_validator("order_type", mode="before")
+    @classmethod
+    def norm_ot(cls, v):
+        s = str(v or "").strip().lower()
+        return "limit" if s.startswith("l") else "market"
+
+    @field_validator("limit_price", mode="before")
+    @classmethod
+    def norm_lp(cls, v):
+        if v is None or v == "":
+            return None
+        try:
+            x = float(v)
+            return x if x > 0 else None
+        except Exception:
+            return None
+
+    @field_validator("stop_loss_pct", "take_profit_pct", "confidence", mode="before")
+    @classmethod
+    def norm_pct(cls, v):
+        if v is None or v == "":
+            return None if v is None else None
+        try:
+            # pct fields can be null; confidence must be clamped
+            return _clamp_confidence(v)
+        except Exception:
+            return None
+
+
 # ─── Sentiment Analyst ─────────────────────────────────────────────────────────
 
 class HeadlineScore(BaseModel):
