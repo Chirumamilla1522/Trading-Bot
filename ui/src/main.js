@@ -1513,7 +1513,60 @@ function updateMetrics(state) {
       if (sel.value !== rights) sel.value = rights;
     }
   } catch { /* ignore */ }
+
+  // Risk limits inputs (max drawdown / position cap). Server stores fractions; UI shows %.
+  try {
+    const dd = r.max_drawdown_pct != null ? Number(r.max_drawdown_pct) * 100 : null;
+    const pc = r.position_cap_pct != null ? Number(r.position_cap_pct) * 100 : null;
+    const ddEl = el("risk-max-dd");
+    const pcEl = el("risk-pos-cap");
+    if (ddEl && dd != null && Number.isFinite(dd) && document.activeElement !== ddEl) {
+      ddEl.value = dd.toFixed(1);
+    }
+    if (pcEl && pc != null && Number.isFinite(pc) && document.activeElement !== pcEl) {
+      pcEl.value = pc.toFixed(1);
+    }
+  } catch { /* ignore */ }
 }
+
+// ── Risk limits (user inputs) ───────────────────────────────────────────────
+el("risk-save")?.addEventListener("click", async () => {
+  const btn = el("risk-save");
+  const st  = el("risk-status");
+  const ddEl = el("risk-max-dd");
+  const pcEl = el("risk-pos-cap");
+  if (!btn || !ddEl || !pcEl) return;
+  const maxDD = parseFloat(ddEl.value);
+  const posCap = parseFloat(pcEl.value);
+  btn.disabled = true;
+  if (st) { st.textContent = "Saving…"; st.style.opacity = "0.85"; }
+  try {
+    const r = await fetchWithTimeout(`${BACKEND}/risk/limits`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        max_drawdown_pct: Number.isFinite(maxDD) ? maxDD : null,
+        position_cap_pct: Number.isFinite(posCap) ? posCap : null,
+      }),
+    }, 5000);
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data?.ok === false) {
+      const msg = data?.detail?.error || data?.detail || data?.error || "Save failed";
+      if (st) { st.textContent = `✗ ${String(msg)}`; st.style.opacity = "0.9"; }
+      showToast(String(msg), "err", 7000);
+    } else {
+      if (st) { st.textContent = "✓ Saved"; st.style.opacity = "0.8"; }
+      showToast("Risk limits saved.", "ok", 3000);
+      try { pollState(); } catch {}
+    }
+  } catch (e) {
+    if (st) st.textContent = `✗ ${e?.message || e}`;
+    showToast(`Could not save risk limits: ${e?.message || e}`, "err", 8000);
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { try { if (st) st.textContent = ""; } catch {} }, 3500);
+  }
+});
 
 function setMetric(id, val, prefix, signed, decimals = 2, suffix = "") {
   const node = el(id);
