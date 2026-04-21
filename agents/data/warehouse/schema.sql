@@ -95,3 +95,93 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_fetch_log_created ON fetch_log (created_at DESC);
+
+-- ── App persistence (replaces local SQLite when configured) ──────────────────
+-- Key/value snapshot store (FirmState, small runtime state).
+CREATE TABLE IF NOT EXISTS app_kv (
+    k           TEXT PRIMARY KEY,
+    v_json      JSONB NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- XAI audit log (agent reasoning). Append-only.
+CREATE TABLE IF NOT EXISTS xai_log (
+    id          BIGSERIAL PRIMARY KEY,
+    ts_iso      TEXT NOT NULL,
+    symbol      TEXT NOT NULL REFERENCES instrument(symbol) ON DELETE CASCADE,
+    agent       TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    reasoning   TEXT NOT NULL,
+    inputs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    outputs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    trade_id    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_xai_ts ON xai_log (ts_iso);
+CREATE INDEX IF NOT EXISTS idx_xai_agent ON xai_log (agent);
+CREATE INDEX IF NOT EXISTS idx_xai_symbol_ts ON xai_log (symbol, ts_iso);
+
+-- Market events (generic JSON payload, used for audit/diagnostics).
+CREATE TABLE IF NOT EXISTS market_event (
+    id          BIGSERIAL PRIMARY KEY,
+    ts_unix     DOUBLE PRECISION NOT NULL,
+    symbol      TEXT NOT NULL REFERENCES instrument(symbol) ON DELETE CASCADE,
+    channel     TEXT NOT NULL,
+    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_me_symbol_ts ON market_event (symbol, ts_unix DESC);
+
+-- ── Processed news store (LLM-friendly) ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS processed_article (
+    id TEXT PRIMARY KEY,
+    headline TEXT NOT NULL,
+    source TEXT,
+    url TEXT,
+    summary TEXT,
+    published_at TIMESTAMPTZ NOT NULL,
+    fetched_at TIMESTAMPTZ NOT NULL,
+    category TEXT,
+    sentiment DOUBLE PRECISION,
+    confidence DOUBLE PRECISION,
+    impact_magnitude INTEGER,
+    llm_digest TEXT,
+    themes_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    tail_risks_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    original_tickers_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    affected_tickers_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    llm_model TEXT,
+    processing_time_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_pa_pub ON processed_article (published_at DESC);
+
+CREATE TABLE IF NOT EXISTS processed_article_ticker (
+    article_id TEXT NOT NULL REFERENCES processed_article(id) ON DELETE CASCADE,
+    symbol TEXT NOT NULL REFERENCES instrument(symbol) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    PRIMARY KEY (article_id, symbol, role)
+);
+CREATE INDEX IF NOT EXISTS idx_pat_symbol ON processed_article_ticker (symbol);
+CREATE INDEX IF NOT EXISTS idx_pat_symbol_article ON processed_article_ticker (symbol, article_id);
+
+CREATE TABLE IF NOT EXISTS ticker_news_rollup_day (
+    symbol TEXT NOT NULL REFERENCES instrument(symbol) ON DELETE CASCADE,
+    day_utc DATE NOT NULL,
+    article_count INTEGER NOT NULL,
+    avg_sentiment DOUBLE PRECISION NOT NULL,
+    avg_impact DOUBLE PRECISION NOT NULL,
+    top_themes_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (symbol, day_utc)
+);
+CREATE INDEX IF NOT EXISTS idx_rollup_symbol_day ON ticker_news_rollup_day (symbol, day_utc DESC);
+
+-- ── Portfolio time series (for /portfolio_series) ───────────────────────────
+CREATE TABLE IF NOT EXISTS portfolio_point (
+    id BIGSERIAL PRIMARY KEY,
+    ts DOUBLE PRECISION NOT NULL,
+    equity DOUBLE PRECISION NOT NULL,
+    delta DOUBLE PRECISION NOT NULL,
+    vega DOUBLE PRECISION NOT NULL,
+    daily_pnl DOUBLE PRECISION NOT NULL,
+    drawdown_pct DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_portfolio_point_ts ON portfolio_point (ts DESC);
