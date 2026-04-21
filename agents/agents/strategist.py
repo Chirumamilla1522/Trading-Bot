@@ -60,6 +60,12 @@ OPTION-RIGHTS CONSTRAINT (must follow):
 - If BOTH: no restriction.
 - If you cannot satisfy the constraint using OCC symbols in `near_atm_contracts`, output HOLD.
 
+OPTION-STRUCTURE CONSTRAINT (must follow):
+- The context includes `allowed_option_structures`: one of ["ALL"] or a subset of:
+  SINGLE | VERTICAL | IRON_CONDOR | CALENDAR.
+- If it is not ["ALL"], you MUST only propose a strategy whose leg pattern matches one of the allowed structures.
+- If you cannot satisfy the constraint using OCC symbols in `near_atm_contracts`, output HOLD.
+
 SIZING RULES:
 - max_risk (max dollar loss) must be ≤ position_cap_pct × current_nav
 - target_return = max_risk × reward_risk_ratio (aim for ≥ 1.5:1 on debit spreads, ≥ 0.33:1 on credit)
@@ -237,6 +243,7 @@ def strategist_node(state: FirmState) -> FirmState:
         "underlying_price":    state.underlying_price,
         "market_regime":       state.market_regime.value,
         "allowed_option_rights": (state.allowed_option_rights or "BOTH"),
+        "allowed_option_structures": (state.allowed_option_structures or ["ALL"]),
         "iv_regime":           state.iv_regime or analytics["iv_metrics"]["iv_regime"],
         "iv_atm":              analytics["iv_metrics"]["atm_iv"],
         "skew_ratio":          analytics["iv_metrics"]["skew_ratio"],
