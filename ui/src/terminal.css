@@ -2538,6 +2538,19 @@ body.atlas.theme-dark .rec-card--pending {
   color: var(--atlas-ink);
   font-variant-numeric: tabular-nums;
 }
+
+.rec-card-asset{
+  display:inline-flex;
+  align-items:center;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--atlas-line);
+  background: color-mix(in srgb, var(--atlas-surface-2) 70%, transparent);
+  font-family: var(--atlas-mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  opacity: 0.75;
+}
 .rec-conf-high {
   border-color: color-mix(in srgb, var(--atlas-up) 35%, var(--atlas-line));
   background: color-mix(in srgb, var(--atlas-up) 10%, var(--atlas-bg));
