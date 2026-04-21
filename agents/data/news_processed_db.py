@@ -615,20 +615,20 @@ def get_tiered_llm_context(
                     themes = []
                 th = ",".join([str(x) for x in themes[:5] if str(x)])
                 roll_lines.append(
-                    f\"{day} n={int(n)} avg_sent={float(avg_s):+.2f} avg_imp={float(avg_imp):.2f}\"
-                    + (f\" th:{th}\" if th else \"\")
+                    f"{day} n={int(n)} avg_sent={float(avg_s):+.2f} avg_imp={float(avg_imp):.2f}"
+                    + (f" th:{th}" if th else "")
                 )
 
             return {
-                \"ticker\": t,
-                \"window\": {
-                    \"recent_hours\": int(recent_hours),
-                    \"days_detail\": int(days_detail),
-                    \"days_rollup\": int(days_rollup),
+                "ticker": t,
+                "window": {
+                    "recent_hours": int(recent_hours),
+                    "days_detail": int(days_detail),
+                    "days_rollup": int(days_rollup),
                 },
-                \"recent\": [r[0] for r in recent if r and r[0]],
-                \"week\": [r[0] for r in week if r and r[0]],
-                \"rollup\": roll_lines,
+                "recent": [r[0] for r in recent if r and r[0]],
+                "week": [r[0] for r in week if r and r[0]],
+                "rollup": roll_lines,
             }
         except Exception:
             pass
