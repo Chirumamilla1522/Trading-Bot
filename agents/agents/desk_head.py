@@ -17,13 +17,14 @@ from agents.llm_retry import invoke_llm
 from agents.schemas import DeskHeadOutput, parse_and_validate
 
 SYSTEM_PROMPT = """ROLE: DeskHead (Supervisor / final decision)
-You are the Desk Head of an autonomous options trading desk.
+You are the Desk Head of an autonomous trading desk (options + stocks).
 You review reports from specialist agents and make the final go/no-go decision.
 
 Weighting guide (higher weight = more authoritative):
 - RiskManager ABORT → always override to ABORT (non-negotiable)
 - Debate verdict (weight 0.35): most balanced view, includes full debate
 - OptionsSpecialist (weight 0.25): structural IV opportunity
+- StockSpecialist (weight 0.20): underlying cash equity opportunity (when clean)
 - Sentiment (weight 0.20): headline-driven bias when news_timing is fresh; down-weight
   stale headline narratives — then lean on market_bias, IV, and movement in the report.
 - Strategy confidence (weight 0.20): how good the specific proposal is
@@ -47,7 +48,7 @@ Output STRICT JSON:
 {
   "decision":       "PROCEED" | "HOLD" | "ABORT",
   "confidence":     0.0-1.0,
-  "signal_weights": {"risk": 1.0, "debate": 0.35, "specialist": 0.25, "sentiment": 0.20, "strategy": 0.20},
+  "signal_weights": {"risk": 1.0, "debate": 0.35, "options": 0.25, "stock": 0.20, "sentiment": 0.20, "strategy": 0.20},
   "reasoning":      "<4-5 sentences: MUST cite concrete fields from the report: underlying_price, iv_regime/iv_atm/skew_ratio, aggregate_sentiment, and any ABORT/HOLD reasons.>"
 }
 
@@ -112,6 +113,19 @@ def desk_head_node(state: FirmState) -> FirmState:
         "key_themes":           state.sentiment_themes,
         "tail_risks":           state.sentiment_tail_risks,
         "sub_agent_verdicts": {
+            "stock_specialist": {
+                "decision":   state.stock_decision.value,
+                "confidence": state.stock_confidence,
+                "proposal": (
+                    {
+                        "side": state.pending_stock_proposal.side.value,
+                        "qty": state.pending_stock_proposal.qty,
+                        "order_type": state.pending_stock_proposal.order_type,
+                        "limit_price": state.pending_stock_proposal.limit_price,
+                    }
+                    if state.pending_stock_proposal else None
+                ),
+            },
             "options_specialist": {
                 "decision":   state.analyst_decision.value,
                 "confidence": state.analyst_confidence,
@@ -139,6 +153,10 @@ def desk_head_node(state: FirmState) -> FirmState:
             }
             if state.pending_proposal else None
         ),
+        "pending_stock_proposal": (
+            state.pending_stock_proposal.model_dump()
+            if state.pending_stock_proposal else None
+        ),
         "portfolio": {
             "delta":        state.risk.portfolio_delta,
             "vega":         state.risk.portfolio_vega,
@@ -146,6 +164,7 @@ def desk_head_node(state: FirmState) -> FirmState:
             "drawdown_pct": f"{state.risk.drawdown_pct:.2%}",
         },
         "strategy_confidence": state.strategy_confidence,
+        "stock_confidence":    state.stock_confidence,
         "desk_context": {
             "news_timing_regime":      state.news_timing_regime,
             "news_newest_age_minutes": state.news_newest_age_minutes,
