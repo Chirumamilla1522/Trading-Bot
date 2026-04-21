@@ -48,7 +48,17 @@ def db_path() -> Path:
     return p
 
 
+def _pg_enabled() -> bool:
+    try:
+        from agents.data.warehouse import postgres as wh
+
+        return wh.is_postgres_enabled()
+    except Exception:
+        return False
+
+
 def connect() -> sqlite3.Connection:
+    """SQLite connection (used when PostgreSQL is not configured)."""
     con = sqlite3.connect(str(db_path()), timeout=10.0)
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA busy_timeout=8000;")
@@ -62,6 +72,16 @@ def ensure_schema() -> None:
         return
     with _lock:
         if _inited:
+            return
+        # Postgres: schema is managed by warehouse schema.sql
+        if _pg_enabled():
+            try:
+                from agents.data.warehouse import postgres as wh
+
+                wh.ensure_schema()
+            except Exception:
+                pass
+            _inited = True
             return
         con = connect()
         try:
@@ -112,6 +132,22 @@ def ensure_schema() -> None:
 
 def kv_put(key: str, value: Any) -> None:
     ensure_schema()
+    if _pg_enabled():
+        from agents.data.warehouse import postgres as wh
+
+        with wh.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO app_kv(k, v_json, updated_at)
+                    VALUES (%s, %s::jsonb, now())
+                    ON CONFLICT(k) DO UPDATE SET
+                      v_json = EXCLUDED.v_json,
+                      updated_at = now();
+                    """,
+                    (key, json.dumps(value, default=str)),
+                )
+        return
     con = connect()
     try:
         con.execute(
@@ -126,6 +162,19 @@ def kv_put(key: str, value: Any) -> None:
 
 def kv_get(key: str) -> Any | None:
     ensure_schema()
+    if _pg_enabled():
+        from agents.data.warehouse import postgres as wh
+
+        with wh.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT v_json FROM app_kv WHERE k = %s;", (key,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                try:
+                    return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                except Exception:
+                    return None
     con = connect()
     try:
         cur = con.execute("SELECT v_json FROM kv WHERE k = ?;", (key,))
@@ -142,6 +191,30 @@ def kv_get(key: str) -> Any | None:
 
 def append_xai_row(row: dict[str, Any]) -> None:
     ensure_schema()
+    if _pg_enabled():
+        from agents.data.warehouse import postgres as wh
+
+        sym = str(row.get("ticker") or "").upper().strip() or "SPY"
+        with wh.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO instrument(symbol) VALUES (%s) ON CONFLICT(symbol) DO NOTHING", (sym,))
+                cur.execute(
+                    """
+                    INSERT INTO xai_log(ts_iso, symbol, agent, action, reasoning, inputs_json, outputs_json, trade_id)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s);
+                    """,
+                    (
+                        str(row.get("timestamp") or ""),
+                        sym,
+                        str(row.get("agent") or ""),
+                        str(row.get("action") or ""),
+                        str(row.get("reasoning") or ""),
+                        json.dumps(row.get("inputs") or {}, default=str),
+                        json.dumps(row.get("outputs") or {}, default=str),
+                        row.get("trade_id"),
+                    ),
+                )
+        return
     con = connect()
     try:
         con.execute(
@@ -167,6 +240,42 @@ def append_xai_row(row: dict[str, Any]) -> None:
 
 def read_xai_rows(*, tail: int | None = None, agent: str | None = None) -> list[dict[str, Any]]:
     ensure_schema()
+    if _pg_enabled():
+        from agents.data.warehouse import postgres as wh
+
+        want = (agent or "").strip()
+        lim = int(tail) if tail is not None and int(tail) > 0 else None
+        q = (
+            "SELECT ts_iso,symbol,agent,action,reasoning,inputs_json,outputs_json,trade_id "
+            "FROM xai_log "
+        )
+        params: list[Any] = []
+        if want:
+            q += "WHERE agent=%s "
+            params.append(want)
+        q += "ORDER BY id DESC "
+        if lim:
+            q += "LIMIT %s"
+            params.append(lim)
+        with wh.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(q, tuple(params))
+                rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for ts_iso, symbol, a, action, reasoning, inputs_json, outputs_json, trade_id in rows[::-1]:
+            out.append(
+                {
+                    "timestamp": ts_iso,
+                    "ticker": symbol,
+                    "agent": a,
+                    "action": action,
+                    "reasoning": reasoning,
+                    "inputs": inputs_json or {},
+                    "outputs": outputs_json or {},
+                    "trade_id": trade_id,
+                }
+            )
+        return out
     con = connect()
     try:
         want = (agent or "").strip()
@@ -224,6 +333,18 @@ def read_xai_rows(*, tail: int | None = None, agent: str | None = None) -> list[
 
 def append_market_event(*, ticker: str, channel: str, payload: Any) -> None:
     ensure_schema()
+    if _pg_enabled():
+        from agents.data.warehouse import postgres as wh
+
+        sym = ticker.upper().strip() or "SPY"
+        with wh.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO instrument(symbol) VALUES (%s) ON CONFLICT(symbol) DO NOTHING", (sym,))
+                cur.execute(
+                    "INSERT INTO market_event(ts_unix, symbol, channel, payload_json) VALUES(%s, %s, %s, %s::jsonb);",
+                    (time.time(), sym, str(channel), json.dumps(payload, default=str)),
+                )
+        return
     con = connect()
     try:
         con.execute(
