@@ -1983,7 +1983,7 @@ async def set_option_structures(req: OptionStructuresRequest):
             continue
         vals.append(v)
     if not vals:
-        vals = ["ALL"]
+        vals = ["SINGLE"]
     allowed = {"ALL", "SINGLE", "VERTICAL", "IRON_CONDOR", "CALENDAR"}
     if any(v not in allowed for v in vals):
         raise HTTPException(status_code=400, detail={"error": f"structures must be subset of {sorted(list(allowed))}"})

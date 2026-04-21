@@ -280,7 +280,7 @@ class FirmState(BaseModel):
     # - "IRON_CONDOR"   (4 legs: 2 puts + 2 calls, same expiry)
     # - "CALENDAR"      (2 legs, same right+strike, different expiry)
     # "ALL" (default) means no restriction.
-    allowed_option_structures: list[str] = Field(default_factory=lambda: ["ALL"])
+    allowed_option_structures: list[str] = Field(default_factory=lambda: ["SINGLE"])
 
     # Risk
     risk:             RiskMetrics = Field(default_factory=RiskMetrics)
