@@ -101,6 +101,7 @@ OPTION-RIGHTS CONSTRAINT (must follow):
 OPTION-STRUCTURE CONSTRAINT (must follow):
 - The context includes `allowed_option_structures`: one of ["ALL"] or a subset of:
   SINGLE | VERTICAL | IRON_CONDOR | CALENDAR.
+- Default desk policy is **SINGLE** (one-leg) unless the user has selected other structures in the UI.
 - If it is not ["ALL"], you MUST only propose a strategy whose leg pattern matches one of the allowed structures.
 - If you cannot satisfy the constraint using OCC symbols in `near_atm_contracts`, output HOLD.
 
@@ -281,7 +282,7 @@ def strategist_node(state: FirmState) -> FirmState:
         "underlying_price":    state.underlying_price,
         "market_regime":       state.market_regime.value,
         "allowed_option_rights": (state.allowed_option_rights or "BOTH"),
-        "allowed_option_structures": (state.allowed_option_structures or ["ALL"]),
+        "allowed_option_structures": (state.allowed_option_structures or ["SINGLE"]),
         "iv_regime":           state.iv_regime or analytics["iv_metrics"]["iv_regime"],
         "iv_atm":              analytics["iv_metrics"]["atm_iv"],
         "skew_ratio":          analytics["iv_metrics"]["skew_ratio"],
@@ -407,10 +408,10 @@ def strategist_node(state: FirmState) -> FirmState:
                         # Continue to final section which clears pending_proposal.
                 # Enforce allowed structures deterministically (user preference).
                 if proposal is not None:
-                    allowed_structs = state.allowed_option_structures or ["ALL"]
+                    allowed_structs = state.allowed_option_structures or ["SINGLE"]
                     allowed_structs = [str(x or "").strip().upper() for x in allowed_structs if str(x or "").strip()]
                     if not allowed_structs:
-                        allowed_structs = ["ALL"]
+                        allowed_structs = ["SINGLE"]
                     if "ALL" not in allowed_structs:
                         kind = _classify_option_structure(proposal)
                         if kind not in allowed_structs:
