@@ -2551,6 +2551,50 @@ body.atlas.theme-dark .rec-card--pending {
   letter-spacing: 0.08em;
   opacity: 0.75;
 }
+
+/* Risk limits mini-panel */
+.risk-limits{
+  padding: 10px 12px 12px;
+  border-bottom: 1px solid var(--atlas-line);
+}
+.risk-grid{
+  display:grid;
+  grid-template-columns: 1fr 110px;
+  gap: 8px 10px;
+  align-items:center;
+}
+.risk-lab{
+  font-family: var(--atlas-mono);
+  font-size: 10px;
+  opacity: 0.75;
+}
+.risk-input{
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--atlas-radius-sm);
+  border: 1px solid var(--atlas-line);
+  background: var(--atlas-bg);
+  font-family: var(--atlas-mono);
+  font-size: 11px;
+}
+.risk-actions{
+  display:flex;
+  gap: 10px;
+  align-items:center;
+  margin-top: 10px;
+}
+.risk-save{
+  border-radius: 8px;
+  border: 1px solid var(--atlas-line);
+  background: color-mix(in srgb, var(--atlas-accent-fill) 65%, var(--atlas-surface-2));
+  color: var(--atlas-ink);
+  padding: 6px 10px;
+  font-family: var(--atlas-mono);
+  font-size: 10px;
+  cursor:pointer;
+}
+.risk-save:disabled{ opacity: 0.55; cursor:not-allowed; }
+.risk-status{ font-size: 10px; opacity: 0.75; }
 .rec-conf-high {
   border-color: color-mix(in srgb, var(--atlas-up) 35%, var(--atlas-line));
   background: color-mix(in srgb, var(--atlas-up) 10%, var(--atlas-bg));
