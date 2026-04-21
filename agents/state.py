@@ -252,6 +252,11 @@ class FirmState(BaseModel):
     pending_proposal: TradeProposal | None = None
     debate_record:    DebateRecord | None = None
 
+    # User / desk preferences
+    # Restrict what option rights the desk should consider for new proposals.
+    # "BOTH" (default) means no restriction.
+    allowed_option_rights: str = "BOTH"   # "CALL" | "PUT" | "BOTH"
+
     # Risk
     risk:             RiskMetrics = Field(default_factory=RiskMetrics)
 
