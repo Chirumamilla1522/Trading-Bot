@@ -405,6 +405,21 @@ def strategist_node(state: FirmState) -> FirmState:
                         proposal = None
                         # Skip multiplier normalization / cap validation.
                         # Continue to final section which clears pending_proposal.
+                # Enforce allowed structures deterministically (user preference).
+                if proposal is not None:
+                    allowed_structs = state.allowed_option_structures or ["ALL"]
+                    allowed_structs = [str(x or "").strip().upper() for x in allowed_structs if str(x or "").strip()]
+                    if not allowed_structs:
+                        allowed_structs = ["ALL"]
+                    if "ALL" not in allowed_structs:
+                        kind = _classify_option_structure(proposal)
+                        if kind not in allowed_structs:
+                            decision = AgentDecision.HOLD
+                            reasoning = (
+                                f"Rejected proposal: structure={kind} not in allowed_option_structures={allowed_structs}."
+                            )
+                            confidence = 0.0
+                            proposal = None
 
                 # Normalize common unit mistake: model forgets options are quoted per-share (×100 per contract).
                 # If the proposal looks off by ~100x relative to live mids, correct it deterministically.
