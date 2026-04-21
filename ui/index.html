@@ -629,6 +629,17 @@
                 </select>
               </div>
               <div class="ot-field ot-field-wide">
+                <label class="ot-lab" for="ot-structures">STRATEGY TYPES</label>
+                <select id="atlas-ot-structures" class="ot-select" multiple size="4"
+                  title="Select which option strategy structures agents may propose (hold Cmd to multi-select on macOS)">
+                  <option value="ALL" selected>ALL</option>
+                  <option value="SINGLE">SINGLE (1‑leg)</option>
+                  <option value="VERTICAL">VERTICAL (2‑leg spread)</option>
+                  <option value="IRON_CONDOR">IRON CONDOR (4‑leg)</option>
+                  <option value="CALENDAR">CALENDAR (same strike, diff expiry)</option>
+                </select>
+              </div>
+              <div class="ot-field ot-field-wide">
                 <label class="ot-lab" for="ot-o-symbol">SYMBOL</label>
                 <input id="atlas-ot-o-symbol" class="ot-input ot-mono" readonly placeholder="select from chain"/>
               </div>
