@@ -3767,6 +3767,19 @@ function _otOptSideUpdate() {
 el("ot-o-side-buy").addEventListener("click",  () => { _otOptSide = "buy";  _otOptSideUpdate(); });
 el("ot-o-side-sell").addEventListener("click", () => { _otOptSide = "sell"; _otOptSideUpdate(); });
 
+// Preference: restrict what option rights the agents propose (CALL/PUT/BOTH).
+el("ot-rights")?.addEventListener("change", async (e) => {
+  const rights = String(e.target.value || "BOTH").toUpperCase();
+  try {
+    await fetchWithTimeout(`${BACKEND}/set_option_rights`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rights }),
+    }, 4000);
+    try { pollState(); } catch { /* ignore */ }
+  } catch { /* ignore */ }
+});
+
 el("ot-o-type").addEventListener("change", e => {
   el("ot-o-lmt-row").style.display =
     e.target.value === "limit" ? "" : "none";
