@@ -132,6 +132,7 @@ export const LEGACY_IDS = {
   "ot-opt-preview": "atlas-ot-opt-preview",
   "ot-s-side-sell": "atlas-ot-s-side-sell",
   "ot-rights": "atlas-ot-rights",
+  "ot-structures": "atlas-ot-structures",
   "risk-max-dd": "atlas-risk-max-dd",
   "risk-pos-cap": "atlas-risk-pos-cap",
   "risk-save": "atlas-risk-save",
