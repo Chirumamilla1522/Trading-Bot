@@ -3858,6 +3858,23 @@ el("ot-rights")?.addEventListener("change", async (e) => {
   } catch { /* ignore */ }
 });
 
+// Preference: restrict what option structures the agents propose.
+el("ot-structures")?.addEventListener("change", async () => {
+  const sel = el("ot-structures");
+  if (!sel) return;
+  const structures = Array.from(sel.selectedOptions || [])
+    .map(o => String(o.value || "").toUpperCase())
+    .filter(Boolean);
+  try {
+    await fetchWithTimeout(`${BACKEND}/set_option_structures`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ structures: structures.length ? structures : ["ALL"] }),
+    }, 5000);
+    try { pollState(); } catch { /* ignore */ }
+  } catch { /* ignore */ }
+});
+
 el("ot-o-type").addEventListener("change", e => {
   el("ot-o-lmt-row").style.display =
     e.target.value === "limit" ? "" : "none";
