@@ -488,7 +488,7 @@ def strategist_node(state: FirmState) -> FirmState:
     }
 
     messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(content=_build_strategist_system_prompt(state)),
         HumanMessage(content=json.dumps(context, indent=2)),
     ]
 
