@@ -601,6 +601,14 @@
               <span class="ot-opt-hint"></span>
             </div>
             <div class="ot-fields">
+              <div class="ot-field">
+                <label class="ot-lab" for="ot-rights">WORK ON</label>
+                <select id="atlas-ot-rights" class="ot-select" title="Restrict new strategy proposals to CALLs, PUTs, or BOTH">
+                  <option value="BOTH" selected>BOTH</option>
+                  <option value="CALL">CALLS</option>
+                  <option value="PUT">PUTS</option>
+                </select>
+              </div>
               <div class="ot-field ot-field-wide">
                 <label class="ot-lab" for="ot-o-symbol">SYMBOL</label>
                 <input id="atlas-ot-o-symbol" class="ot-input ot-mono" readonly placeholder="select from chain"/>
