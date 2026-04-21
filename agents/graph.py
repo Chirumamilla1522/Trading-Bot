@@ -53,6 +53,7 @@ from langgraph.graph import END, START, StateGraph
 from agents.state import AgentDecision, FirmState, Recommendation, ReasoningEntry
 from agents.agents.desk_head         import desk_head_node
 from agents.agents.options_specialist import options_specialist_node
+from agents.agents.stock_specialist   import stock_specialist_node
 from agents.agents.sentiment_analyst  import sentiment_analyst_node
 from agents.agents.risk_manager       import risk_manager_node
 from agents.agents.strategist         import strategist_node
@@ -379,7 +380,7 @@ def recommend_node(state: FirmState) -> FirmState:
     Advisory mode: park the approved proposal as a Recommendation
     instead of executing it. The user approves/dismisses from the UI.
     """
-    if not state.pending_proposal:
+    if not state.pending_proposal and not state.pending_stock_proposal:
         return state
 
     # Safety: never park expired legs as recommendations (can happen via stale persistence)
@@ -390,7 +391,8 @@ def recommend_node(state: FirmState) -> FirmState:
 
         today = _date.today()
         expired: list[dict] = []
-        for leg in state.pending_proposal.legs:
+        if state.pending_proposal:
+            for leg in state.pending_proposal.legs:
             sym = (leg.symbol or "").strip()
             exp_d = occ_expiry_as_date(sym) or parse_greeks_expiry_str(str(leg.expiry or ""))
             if exp_d is not None and exp_d < today:
@@ -408,20 +410,42 @@ def recommend_node(state: FirmState) -> FirmState:
     except Exception:
         pass
 
+    # Pick which recommendation to park if both exist.
+    pick = "option"
+    if state.pending_stock_proposal and not state.pending_proposal:
+        pick = "stock"
+    elif state.pending_stock_proposal and state.pending_proposal:
+        pick = "stock" if float(state.stock_confidence or 0.0) >= float(state.strategy_confidence or 0.0) else "option"
+
     # Build a recommendation from the current pipeline outputs
     last_desk = next(
         (e for e in reversed(state.reasoning_log) if e.agent == "DeskHead"),
         None,
     )
-    rec = Recommendation(
-        ticker              = state.ticker,
-        strategy_name       = state.pending_proposal.strategy_name,
-        proposal            = state.pending_proposal,
-        bull_conviction     = state.bull_conviction,
-        bear_conviction     = state.bear_conviction,
-        desk_head_reasoning = last_desk.reasoning if last_desk else "",
-        confidence          = state.strategy_confidence,
-    )
+    if pick == "stock" and state.pending_stock_proposal:
+        rec = Recommendation(
+            ticker              = state.ticker,
+            asset_type          = "stock",
+            strategy_name       = f"Stock ({state.pending_stock_proposal.side.value})",
+            stock_proposal      = state.pending_stock_proposal,
+            bull_conviction     = state.bull_conviction,
+            bear_conviction     = state.bear_conviction,
+            desk_head_reasoning = last_desk.reasoning if last_desk else "",
+            confidence          = float(state.stock_confidence or 0.0),
+        )
+    else:
+        if not state.pending_proposal:
+            return state
+        rec = Recommendation(
+            ticker              = state.ticker,
+            asset_type          = "option",
+            strategy_name       = state.pending_proposal.strategy_name,
+            proposal            = state.pending_proposal,
+            bull_conviction     = state.bull_conviction,
+            bear_conviction     = state.bear_conviction,
+            desk_head_reasoning = last_desk.reasoning if last_desk else "",
+            confidence          = float(state.strategy_confidence or 0.0),
+        )
     state.pending_recommendations.append(rec)
     try:
         from agents.tracking.mlflow_tracing import log_agent_step
@@ -464,10 +488,10 @@ def recommend_node(state: FirmState) -> FirmState:
 
 def should_run_pipeline(
     state: FirmState,
-) -> Literal["options_specialist", "early_abort"]:
+) -> Literal["stock_specialist", "early_abort"]:
     if state.circuit_breaker_tripped or state.kill_switch_active:
         return "early_abort"
-    return "options_specialist"
+    return "stock_specialist"
 
 
 def should_debate(
@@ -501,6 +525,7 @@ def build_graph() -> StateGraph:
     # Register nodes
     g.add_node("ingest_data",        ingest_data_node)
     g.add_node("early_abort",        early_abort_node)
+    g.add_node("stock_specialist",   stock_specialist_node)
     g.add_node("options_specialist", options_specialist_node)
     g.add_node("bull_researcher",    bull_researcher_node)
     g.add_node("bear_researcher",    bear_researcher_node)
@@ -516,12 +541,13 @@ def build_graph() -> StateGraph:
     # Entry → gate on circuit breaker
     g.add_edge(START, "ingest_data")
     g.add_conditional_edges("ingest_data", should_run_pipeline, {
-        "options_specialist": "options_specialist",
+        "stock_specialist":  "stock_specialist",
         "early_abort":        "early_abort",
     })
     g.add_edge("early_abort", "xai_log")
 
-    # Analysis: IV → sentiment → bull research → bear rebuttal → strategist
+    # Analysis: stock → IV → sentiment → bull research → bear rebuttal → strategist
+    g.add_edge("stock_specialist",   "options_specialist")
     g.add_edge("options_specialist", "sentiment_analyst")
     g.add_edge("sentiment_analyst",  "bull_researcher")
     g.add_edge("bull_researcher",    "bear_researcher")
