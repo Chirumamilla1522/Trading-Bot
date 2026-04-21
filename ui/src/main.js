@@ -1520,7 +1520,7 @@ function updateMetrics(state) {
     const vals = (want || []).map(x => String(x || "").toUpperCase()).filter(Boolean);
     const sel = el("ot-structures");
     if (sel && sel.options?.length) {
-      const normalized = vals.includes("ALL") || !vals.length ? (vals.includes("ALL") ? ["ALL"] : ["SINGLE"]) : vals;
+      const normalized = vals.includes("ALL") ? ["ALL"] : (!vals.length ? ["SINGLE"] : vals);
       const set = new Set(normalized);
       // Avoid fighting user mid-selection.
       if (document.activeElement !== sel) {
