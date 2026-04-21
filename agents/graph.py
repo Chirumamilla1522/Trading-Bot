@@ -393,10 +393,10 @@ def recommend_node(state: FirmState) -> FirmState:
         expired: list[dict] = []
         if state.pending_proposal:
             for leg in state.pending_proposal.legs:
-            sym = (leg.symbol or "").strip()
-            exp_d = occ_expiry_as_date(sym) or parse_greeks_expiry_str(str(leg.expiry or ""))
-            if exp_d is not None and exp_d < today:
-                expired.append({"symbol": sym, "expired_on": exp_d.isoformat()})
+                sym = (leg.symbol or "").strip()
+                exp_d = occ_expiry_as_date(sym) or parse_greeks_expiry_str(str(leg.expiry or ""))
+                if exp_d is not None and exp_d < today:
+                    expired.append({"symbol": sym, "expired_on": exp_d.isoformat()})
         if expired:
             state.pending_proposal = None
             state.reasoning_log.append(ReasoningEntry(
