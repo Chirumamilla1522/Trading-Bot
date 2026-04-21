@@ -1504,6 +1504,15 @@ function updateMetrics(state) {
     renderAgentStatus(state.agent_runtime);
     renderLlmModelsHint(state.agent_runtime);
   }
+
+  // Option rights preference (CALL/PUT/BOTH) used by Strategist proposals.
+  try {
+    const rights = String(state.allowed_option_rights || "").toUpperCase();
+    const sel = el("ot-rights");
+    if (sel && (rights === "CALL" || rights === "PUT" || rights === "BOTH")) {
+      if (sel.value !== rights) sel.value = rights;
+    }
+  } catch { /* ignore */ }
 }
 
 function setMetric(id, val, prefix, signed, decimals = 2, suffix = "") {
