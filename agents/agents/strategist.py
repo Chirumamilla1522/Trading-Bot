@@ -23,6 +23,44 @@ from agents.state import (
     ReasoningEntry, TradeLeg, TradeProposal,
 )
 
+
+def _classify_option_structure(proposal: TradeProposal) -> str:
+    """
+    Classify proposal into a small set of leg-pattern structures.
+    Returns: SINGLE | VERTICAL | IRON_CONDOR | CALENDAR | OTHER
+    """
+    try:
+        legs = proposal.legs or []
+        if not legs:
+            return "OTHER"
+        n = len(legs)
+        rights = {l.right for l in legs}
+        expiries = {str(l.expiry or "") for l in legs}
+        strikes = [float(l.strike) for l in legs]
+
+        if n == 1:
+            return "SINGLE"
+
+        if n == 2:
+            # Vertical: same expiry + same right, different strike.
+            if len(expiries) == 1 and len(rights) == 1:
+                if abs(strikes[1] - strikes[0]) > 0:
+                    return "VERTICAL"
+            # Calendar: same right + same strike, different expiry.
+            if len(rights) == 1 and len(expiries) == 2:
+                if abs(strikes[1] - strikes[0]) < 1e-9:
+                    return "CALENDAR"
+            return "OTHER"
+
+        if n == 4 and len(expiries) == 1:
+            puts = [l for l in legs if l.right == OptionRight.PUT]
+            calls = [l for l in legs if l.right == OptionRight.CALL]
+            if len(puts) == 2 and len(calls) == 2:
+                return "IRON_CONDOR"
+        return "OTHER"
+    except Exception:
+        return "OTHER"
+
 # Regime → strategy recommendation table (injected into prompt)
 _REGIME_STRATEGY_GUIDE = """
 REGIME-TO-STRATEGY MATRIX (follow this unless contradicted by skew/sentiment):
