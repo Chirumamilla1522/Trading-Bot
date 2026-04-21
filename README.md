@@ -168,6 +168,7 @@ You’ll typically run:
 - **Node 18+** for the UI (Tauri/Vite)
 - Optional: **Redis** for semantic cache
 - Optional: **llama.cpp** `llama-server` for local LLM
+- Optional: **PostgreSQL** if you want persistence across machines (set `WAREHOUSE_POSTGRES_URL`)
 
 **Step-by-step installs (venv, pip, npm, Rust/Tauri):** see **`INSTALL.md`** in the repo root.
 
@@ -189,6 +190,10 @@ ENABLE_ADVERSARIAL_DEBATE=true
 DEBATE_ROUNDS=2
 MAX_DAILY_DRAWDOWN=0.05
 MAX_POSITION_PCT=0.02
+
+# Optional PostgreSQL (recommended if you move machines / want durable shared storage)
+WAREHOUSE_POSTGRES_URL=postgresql://user:pass@host:5432/agentic_trading
+WAREHOUSE_AUTO_SCHEMA=1
 
 # Local LLM (llama.cpp server)
 LLAMA_LOCAL_BASE_URL=http://127.0.0.1:8080/v1
