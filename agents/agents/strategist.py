@@ -136,6 +136,15 @@ def _normalize_allowed_structures(structs: list[str] | None) -> set[str]:
     return set(vals)
 
 
+# Proposals for these names often classify as OTHER; enforcement rejects unless allowed structures is ALL.
+_GUIDE_REQUIRES_ALL_STRUCTURES = frozenset({
+    "Short Strangle",
+    "Long Straddle",
+    "Long Strangle",
+    "Protective Collar (long put + short OTM call)",
+})
+
+
 def _strategy_allowed(
     label: str,
     allowed_structs: set[str],
@@ -146,6 +155,8 @@ def _strategy_allowed(
     if not spec:
         return False
     sk, rk = spec
+    if label in _GUIDE_REQUIRES_ALL_STRUCTURES and "ALL" not in allowed_structs:
+        return False
     if "ALL" not in allowed_structs and sk not in allowed_structs:
         return False
     ar = (allowed_rights or "BOTH").strip().upper()
