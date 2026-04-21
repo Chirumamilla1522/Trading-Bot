@@ -131,6 +131,7 @@ export const LEGACY_IDS = {
   "ot-o-side-sell": "atlas-ot-o-side-sell",
   "ot-opt-preview": "atlas-ot-opt-preview",
   "ot-s-side-sell": "atlas-ot-s-side-sell",
+  "ot-rights": "atlas-ot-rights",
   "positions-body": "atlas-positions-body",
   "scanner-filter": "atlas-scanner-filter",
   "si-competitors": "atlas-si-competitors",
