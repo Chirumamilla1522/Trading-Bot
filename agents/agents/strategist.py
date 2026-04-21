@@ -53,6 +53,13 @@ sentiment, researcher conviction, portfolio risk limits), and then assemble a va
 
 {_REGIME_STRATEGY_GUIDE}
 
+OPTION-RIGHTS CONSTRAINT (must follow):
+- The context includes `allowed_option_rights` which is one of: CALL | PUT | BOTH.
+- If CALL: all legs MUST be CALL.
+- If PUT:  all legs MUST be PUT.
+- If BOTH: no restriction.
+- If you cannot satisfy the constraint using OCC symbols in `near_atm_contracts`, output HOLD.
+
 SIZING RULES:
 - max_risk (max dollar loss) must be ≤ position_cap_pct × current_nav
 - target_return = max_risk × reward_risk_ratio (aim for ≥ 1.5:1 on debit spreads, ≥ 0.33:1 on credit)
@@ -229,6 +236,7 @@ def strategist_node(state: FirmState) -> FirmState:
         "ticker":              state.ticker,
         "underlying_price":    state.underlying_price,
         "market_regime":       state.market_regime.value,
+        "allowed_option_rights": (state.allowed_option_rights or "BOTH"),
         "iv_regime":           state.iv_regime or analytics["iv_metrics"]["iv_regime"],
         "iv_atm":              analytics["iv_metrics"]["atm_iv"],
         "skew_ratio":          analytics["iv_metrics"]["skew_ratio"],
@@ -337,6 +345,21 @@ def strategist_node(state: FirmState) -> FirmState:
                     stop_loss_pct   = p.stop_loss_pct,
                     take_profit_pct = p.take_profit_pct,
                 )
+
+                # Enforce allowed rights deterministically (user preference).
+                allowed = (state.allowed_option_rights or "BOTH").strip().upper()
+                if allowed in ("CALL", "PUT"):
+                    bad = [l.symbol for l in (proposal.legs or []) if l.right.value != allowed]
+                    if bad:
+                        decision = AgentDecision.HOLD
+                        reasoning = (
+                            f"Rejected proposal: allowed_option_rights={allowed} "
+                            f"but proposal contains other rights: {bad[:4]}"
+                        )
+                        confidence = 0.0
+                        proposal = None
+                        # Skip multiplier normalization / cap validation.
+                        # Continue to final section which clears pending_proposal.
 
                 # Normalize common unit mistake: model forgets options are quoted per-share (×100 per contract).
                 # If the proposal looks off by ~100x relative to live mids, correct it deterministically.
