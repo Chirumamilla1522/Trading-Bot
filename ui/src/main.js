@@ -1514,6 +1514,23 @@ function updateMetrics(state) {
     }
   } catch { /* ignore */ }
 
+  // Option structure preference (SINGLE / VERTICAL / IRON_CONDOR / CALENDAR / ALL).
+  try {
+    const want = Array.isArray(state.allowed_option_structures) ? state.allowed_option_structures : ["ALL"];
+    const vals = (want || []).map(x => String(x || "").toUpperCase()).filter(Boolean);
+    const sel = el("ot-structures");
+    if (sel && sel.options?.length) {
+      const normalized = vals.includes("ALL") || !vals.length ? ["ALL"] : vals;
+      const set = new Set(normalized);
+      // Avoid fighting user mid-selection.
+      if (document.activeElement !== sel) {
+        Array.from(sel.options).forEach((o) => {
+          o.selected = set.has(String(o.value || "").toUpperCase());
+        });
+      }
+    }
+  } catch { /* ignore */ }
+
   // Risk limits inputs (max drawdown / position cap). Server stores fractions; UI shows %.
   try {
     const dd = r.max_drawdown_pct != null ? Number(r.max_drawdown_pct) * 100 : null;
