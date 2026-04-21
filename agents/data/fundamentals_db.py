@@ -18,6 +18,15 @@ from typing import Any
 # ``<dir>/fundamentals.sqlite3`` (same dir as daily bars when both env vars are used).
 
 
+def _pg_enabled() -> bool:
+    try:
+        from agents.data.warehouse import postgres as wh
+
+        return wh.is_postgres_enabled()
+    except Exception:
+        return False
+
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -92,6 +101,21 @@ def get_stock_info_cached(ticker: str) -> tuple[dict[str, Any] | None, int | Non
     """
     Returns (payload, fetched_at_unix) or (None, None) if missing.
     """
+    if _pg_enabled():
+        try:
+            from agents.data.warehouse import postgres as wh
+
+            t = ticker.upper().strip()
+            with wh.connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT payload, EXTRACT(EPOCH FROM fetched_at)::bigint FROM fundamentals_latest WHERE symbol=%s;", (t,))
+                    row = cur.fetchone()
+            if not row:
+                return None, None
+            payload, fetched_at = row
+            return payload, int(fetched_at)
+        except Exception:
+            return None, None
     _ensure_init()
     t = ticker.upper().strip()
     con = _connect()
@@ -114,6 +138,19 @@ def upsert_stock_info(ticker: str, payload: dict[str, Any]) -> bool:
     Insert/update payload. Returns True if content changed (hash changed).
     Always updates fetched_at_unix to 'now'.
     """
+    if _pg_enabled():
+        # Use warehouse tables as primary store when configured.
+        try:
+            from agents.data.warehouse.postgres import enqueue_fundamentals, ensure_schema
+
+            t = ticker.upper().strip()
+            now = int(time.time())
+            ensure_schema()
+            enqueue_fundamentals(t, payload, now)
+            return True
+        except Exception:
+            # fall back to sqlite
+            pass
     _ensure_init()
     t = ticker.upper().strip()
     now = int(time.time())
@@ -139,12 +176,6 @@ def upsert_stock_info(ticker: str, payload: dict[str, Any]) -> bool:
             (t, json.dumps(payload, sort_keys=True, ensure_ascii=False), h, now),
         )
         con.commit()
-        try:
-            from agents.data.warehouse.postgres import enqueue_fundamentals
-
-            enqueue_fundamentals(t, payload, now)
-        except Exception:
-            pass
         return bool(changed)
     finally:
         con.close()
