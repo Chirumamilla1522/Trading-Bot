@@ -1916,6 +1916,10 @@ class OptionRightsRequest(BaseModel):
     rights: str  # CALL | PUT | BOTH
 
 
+class OptionStructuresRequest(BaseModel):
+    structures: list[str]
+
+
 class RiskLimitsRequest(BaseModel):
     max_drawdown_pct: float | None = None  # percent (0-100) in UI
     position_cap_pct: float | None = None  # percent (0-100) in UI
@@ -1963,6 +1967,37 @@ async def set_option_rights(req: OptionRightsRequest):
     except Exception:
         pass
     return {"ok": True, "allowed_option_rights": firm_state.allowed_option_rights}
+
+
+@app.post("/set_option_structures")
+async def set_option_structures(req: OptionStructuresRequest):
+    """
+    Persist a user preference restricting what option *structures* are considered for new proposals.
+    Values: ALL | SINGLE | VERTICAL | IRON_CONDOR | CALENDAR.
+    """
+    items = req.structures or []
+    vals = []
+    for x in items:
+        v = str(x or "").strip().upper()
+        if not v:
+            continue
+        vals.append(v)
+    if not vals:
+        vals = ["ALL"]
+    allowed = {"ALL", "SINGLE", "VERTICAL", "IRON_CONDOR", "CALENDAR"}
+    if any(v not in allowed for v in vals):
+        raise HTTPException(status_code=400, detail={"error": f"structures must be subset of {sorted(list(allowed))}"})
+    # If ALL is present, normalize to just ALL.
+    if "ALL" in vals:
+        vals = ["ALL"]
+    firm_state.allowed_option_structures = vals
+    try:
+        from agents.state_persistence import save_state
+
+        await asyncio.to_thread(save_state, firm_state)
+    except Exception:
+        pass
+    return {"ok": True, "allowed_option_structures": firm_state.allowed_option_structures}
 
 
 @app.post("/risk/limits")
