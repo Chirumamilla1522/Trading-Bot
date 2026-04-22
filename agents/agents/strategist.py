@@ -301,7 +301,7 @@ PROCEED:
 {{
   "decision": "PROCEED",
   "proposal": {{
-    "strategy_name": "<e.g. Iron Condor>",
+    "strategy_name": "<e.g. Bull Call Spread>",
     "legs": [
       {{"symbol":"<OCC>", "right":"CALL|PUT", "strike":<float>, "expiry":"<YYMMDD>", "side":"BUY|SELL", "qty":<int>}}
     ],
