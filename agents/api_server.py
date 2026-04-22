@@ -716,23 +716,6 @@ async def _ws_quote_push_task():
         except Exception:
             continue
 
-        try:
-            from agents.data.warehouse.postgres import enqueue_quote
-
-            enqueue_quote(
-                t,
-                {
-                    "bid": q.get("bid"),
-                    "ask": q.get("ask"),
-                    "last": q.get("last"),
-                    "prev_close": q.get("prev_close"),
-                    "change_pct": q.get("change_pct"),
-                    "source": q.get("source"),
-                },
-            )
-        except Exception:
-            pass
-
         payload = {
             "type": "quote",
             "ticker": t,
