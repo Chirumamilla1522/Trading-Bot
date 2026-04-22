@@ -185,3 +185,48 @@ CREATE TABLE IF NOT EXISTS portfolio_point (
     drawdown_pct DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_portfolio_point_ts ON portfolio_point (ts DESC);
+
+-- ── Perception bundles (Phase 0–2) ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS perception_cycle (
+    id          BIGSERIAL PRIMARY KEY,
+    trace_id    TEXT NOT NULL,
+    symbol      TEXT NOT NULL REFERENCES instrument(symbol) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ NOT NULL,
+    payload     JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_perception_symbol_time ON perception_cycle (symbol, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_perception_trace ON perception_cycle (trace_id);
+
+-- ── Universe research cache (briefs + graph edges) ──────────────────────────
+CREATE TABLE IF NOT EXISTS ticker_research (
+    symbol           TEXT PRIMARY KEY REFERENCES instrument(symbol) ON DELETE CASCADE,
+    brief            JSONB NOT NULL,
+    signal_hash      TEXT NOT NULL DEFAULT '',
+    updated_at       TIMESTAMPTZ NOT NULL,
+    valid_until      TIMESTAMPTZ,
+    dirty            BOOLEAN NOT NULL DEFAULT FALSE,
+    dirty_reasons    JSONB NOT NULL DEFAULT '[]'::jsonb,
+    priority_score   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    portfolio_weight DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tr_dirty ON ticker_research (dirty, priority_score DESC);
+CREATE INDEX IF NOT EXISTS idx_tr_updated ON ticker_research (updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS ticker_edges (
+    src     TEXT NOT NULL REFERENCES instrument(symbol) ON DELETE CASCADE,
+    dst     TEXT NOT NULL REFERENCES instrument(symbol) ON DELETE CASCADE,
+    kind    TEXT NOT NULL DEFAULT 'news_impact',
+    weight  DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    PRIMARY KEY (src, dst, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_edges_src ON ticker_edges (src);
+CREATE INDEX IF NOT EXISTS idx_edges_dst ON ticker_edges (dst);
+
+CREATE TABLE IF NOT EXISTS research_eval (
+    id          BIGSERIAL PRIMARY KEY,
+    symbol      TEXT NOT NULL REFERENCES instrument(symbol) ON DELETE CASCADE,
+    event       TEXT NOT NULL,
+    payload     JSONB,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_research_eval_symbol_time ON research_eval (symbol, created_at DESC);
