@@ -489,6 +489,29 @@ def fetch_stock_quotes_batch(symbols: list[str]) -> dict[str, dict[str, Any]]:
                     key = sym.upper().strip()
                     out[key] = parsed
                     _quote_cache[key] = (parsed, time.monotonic() + _QUOTE_TTL)
+                    # Persist every pulled quote movement.
+                    try:
+                        from agents.data.market_data_store import append_event
+
+                        append_event(key, "quote", parsed)
+                    except Exception:
+                        pass
+                    try:
+                        from agents.data.warehouse.postgres import enqueue_quote
+
+                        enqueue_quote(
+                            key,
+                            {
+                                "bid": parsed.get("bid"),
+                                "ask": parsed.get("ask"),
+                                "last": parsed.get("last"),
+                                "prev_close": parsed.get("prev_close"),
+                                "change_pct": parsed.get("change_pct"),
+                                "source": parsed.get("source"),
+                            },
+                        )
+                    except Exception:
+                        pass
         except Exception as e:
             log.debug("Alpaca batch snapshots: %s", e)
     return out
@@ -527,6 +550,7 @@ def fetch_stock_quote(ticker: str) -> dict[str, Any]:
 
     out: dict[str, Any] | None = None
     _feed = (ALPACA_STOCK_DATA_FEED or "iex").lower()
+    did_pull = False
 
     # ── 1. Alpaca snapshot (best available “live” last/bid/ask for the strip) ─
     if ALPACA_API_KEY and ALPACA_SECRET_KEY:
@@ -541,6 +565,7 @@ def fetch_stock_quote(ticker: str) -> dict[str, Any]:
                     o = _parse_alpaca_stock_snapshot(snap, t)
                     if o is not None:
                         out = o
+                        did_pull = True
         except Exception as e:
             log.debug("Alpaca snapshot for %s: %s — falling back", t, e)
 
@@ -552,6 +577,7 @@ def fetch_stock_quote(ticker: str) -> dict[str, Any]:
             av = av_quote(t)
             if av and av.get("last") is not None:
                 out = {**_empty, **av}
+                did_pull = True
         except Exception as e:
             log.debug("Alpha Vantage quote for %s: %s — falling back", t, e)
 
@@ -560,7 +586,32 @@ def fetch_stock_quote(ticker: str) -> dict[str, Any]:
         yf_data = _quote_from_yfinance(t)
         if yf_data:
             out = yf_data
+            did_pull = True
 
     result = out if out is not None else (cached if cached else _empty)
     _quote_cache[t] = (result, time.monotonic() + _QUOTE_TTL)
+    # Persist movements only when we actually pulled fresh data (not cache hits).
+    if did_pull and result and result.get("last") is not None:
+        try:
+            from agents.data.market_data_store import append_event
+
+            append_event(t, "quote", result)
+        except Exception:
+            pass
+        try:
+            from agents.data.warehouse.postgres import enqueue_quote
+
+            enqueue_quote(
+                t,
+                {
+                    "bid": result.get("bid"),
+                    "ask": result.get("ask"),
+                    "last": result.get("last"),
+                    "prev_close": result.get("prev_close"),
+                    "change_pct": result.get("change_pct"),
+                    "source": result.get("source"),
+                },
+            )
+        except Exception:
+            pass
     return result
