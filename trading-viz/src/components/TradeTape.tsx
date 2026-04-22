@@ -1,6 +1,8 @@
 import { useMemo } from "react";
 import { useMarketStore } from "../store/useMarketStore";
 
+const ET_TZ = "America/New_York";
+
 export function TradeTape() {
   const trades = useMarketStore((s) => s.trades);
 
@@ -39,7 +41,7 @@ export function TradeTape() {
       <div className="tape-body">
         {rows.map((t) => (
           <div key={t.tradeId} className={`tape-row ${t.side}`}>
-            <span>{new Date(t.timestamp).toLocaleTimeString()}</span>
+            <span>{new Date(t.timestamp).toLocaleTimeString("en-US", { timeZone: ET_TZ })}</span>
             <span>{t.price.toFixed(2)}</span>
             <span>{t.size.toFixed(0)}</span>
             <span>{t.side === "buy" ? "B" : "S"}</span>

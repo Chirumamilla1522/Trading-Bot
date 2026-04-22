@@ -34,6 +34,8 @@ export interface MarketState {
   applyDelta: (d: OrderBookDelta) => void;
   pushTrade: (t: TickTrade) => void;
   pushCandle: (c: OHLC) => void;
+  /** Replace candle history from persisted /bars series */
+  setCandlesFromBars: (bars: OHLC[]) => void;
   /** Aggregate tick into 1s buckets */
   aggregateTickToBucket: (t: TickTrade, bucketMs?: number) => void;
   reset: () => void;
@@ -85,6 +87,25 @@ export const useMarketStore = create<MarketState>((set, get) => ({
       }
       return { candles: m };
     });
+  },
+
+  setCandlesFromBars: (bars) => {
+    const m = new Map<number, OHLC>();
+    for (const b of bars || []) {
+      if (!b) continue;
+      const t = Math.floor(Number(b.time));
+      if (!Number.isFinite(t) || t <= 0) continue;
+      const o = Number(b.open), h = Number(b.high), lo = Number(b.low), c = Number(b.close);
+      if (![o, h, lo, c].every(Number.isFinite)) continue;
+      m.set(t * 1000, { time: t, open: o, high: h, low: lo, close: c, volume: b.volume });
+    }
+    // Cap
+    const keys = [...m.keys()].sort((a, b) => a - b);
+    while (keys.length > MAX_CANDLES) {
+      const k = keys.shift();
+      if (k != null) m.delete(k);
+    }
+    set({ candles: m, forming: null });
   },
 
   aggregateTickToBucket: (t, bucketMs = 1000) => {

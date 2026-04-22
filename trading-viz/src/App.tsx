@@ -3,12 +3,14 @@ import { ChartEngine } from "./components/ChartEngine";
 import { DepthChart } from "./components/DepthChart";
 import { OrderBookPanel } from "./components/OrderBookPanel";
 import { TradeTape } from "./components/TradeTape";
+import { useBarsHistory } from "./hooks/useBarsHistory";
 import { useIndicatorWorker } from "./hooks/useIndicatorWorker";
 import { useWebSocketMarket } from "./hooks/useWebSocketMarket";
 
 export default function App() {
   const [wsOn, setWsOn] = useState(true);
   useWebSocketMarket(wsOn);
+  const { barsStatus, barsMessage } = useBarsHistory("5D");
   const { run } = useIndicatorWorker();
   const [bench, setBench] = useState<string>("");
 
@@ -27,6 +29,9 @@ export default function App() {
         <h1>Trading Viz</h1>
         <p className="sub">
           WebSocket → normalizer → Zustand → canvas chart + L2 DOM + L3 tape. Indicator math in Web Worker.
+        </p>
+        <p className="sub" style={{ opacity: 0.75 }}>
+          {barsMessage || (barsStatus === "loading" ? "Loading /bars…" : "")}
         </p>
         <div className="actions">
           <label>

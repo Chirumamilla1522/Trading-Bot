@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any, Literal
 
@@ -382,6 +383,36 @@ def recommend_node(state: FirmState) -> FirmState:
     """
     if not state.pending_proposal and not state.pending_stock_proposal:
         return state
+
+    # Cap pending approvals per ticker: if the desk already has too many pending
+    # recommendations for this symbol, do not add more.
+    try:
+        cap = int(float(os.getenv("MAX_PENDING_RECS_PER_TICKER", "5")))
+    except Exception:
+        cap = 5
+    cap = max(1, min(50, cap))
+    try:
+        cur_t = (state.ticker or "").upper().strip()
+        pending_n = sum(
+            1
+            for r in (state.pending_recommendations or [])
+            if (getattr(r, "ticker", "") or "").upper().strip() == cur_t
+            and getattr(r, "status", "") == "pending"
+        )
+        if pending_n >= cap:
+            state.reasoning_log.append(ReasoningEntry(
+                agent="System",
+                action="INFO",
+                reasoning=(
+                    f"Recommendation skipped: {cur_t} already has {pending_n} pending approvals "
+                    f"(cap={cap})."
+                ),
+                inputs={"ticker": cur_t, "pending": pending_n, "cap": cap},
+                outputs={"skipped_recommendation": True},
+            ))
+            return state
+    except Exception:
+        pass
 
     # Safety: never park expired legs as recommendations (can happen via stale persistence)
     try:

@@ -59,6 +59,20 @@
           <button class="mode-btn" data-mode="autopilot">AUTOPILOT</button>
         </div>
 
+        <div id="atlas-notifications" class="atlas-notifications">
+          <button type="button" id="atlas-notif-btn" class="atlas-notif-btn" title="Notifications" aria-haspopup="dialog" aria-expanded="false" aria-controls="atlas-notif-popover">
+            <span class="atlas-notif-icon" aria-hidden="true">🔔</span>
+            <span id="atlas-notif-badge" class="atlas-notif-badge" hidden>0</span>
+          </button>
+          <div id="atlas-notif-popover" class="atlas-notif-popover" role="dialog" aria-label="Notifications" hidden>
+            <div class="atlas-notif-head">
+              <span class="atlas-notif-title">Notifications</span>
+              <button type="button" id="atlas-notif-clear" class="atlas-notif-clear">Clear</button>
+            </div>
+            <div id="atlas-notif-list" class="atlas-notif-list"></div>
+          </div>
+        </div>
+
         <button type="button" id="atlas-agent-flow-btn" class="theme-cycle-btn" title="How data flows through AI agents and tiers">◇ AI FLOW</button>
 
         <button type="button" id="atlas-theme-cycle-btn" class="theme-cycle-btn" title="Cycle experimental UI themes (saved in this browser)">◈ HUD</button>

@@ -353,6 +353,13 @@ class FirmState(BaseModel):
     last_tier3_run:     datetime | None = None
     tier3_trigger:      str   = "manual"   # "manual" | "sentiment" | "movement" | "scanner"
 
+    # ── Tier-3 focus ticker (lock semantics) ───────────────────────────────────
+    # UI may switch `ticker` freely; Tier-3 will run on `tier3_focus_ticker` when set.
+    tier3_focus_ticker: str | None = None
+    tier3_focus_locked: bool = False
+    tier3_focus_lock_reason: str = ""
+    tier3_focus_locked_at: datetime | None = None
+
     # Bull/Bear researcher outputs (populated in T3, read by Strategist)
     bull_argument:      str   = ""
     bear_argument:      str   = ""

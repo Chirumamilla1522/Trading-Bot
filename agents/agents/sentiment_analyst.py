@@ -143,12 +143,16 @@ def sentiment_analyst_node(state: FirmState) -> FirmState:
     # priority first.
     top_k = max(5, int(SENTIMENT_ANALYST_TOPK_HEADLINES))
     queue_picked_ids: list[str] = []
+    queue_taken_ids: list[str] = []
     recent_news: list = []
     try:
         from agents.data.news_priority_queue import AGENT_SENTIMENT_ANALYST, get_queue
 
         q = get_queue()
         for qn in q.take_unseen(AGENT_SENTIMENT_ANALYST, top_k):
+            # Important: always mark dequeued items as "seen" so they can't
+            # accumulate forever (even if they are outside this agent's lookback window).
+            queue_taken_ids.append(qn.id)
             if qn.item.published_at >= cutoff:
                 recent_news.append(qn.item)
                 queue_picked_ids.append(qn.id)
@@ -319,12 +323,13 @@ def sentiment_analyst_node(state: FirmState) -> FirmState:
     state.sentiment_themes     = key_themes
     state.sentiment_tail_risks = tail_risks
 
-    # Mark queue items as seen by this agent so next cycle can drain lower-priority tail
-    if queue_picked_ids:
+    # Mark queue items as seen by this agent so the queue can advance.
+    # We mark EVERYTHING we took, even if it was too old for this cycle's lookback window.
+    if queue_taken_ids:
         try:
             from agents.data.news_priority_queue import AGENT_SENTIMENT_ANALYST, get_queue
 
-            get_queue().mark_seen(AGENT_SENTIMENT_ANALYST, queue_picked_ids)
+            get_queue().mark_seen(AGENT_SENTIMENT_ANALYST, queue_taken_ids)
         except Exception:
             pass
 

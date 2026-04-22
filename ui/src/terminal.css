@@ -312,6 +312,154 @@ body.atlas.theme-dark #atlas-price-pill {
   flex-shrink: 0;
 }
 
+/* ── Notifications bell + popover ─────────────────────────────────────────── */
+.atlas-notifications{
+  position: relative;
+  flex-shrink: 0;
+}
+.atlas-notif-btn{
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: 1px solid var(--atlas-line);
+  background: var(--atlas-surface);
+  color: var(--atlas-ink);
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease;
+}
+.atlas-notif-btn:hover{
+  border-color: var(--atlas-accent-ring);
+  background: var(--atlas-accent-soft);
+}
+.atlas-notif-icon{
+  font-size: 14px;
+  line-height: 1;
+  transform: translateY(-0.5px);
+}
+.atlas-notif-badge{
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 1px solid var(--atlas-accent-ring);
+  background: var(--atlas-accent);
+  color: #fff;
+  font-family: var(--atlas-mono);
+  font-size: 9px;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+.atlas-notif-popover{
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 5000;
+  width: min(420px, calc(100vw - 24px));
+  max-height: min(420px, 70vh);
+  overflow: hidden;
+  border-radius: var(--atlas-radius-sm);
+  border: 1px solid var(--atlas-line);
+  background: var(--atlas-surface-2);
+  box-shadow: var(--atlas-shadow);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+.atlas-notif-popover[hidden]{ display:none !important; }
+.atlas-notif-head{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--atlas-line);
+  background: linear-gradient(180deg, rgba(255,255,255,.06), transparent);
+}
+.atlas-notif-title{
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--atlas-muted);
+}
+.atlas-notif-clear{
+  margin-left:auto;
+  border-radius: 999px;
+  border: 1px solid var(--atlas-line);
+  background: var(--atlas-bg);
+  padding: 6px 10px;
+  font-family: var(--atlas-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  cursor:pointer;
+  color: var(--atlas-muted);
+}
+.atlas-notif-clear:hover{
+  border-color: var(--atlas-accent-ring);
+  background: var(--atlas-accent-soft);
+  color: var(--atlas-accent);
+}
+.atlas-notif-list{
+  overflow-y: auto;
+  max-height: calc(min(420px, 70vh) - 44px);
+  padding: 10px 12px 12px;
+}
+.atlas-notif-empty{
+  padding: 14px 8px;
+  border: 1px dashed var(--atlas-line);
+  border-radius: 12px;
+  color: var(--atlas-muted);
+  text-align:center;
+  font-size: 12px;
+}
+.atlas-notif-item{
+  border: 1px solid var(--atlas-line);
+  border-radius: 12px;
+  background: var(--atlas-bg);
+  padding: 10px 10px;
+  margin-bottom: 8px;
+}
+.atlas-notif-item:last-child{ margin-bottom: 0; }
+.atlas-notif-row{
+  display:flex;
+  align-items:baseline;
+  gap:8px;
+  margin-bottom: 6px;
+}
+.atlas-notif-type{
+  font-family: var(--atlas-mono);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: .10em;
+  text-transform: uppercase;
+  color: var(--atlas-muted);
+}
+.atlas-notif-time{
+  margin-left:auto;
+  font-family: var(--atlas-mono);
+  font-size: 9px;
+  color: var(--atlas-muted);
+  opacity: .85;
+}
+.atlas-notif-msg{
+  font-size: 12px;
+  line-height: 1.45;
+  color: color-mix(in srgb, var(--atlas-ink) 88%, var(--atlas-muted));
+  overflow-wrap:anywhere;
+}
+.atlas-notif-item.type-ok{ border-left: 3px solid rgba(5,150,105,.45); }
+.atlas-notif-item.type-warn{ border-left: 3px solid rgba(245,158,11,.55); }
+.atlas-notif-item.type-err{ border-left: 3px solid rgba(220,38,38,.55); }
+
 .topbar-badge {
   font-family: var(--atlas-mono);
   font-size: 10px;
@@ -601,21 +749,23 @@ body.atlas.theme-dark .topbar-badge.agent-status-stale {
   flex-direction: row;
   align-items: center;
   gap: 8px;
-  padding: 5px 11px;
+  padding: 7px 12px;
   margin: 0;
   border-radius: 9px;
   border: 1px solid var(--atlas-line);
-  background: var(--atlas-surface-2);
+  background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02)), var(--atlas-surface-2);
   cursor: pointer;
   font-family: var(--atlas-mono);
   font-variant-numeric: tabular-nums;
   line-height: 1.15;
   color: var(--atlas-ink);
+  transition: transform .10s ease, border-color .12s ease, background .12s ease;
 }
 .atlas-bench-chip:hover {
   border-color: color-mix(in srgb, var(--atlas-accent) 35%, var(--atlas-line));
   background: color-mix(in srgb, var(--atlas-accent-fill) 55%, var(--atlas-surface-2));
 }
+.atlas-bench-chip:active{ transform: translateY(0.5px); }
 .atlas-bench-sym {
   font-size: 11px;
   font-weight: 800;
@@ -628,7 +778,7 @@ body.atlas.theme-dark .topbar-badge.agent-status-stale {
   flex-direction: column;
   align-items: flex-end;
   gap: 1px;
-  min-width: 4.5rem;
+  min-width: 5.1rem;
 }
 .atlas-bench-last {
   font-size: 11px;
@@ -636,12 +786,41 @@ body.atlas.theme-dark .topbar-badge.agent-status-stale {
   font-variant-numeric: tabular-nums;
 }
 .atlas-bench-chg {
-  font-size: 10px;
-  font-weight: 700;
+  font-size: 9px;
+  font-weight: 800;
   font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--atlas-line);
+  background: color-mix(in srgb, var(--atlas-ink) 1.5%, transparent);
 }
 .atlas-bench-chg--up { color: var(--atlas-up); }
 .atlas-bench-chg--down { color: var(--atlas-down); }
+.atlas-bench-chg--flat { color: var(--atlas-muted); }
+.atlas-bench-chg-arrow{
+  font-size: 9px;
+  line-height: 1;
+  opacity: 0.85;
+}
+
+/* Core indices / section headers in scanner */
+tr.scanner-section-row td.scanner-section {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+tr.scanner-section-row td.scanner-section{
+  border-left: 3px solid color-mix(in srgb, var(--atlas-accent) 55%, transparent);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--atlas-accent) 9%, transparent), transparent 40%),
+    color-mix(in srgb, var(--atlas-bg) 70%, var(--atlas-surface-2));
+}
 
 /* Scanner: section dividers (indices / sectors / macro vs names) */
 tr.scanner-section-row td.scanner-section {

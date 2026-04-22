@@ -106,6 +106,7 @@ class NewsPriorityQueue:
         self._items: dict[str, QueuedNews] = {}
         self._max_size = int(max_size)
         self._ttl_hours = float(ttl_hours)
+        self._order = (os.getenv("NEWS_QUEUE_ORDER", "fifo") or "fifo").strip().lower()
 
     # ── mutation ───────────────────────────────────────────────────────────
     def push(self, item: Any) -> bool:
@@ -165,13 +166,22 @@ class NewsPriorityQueue:
 
     # ── reads ─────────────────────────────────────────────────────────────
     def take_unseen(self, agent: str, limit: int) -> list[QueuedNews]:
-        """Return the highest-priority items not yet seen by `agent` (up to `limit`)."""
+        """
+        Return unseen items for `agent` (up to `limit`).
+
+        Ordering is controlled by `NEWS_QUEUE_ORDER`:
+        - fifo (default): oldest `added_at` first (strict first-in-first-out)
+        - priority: higher computed priority first, then FIFO tiebreak
+        """
         if limit <= 0:
             return []
         with self._lock:
             self._gc_locked()
             unseen = [q for q in self._items.values() if agent not in q.seen]
-            unseen.sort(key=lambda q: (-q.priority, q.added_at))
+            if self._order == "priority":
+                unseen.sort(key=lambda q: (-q.priority, q.added_at))
+            else:
+                unseen.sort(key=lambda q: (q.added_at, -q.priority))
             return list(unseen[:limit])
 
     def peek_top(self, limit: int) -> list[QueuedNews]:
@@ -179,7 +189,10 @@ class NewsPriorityQueue:
             return []
         with self._lock:
             items = list(self._items.values())
-            items.sort(key=lambda q: (-q.priority, q.added_at))
+            if self._order == "priority":
+                items.sort(key=lambda q: (-q.priority, q.added_at))
+            else:
+                items.sort(key=lambda q: (q.added_at, -q.priority))
             return items[:limit]
 
     def size(self) -> int:

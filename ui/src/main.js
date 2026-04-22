@@ -194,70 +194,132 @@ let _optionsController = null;
 let _quoteSeq = 0;
 let _quoteController = null;
 
-// ── Toast notification system ────────────────────────────────────────────────
-const _toastContainer = () => el("toast-container");
+// ── Notifications bell system ────────────────────────────────────────────────
+const _notif = {
+  items: [],
+  unread: 0,
+  open: false,
+  max: 250,
+};
 
-function _ensureToastControls() {
-  const tc = _toastContainer();
-  if (!tc) return null;
-  if (tc.dataset.controlsWired === "1") return tc;
-  tc.dataset.controlsWired = "1";
+const ET_TZ = "America/New_York"; // ET/EST/EDT depending on date (IANA)
 
-  // Clear-all control (shown only when toasts exist).
-  const clear = document.createElement("button");
-  clear.type = "button";
-  clear.id = "toast-clear";
-  clear.className = "toast-clear";
-  clear.textContent = "Clear";
-  clear.hidden = true;
-  clear.addEventListener("click", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    tc.querySelectorAll(".toast").forEach(n => n.remove());
-    clear.hidden = true;
-  });
-  tc.prepend(clear);
-
-  // Delegate close buttons.
-  tc.addEventListener("click", (e) => {
-    const btn = e.target.closest(".toast-close");
-    if (!btn || !tc.contains(btn)) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const toast = btn.closest(".toast");
-    toast?.remove();
-    const any = tc.querySelector(".toast");
-    clear.hidden = !any;
-  });
-  return tc;
-}
-
-function showToast(msg, type = "info", duration = 4000) {
-  const icons = { ok: "✓", err: "✕", warn: "⚠", info: "ℹ" };
-  const tc = _ensureToastControls();
-  if (!tc) return;
-  const t = document.createElement("div");
-  t.className = `toast toast-${type}`;
-  t.innerHTML = `
-    <span class="toast-icon">${icons[type] ?? "ℹ"}</span>
-    <span class="toast-msg">${msg}</span>
-    <button type="button" class="toast-close" aria-label="Dismiss notification">✕</button>
-  `;
-  tc.appendChild(t);
-  const clear = tc.querySelector("#toast-clear");
-  if (clear) clear.hidden = false;
-  setTimeout(() => {
-    t.classList.add("toast-out");
-    t.addEventListener("animationend", () => {
-      t.remove();
-      const tc = _toastContainer();
-      const clear = tc?.querySelector?.("#toast-clear");
-      if (clear) clear.hidden = !tc.querySelector(".toast");
+function _fmtTime(ts) {
+  try {
+    const d = new Date(ts);
+    if (!Number.isFinite(d.getTime())) return "";
+    return d.toLocaleTimeString("en-US", {
+      timeZone: ET_TZ,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
     });
-  }, duration);
+  } catch {
+    return "";
+  }
 }
 
-// Expose for other modules (charts.js) to surface errors inside Tauri WebView
+function _notifEls() {
+  return {
+    btn: el("atlas-notif-btn"),
+    badge: el("atlas-notif-badge"),
+    pop: el("atlas-notif-popover"),
+    list: el("atlas-notif-list"),
+    clear: el("atlas-notif-clear"),
+  };
+}
+
+function _renderNotifications() {
+  const { badge, pop, list, btn } = _notifEls();
+  if (badge) {
+    badge.textContent = String(_notif.unread || 0);
+    badge.hidden = !(_notif.unread > 0);
+  }
+  if (btn) btn.setAttribute("aria-expanded", _notif.open ? "true" : "false");
+  if (pop) pop.hidden = !_notif.open;
+  if (!list) return;
+
+  if (!_notif.items.length) {
+    list.innerHTML = `<div class="atlas-notif-empty">No notifications yet.</div>`;
+    return;
+  }
+  const rows = _notif.items
+    .slice()
+    .reverse()
+    .slice(0, 80)
+    .map((n) => {
+      const type = String(n.type || "info");
+      const msg = String(n.msg || "");
+      const time = _fmtTime(n.ts);
+      const typLab = type.toUpperCase();
+      return `
+        <div class="atlas-notif-item type-${type}">
+          <div class="atlas-notif-row">
+            <span class="atlas-notif-type">${typLab}</span>
+            <span class="atlas-notif-time">${time}</span>
+          </div>
+          <div class="atlas-notif-msg">${msg}</div>
+        </div>
+      `;
+    })
+    .join("");
+  list.innerHTML = rows;
+}
+
+function _setNotificationsOpen(v) {
+  _notif.open = !!v;
+  if (_notif.open) _notif.unread = 0;
+  _renderNotifications();
+}
+
+function _wireNotificationsBellOnce() {
+  const { btn, clear, pop } = _notifEls();
+  if (!btn || btn.dataset.wired === "1") return;
+  btn.dataset.wired = "1";
+
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    _setNotificationsOpen(!_notif.open);
+  });
+  clear?.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    _notif.items = [];
+    _notif.unread = 0;
+    _renderNotifications();
+  });
+
+  // Close on outside click
+  window.addEventListener("click", (e) => {
+    if (!_notif.open) return;
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    if (btn.contains(t)) return;
+    if (pop && pop.contains(t)) return;
+    _setNotificationsOpen(false);
+  });
+
+  // ESC closes
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (_notif.open) _setNotificationsOpen(false);
+  });
+
+  _renderNotifications();
+}
+
+function showToast(msg, type = "info", _duration = 4000) {
+  _wireNotificationsBellOnce();
+  const t = Date.now();
+  const item = { id: `${t}-${Math.random().toString(16).slice(2)}`, ts: t, type, msg: String(msg ?? "") };
+  _notif.items.push(item);
+  while (_notif.items.length > _notif.max) _notif.items.shift();
+  if (!_notif.open) _notif.unread += 1;
+  _renderNotifications();
+}
+
+// Expose for other modules (charts.js) to surface notifications inside Tauri WebView
 window.__showToast = showToast;
 
 // Surface runtime errors (Atlas: helps diagnose missing bindings quickly)
@@ -1661,8 +1723,8 @@ function _updateNewsLastSync() {
   if (!node) return;
   const t = new Date();
   node.hidden = false;
-  node.textContent = ` · Sync ${t.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true })}`;
-  node.title = `Last ${BACKEND}/news pull: ${t.toLocaleString("en-US")}`;
+  node.textContent = ` · Sync ${t.toLocaleTimeString("en-US", { timeZone: ET_TZ, hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true })}`;
+  node.title = `Last ${BACKEND}/news pull: ${t.toLocaleString("en-US", { timeZone: ET_TZ })}`;
 }
 
 // ── Category meta ─────────────────────────────────────────────────────────────
@@ -1705,7 +1767,7 @@ function _newsRelTime(pubStr) {
     if (ageSec < 60)        return `${Math.round(ageSec)}s ago`;
     if (ageSec < 3600)      return `${Math.round(ageSec / 60)}m ago`;
     if (ageSec < 86400)     return `${Math.round(ageSec / 3600)}h ago`;
-    return new Date(pubStr).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    return new Date(pubStr).toLocaleDateString("en-US", { timeZone: ET_TZ, month: "short", day: "numeric" });
   } catch { return "--"; }
 }
 
@@ -1728,6 +1790,7 @@ function _openNewsModal(item) {
 
   const timeStr = item.published_at
     ? new Date(item.published_at).toLocaleString("en-US", {
+        timeZone: ET_TZ,
         month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
         hour12: false, timeZoneName: "short",
       })
@@ -3066,7 +3129,7 @@ function _fmtRecAge(iso) {
     if (sec < 60) return "just now";
     if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
     if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
-    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return d.toLocaleDateString("en-US", { timeZone: ET_TZ, month: "short", day: "numeric" });
   } catch {
     return "";
   }
@@ -3646,12 +3709,22 @@ function _benchmarkChipHtml(it) {
       : "—";
   const chgRaw = it.change_pct;
   let chgText = "—";
-  let chgCls = "atlas-bench-chg";
+  let chgCls = "atlas-bench-chg atlas-bench-chg--flat";
+  let arrow = "";
   if (chgRaw != null && Number.isFinite(Number(chgRaw))) {
     const c = Number(chgRaw);
-    const sign = c >= 0 ? "+" : "";
+    const sign = c > 0 ? "+" : "";
     chgText = `${sign}${c.toFixed(2)}%`;
-    chgCls += c >= 0 ? " atlas-bench-chg--up" : " atlas-bench-chg--down";
+    if (c > 0.001) {
+      chgCls = "atlas-bench-chg atlas-bench-chg--up";
+      arrow = "▲";
+    } else if (c < -0.001) {
+      chgCls = "atlas-bench-chg atlas-bench-chg--down";
+      arrow = "▼";
+    } else {
+      chgCls = "atlas-bench-chg atlas-bench-chg--flat";
+      arrow = "•";
+    }
   }
   const src = it.quote_source ? String(it.quote_source) : "";
   const titleRaw = src ? `${sym} · last & day % (${src})` : `${sym} · last & day %`;
@@ -3661,7 +3734,7 @@ function _benchmarkChipHtml(it) {
     `<span class="atlas-bench-sym">${tEsc}</span>` +
     `<div class="atlas-bench-metrics">` +
     `<span class="atlas-bench-last">${last}</span>` +
-    `<span class="${chgCls}">${chgText}</span>` +
+    `<span class="${chgCls}"><span class="atlas-bench-chg-arrow" aria-hidden="true">${arrow}</span>${chgText}</span>` +
     `</div></button>`
   );
 }
@@ -4091,7 +4164,7 @@ function _renderMarketClock(data) {
     const today    = new Date();
     const isToday  = nextOpen && nextOpen.toDateString() === today.toDateString();
     const dayLabel = nextOpen
-      ? (isToday ? "today" : nextOpen.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }))
+      ? (isToday ? "today" : nextOpen.toLocaleDateString("en-US", { timeZone: ET_TZ, weekday: "short", month: "short", day: "numeric" }))
       : "";
     const timeLabel = nextOpen
       ? nextOpen.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "America/New_York" })
@@ -4108,7 +4181,7 @@ function _marketStatusLabel() {
     const nextOpen = new Date(_marketClock.next_open);
     const today    = new Date();
     const isToday  = nextOpen.toDateString() === today.toDateString();
-    const day  = isToday ? "today" : nextOpen.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+    const day  = isToday ? "today" : nextOpen.toLocaleDateString("en-US", { timeZone: ET_TZ, weekday: "short", month: "short", day: "numeric" });
     const time = nextOpen.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "America/New_York" });
     return `market opens ${day} ${time} ET`;
   }
@@ -4153,7 +4226,9 @@ function renderOrderBlotter(orders) {
   }
   tbody.innerHTML = orders.slice(0, 50).map(o => {
     const t    = o.submitted_at || o.created_at || "";
-    const time = t ? new Date(t).toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" }) : "—";
+    const time = t
+      ? new Date(t).toLocaleTimeString("en-US", { timeZone: ET_TZ, hour12: false, hour: "2-digit", minute: "2-digit" })
+      : "—";
     const sym  = (o.symbol || "").slice(0, 20);
     const side = (o.side || "").toUpperCase();
     const sideCls = side === "BUY" ? "call" : "put";
@@ -4523,7 +4598,9 @@ function _dashRenderProcessed(items) {
   tb.innerHTML = "";
   for (const a of rows) {
     const tr = document.createElement("tr");
-    const t = a.published_at ? new Date(a.published_at).toLocaleString("en-US", { month:"short", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false }) : "—";
+    const t = a.published_at
+      ? new Date(a.published_at).toLocaleString("en-US", { timeZone: ET_TZ, month:"short", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false })
+      : "—";
     tr.innerHTML = `
       <td class="mono">${esc(t)}</td>
       <td class="mono">${esc((a.original_tickers || []).slice(0, 4).join(","))}</td>

@@ -27,7 +27,7 @@ function fetchWithTimeout(url, init = {}, ms = 8000) {
     .finally(() => clearTimeout(timer));
 }
 
-const US_STOCK_TZ = "America/New_York";
+const US_STOCK_TZ = "America/New_York"; // ET/EST/EDT depending on date (IANA timezone)
 
 // ── Shared chart theme (Atlas-driven) ─────────────────────────────────────────
 // Pull from CSS variables so charts match Atlas light/dark + palette.
@@ -166,27 +166,36 @@ function barChartTime(timeframe, unixSec) {
   const t = Math.floor(Number(unixSec));
   if (!Number.isFinite(t) || t <= 0) return null;
   if (DAILY_CHART_TIMEFRAMES.has(timeframe)) {
+    // Use ET calendar day so daily candles align to US market sessions.
     const d = new Date(t * 1000);
-    const y = d.getUTCFullYear();
-    const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-    const day = String(d.getUTCDate()).padStart(2, "0");
-    return `${y}-${m}-${day}`;
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: US_STOCK_TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(d);
+    const p = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+    return `${p.year}-${p.month}-${p.day}`;
   }
   return t;   // UTCTimestamp (integer seconds)
 }
 
-function _utcDayKey(unixSec) {
+function _etDayKey(unixSec) {
   const t = Math.floor(Number(unixSec));
   if (!Number.isFinite(t) || t <= 0) return null;
   const d = new Date(t * 1000);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: US_STOCK_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(d);
+  const p = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${p.year}-${p.month}-${p.day}`;
 }
 
 /**
- * Dedupe by unix second; for daily chart modes also collapse rows that share the same UTC calendar day
+ * Dedupe by unix second; for daily chart modes also collapse rows that share the same ET calendar day
  * (Yahoo occasionally returns two rows for one session → lightweight-charts requires strictly increasing time).
  */
 function normalizeBars(bars, timeframe) {
@@ -199,7 +208,7 @@ function normalizeBars(bars, timeframe) {
     for (const b of bars) {
       const t = Math.floor(Number(b.time));
       if (!Number.isFinite(t) || t <= 0) continue;
-      const dk = _utcDayKey(t);
+      const dk = _etDayKey(t);
       if (!dk) continue;
       const prev = byDay.get(dk);
       if (!prev || t >= Math.floor(Number(prev.time))) {
@@ -256,7 +265,11 @@ function chartTimeToUnixSec(t) {
   if (t === undefined || t === null) return NaN;
   if (typeof t === "number" && Number.isFinite(t)) return t;
   if (typeof t === "string" && /^\d{4}-\d{2}-\d{2}$/.test(t)) {
+    // Interpret daily string as ET midnight (not UTC) to keep visible range logic aligned.
     const [y, m, d] = t.split("-").map(Number);
+    const ms = Date.parse(`${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}T00:00:00`);
+    // Fallback: Date.parse above is local; instead compute a stable UTC timestamp for that ET day.
+    // Use noon UTC as safe anchor then shift by offset is overkill; we only need monotonic mapping.
     return Math.floor(Date.UTC(y, m - 1, d) / 1000);
   }
   if (typeof t === "object" && t.year != null) {
@@ -324,12 +337,12 @@ function makeTickMarkFormatter(tf) {
       const d = new Date(ms);
       if (!Number.isFinite(d.getTime())) return null;
       if (type === TickMarkType.Year) {
-        return String(d.getUTCFullYear());
+        return new Intl.DateTimeFormat("en-US", { timeZone: US_STOCK_TZ, year: "numeric" }).format(d);
       }
       if (type === TickMarkType.Month) {
-        return d.toLocaleDateString("en-US", { timeZone: "UTC", month: "short", year: "2-digit" });
+        return d.toLocaleDateString("en-US", { timeZone: US_STOCK_TZ, month: "short", year: "2-digit" });
       }
-      return d.toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" });
+      return d.toLocaleDateString("en-US", { timeZone: US_STOCK_TZ, month: "short", day: "numeric" });
     }
     // Intraday: UTCTimestamp as number (or string); fall back to default formatter if unsure.
     const sec = typeof time === "number" ? time : typeof time === "string" ? Number(time) : NaN;
@@ -364,7 +377,7 @@ function fmtCrosshairTime(tf, time) {
     const d = new Date(ms);
     if (!Number.isFinite(d.getTime())) return "";
     const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: "UTC", month: "short", day: "numeric", year: "numeric",
+      timeZone: US_STOCK_TZ, month: "short", day: "numeric", year: "numeric",
     }).formatToParts(d);
     const p = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
     return `${p.month} ${p.day}, ${p.year}`;
