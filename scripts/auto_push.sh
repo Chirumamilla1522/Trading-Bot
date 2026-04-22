@@ -63,6 +63,22 @@ _commit_and_push() {
     return 0
   fi
 
+  # Always try to integrate remote changes first (keeps multi-device workflows smooth).
+  # If this fails (e.g. conflicts), we skip the auto-commit/push so a human can resolve.
+  if [[ -n "$BRANCH" ]]; then
+    git fetch "$REMOTE" "$BRANCH" >/dev/null 2>&1 || true
+    if ! git pull --rebase "$REMOTE" "$BRANCH"; then
+      echo "[skip] git pull --rebase failed; resolve manually"
+      return 0
+    fi
+  else
+    git fetch "$REMOTE" >/dev/null 2>&1 || true
+    if ! git pull --rebase "$REMOTE" HEAD; then
+      echo "[skip] git pull --rebase failed; resolve manually"
+      return 0
+    fi
+  fi
+
   git add -A
 
   # Nothing to commit.
