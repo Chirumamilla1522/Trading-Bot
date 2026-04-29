@@ -194,6 +194,22 @@ let _optionsController = null;
 let _quoteSeq = 0;
 let _quoteController = null;
 
+function _isIndexTicker(t) {
+  const u = String(t || "").trim().toUpperCase();
+  return u.startsWith("^");
+}
+
+function _displaySymbol(t) {
+  const u = String(t || "").trim().toUpperCase();
+  const map = {
+    "^GSPC": "SPX",
+    "^IXIC": "NASDAQ",
+    "^DJI": "DOW JONES",
+    "^NDX": "NASDAQ 100",
+  };
+  return map[u] || u;
+}
+
 // ── Notifications bell system ────────────────────────────────────────────────
 const _notif = {
   items: [],
@@ -203,6 +219,23 @@ const _notif = {
 };
 
 const ET_TZ = "America/New_York"; // ET/EST/EDT depending on date (IANA)
+
+function _fmtEtHms(isoLike) {
+  try {
+    if (!isoLike) return "";
+    const d = new Date(isoLike);
+    if (!Number.isFinite(d.getTime())) return "";
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: ET_TZ,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).format(d);
+  } catch {
+    return "";
+  }
+}
 
 function _fmtTime(ts) {
   try {
@@ -486,15 +519,20 @@ function buildReasoningEntryElement(entry) {
     ? `action-${action}`
     : "action-default";
   const agentName = (entry.agent ?? "").toUpperCase().replace(/\s+/g, "_");
+  const tok = entry?.outputs?.llm_call || entry?.outputs?.llm || null;
+  const tokLine = (tok && (tok.total_tokens != null || tok.prompt_tokens != null || tok.completion_tokens != null))
+    ? `<div class="re-tokens">TOK: ${tok.prompt_tokens ?? "—"} in · ${tok.completion_tokens ?? "—"} out · ${tok.total_tokens ?? "—"} total${tok.duration_s != null ? ` · ${Number(tok.duration_s).toFixed(2)}s` : ""}${tok.backend ? ` · ${esc(String(tok.backend))}` : ""}</div>`
+    : "";
   const div = document.createElement("div");
   div.className = "reasoning-entry";
   div.innerHTML = `
     <div class="re-header">
       <span class="re-agent" data-role="${esc(agentName)}">${esc(entry.agent ?? "")}</span>
       <span class="re-action ${cls}">${esc(action)}</span>
-      <span class="re-time">${(entry.timestamp ?? "").slice(11, 19)}</span>
+      <span class="re-time">${esc(_fmtEtHms(entry.timestamp) || "")}</span>
     </div>
-    <div class="re-reasoning">${esc(entry.reasoning ?? "")}</div>`;
+    <div class="re-reasoning">${esc(entry.reasoning ?? "")}</div>
+    ${tokLine}`;
   return div;
 }
 
@@ -724,6 +762,7 @@ async function pollScanner() {
     if (!r.ok) return;
     scannerData = await r.json();
     renderScanner();
+    try { renderTopTickersStrip(); } catch {}
   } catch { /* backend not ready */ }
 }
 
@@ -788,7 +827,62 @@ async function pollScannerQuotes() {
       resortScannerDataClient();
     }
     renderScanner();
+    try { renderTopTickersStrip(); } catch {}
   } catch { /* ignore */ }
+}
+
+function renderTopTickersStrip() {
+  const host = el("top-tickers");
+  if (!host) return;
+  if (!scannerData?.length) { host.innerHTML = ""; return; }
+
+  // Use the benchmark sections ordering when present; otherwise use scanner order.
+  let tickers = [];
+  if (_scannerBenchSections?.length) {
+    for (const sec of _scannerBenchSections) {
+      for (const t of (sec.tickers || [])) tickers.push(String(t || "").toUpperCase());
+    }
+    // Append any remaining single names
+    const seen = new Set(tickers);
+    for (const r of scannerData) {
+      const t = String(r.ticker || "").toUpperCase();
+      if (t && !seen.has(t)) { seen.add(t); tickers.push(t); }
+    }
+  } else {
+    tickers = scannerData.map(r => String(r.ticker || "").toUpperCase());
+  }
+
+  // Cap for topbar density (small universe anyway)
+  tickers = tickers.filter(Boolean).slice(0, 14);
+  const byTicker = new Map(scannerData.map(r => [String(r.ticker || "").toUpperCase(), r]));
+
+  host.innerHTML = tickers.map(t => {
+    const r = byTicker.get(t) || {};
+    const last = r.last != null ? Number(r.last) : (r.underlying_price != null ? Number(r.underlying_price) : NaN);
+    const px = Number.isFinite(last) ? fmtNum(last, 2) : "—";
+    const chgRaw = r.change_pct;
+    let chgStr = "";
+    let cls = "";
+    if (chgRaw != null && Number.isFinite(Number(chgRaw))) {
+      const c = Number(chgRaw);
+      chgStr = `${c >= 0 ? "+" : ""}${c.toFixed(2)}%`;
+      cls = c > 0 ? "pos" : c < 0 ? "neg" : "";
+    }
+    const active = String(activeTicker || "").toUpperCase() === t;
+    const disp = _displaySymbol(t);
+    return `<button type="button" class="top-ticker-chip${active ? " active" : ""}" data-ticker="${escAttr(t)}" title="${escAttr(disp)}">
+      <span class="sym">${esc(disp)}</span>
+      <span class="px">$${esc(px)}</span>
+      <span class="chg ${cls}">${esc(chgStr || "")}</span>
+    </button>`;
+  }).join("");
+
+  host.querySelectorAll(".top-ticker-chip").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const t = btn.dataset.ticker;
+      if (t) switchTicker(t);
+    });
+  });
 }
 
 function _scannerRowHtml(d) {
@@ -803,7 +897,7 @@ function _scannerRowHtml(d) {
   const estN     = !hasLive && d.underlying_price > 0 ? Number(d.underlying_price) : NaN;
   const pxNum    = hasLive ? lastN : estN;
   const px       = Number.isFinite(pxNum)
-    ? fmtNum(pxNum, pxNum >= 100 ? 2 : 4)
+    ? fmtNum(pxNum, 2)
     : "—";
   const sess = d.quote_session || "";
   const sessHint =
@@ -840,8 +934,10 @@ function renderScanner() {
   );
 
   const total = scannerData.length;
-  el("scanner-count").textContent =
-    `${total} / ${rows.length}`;
+  const scCount = el("scanner-count");
+  if (scCount) {
+    scCount.textContent = `${total} / ${rows.length}`;
+  }
 
   const tbody = el("scanner-body");
   const scrollParent = el("col-left-scroll");
@@ -856,15 +952,19 @@ function renderScanner() {
   };
 
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="empty-row scan-loading">
-      ${total === 0 ? "Scanning S&amp;P 500… (~2 min first load)" : "No matches"}
-    </td></tr>`;
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="6" class="empty-row scan-loading">
+        ${total === 0 ? "Scanning S&amp;P 500… (~2 min first load)" : "No matches"}
+      </td></tr>`;
+    }
     _restoreScannerScroll();
     return;
   }
 
   if (!_scannerBenchSections || !_benchmarkTickerSet) {
-    tbody.innerHTML = rows.map((d) => _scannerRowHtml(d)).join("");
+    if (tbody) {
+      tbody.innerHTML = rows.map((d) => _scannerRowHtml(d)).join("");
+    }
     _restoreScannerScroll();
     return;
   }
@@ -886,7 +986,9 @@ function renderScanner() {
     html += `<tr class="scanner-section-row"><td colspan="6" class="scanner-section">Single names</td></tr>`;
     for (const d of eqRows) html += _scannerRowHtml(d);
   }
-  tbody.innerHTML = html || rows.map((d) => _scannerRowHtml(d)).join("");
+  if (tbody) {
+    tbody.innerHTML = html || rows.map((d) => _scannerRowHtml(d)).join("");
+  }
   _restoreScannerScroll();
 }
 
@@ -956,14 +1058,15 @@ el("scanner-sort")?.addEventListener("change", e => {
 async function switchTicker(ticker) {
   if (ticker === activeTicker) return;
   activeTicker = ticker;
+  const disp = _displaySymbol(ticker);
 
   // Update header & price pill ticker immediately
-  el("chain-ticker").textContent = ticker;
+  el("chain-ticker").textContent = disp;
   const cLab = el("chart-ticker-label");
-  if (cLab) cLab.textContent = ticker;
+  if (cLab) cLab.textContent = disp;
   el("chain-count").textContent = "loading…";
   const ppTicker = el("pp-ticker");
-  if (ppTicker) ppTicker.textContent = ticker;
+  if (ppTicker) ppTicker.textContent = disp;
   const ppPrice = el("pp-price");
   // Fast paint: use last known scanner quote if present (avoids "—" flash).
   try {
@@ -971,7 +1074,7 @@ async function switchTicker(ticker) {
     const lastN = row?.last != null ? Number(row.last) : NaN;
     if (ppPrice) {
       if (Number.isFinite(lastN)) {
-        ppPrice.textContent = fmtNum(lastN, lastN >= 100 ? 2 : 4);
+        ppPrice.textContent = `$${fmtNum(lastN, 2)}`;
       } else {
         ppPrice.textContent = "—";
       }
@@ -1009,7 +1112,13 @@ async function switchTicker(ticker) {
   }).catch(() => {});
 
   // Start dependent loads without blocking fundamentals/plot updates.
-  fetchOptionsChain(ticker);
+  if (_isIndexTicker(ticker)) {
+    // Indices are quotes-only; Alpaca options endpoints will error. Clear chain UI.
+    try { renderOptionsTable([]); } catch {}
+    try { el("chain-count").textContent = ""; } catch {}
+  } else {
+    fetchOptionsChain(ticker);
+  }
   _syncStockTicker(ticker);
 
   window.dispatchEvent(
@@ -1028,6 +1137,11 @@ async function switchTicker(ticker) {
 async function fetchOptionsChain(ticker) {
   try {
     const t = String(ticker || "").toUpperCase();
+    if (_isIndexTicker(t)) {
+      el("options-body").innerHTML =
+        `<tr><td colspan="11" class="empty-row">Options not available for indices</td></tr>`;
+      return;
+    }
     // Instant paint from cache (then refresh in background)
     const cached = _getCache(_optionsCache, t, 15 * 60 * 1000);
     if (cached?.contracts?.length) {
@@ -1557,6 +1671,7 @@ function updateMetrics(state) {
 
   renderStockPositions(state.stock_positions);
   renderPositions(state.open_positions);
+  try { renderLeftPortfolio(state); } catch { /* ignore */ }
 
   _updateNewsFeedStatus(state);
   // Render news from state (backup in case /news poll fails)
@@ -1567,31 +1682,7 @@ function updateMetrics(state) {
     renderLlmModelsHint(state.agent_runtime);
   }
 
-  // Option rights preference (CALL/PUT/BOTH) used by Strategist proposals.
-  try {
-    const rights = String(state.allowed_option_rights || "").toUpperCase();
-    const sel = el("ot-rights");
-    if (sel && (rights === "CALL" || rights === "PUT" || rights === "BOTH")) {
-      if (sel.value !== rights) sel.value = rights;
-    }
-  } catch { /* ignore */ }
-
-  // Option structure preference (SINGLE / VERTICAL / IRON_CONDOR / CALENDAR / ALL).
-  try {
-    const want = Array.isArray(state.allowed_option_structures) ? state.allowed_option_structures : ["SINGLE"];
-    const vals = (want || []).map(x => String(x || "").toUpperCase()).filter(Boolean);
-    const sel = el("ot-structures");
-    if (sel && sel.options?.length) {
-      const normalized = vals.includes("ALL") ? ["ALL"] : (!vals.length ? ["SINGLE"] : vals);
-      const set = new Set(normalized);
-      // Avoid fighting user mid-selection.
-      if (document.activeElement !== sel) {
-        Array.from(sel.options).forEach((o) => {
-          o.selected = set.has(String(o.value || "").toUpperCase());
-        });
-      }
-    }
-  } catch { /* ignore */ }
+  // Option strategy filters removed from UI (naked options only).
 
   // Risk limits inputs (max drawdown / position cap). Server stores fractions; UI shows %.
   try {
@@ -1606,6 +1697,87 @@ function updateMetrics(state) {
       pcEl.value = pc.toFixed(1);
     }
   } catch { /* ignore */ }
+}
+
+function renderLeftPortfolio(state) {
+  const wrap = el("left-portfolio");
+  const meta = el("left-port-meta");
+  if (!wrap) return;
+  const stocks = state?.stock_positions || [];
+  const opts = state?.open_positions || [];
+
+  const stockRows = (Array.isArray(stocks) ? stocks : [])
+    .map(p => ({
+      ticker: String(p.ticker || "").toUpperCase(),
+      qty: Number(p.quantity || 0),
+      upl: Number(p.unrealized_pl || 0),
+      mv: Number(p.market_value || 0),
+    }))
+    .filter(x => x.ticker && Math.abs(x.qty) > 1e-9)
+    .sort((a, b) => Math.abs(b.mv) - Math.abs(a.mv));
+
+  const optRows = (Array.isArray(opts) ? opts : [])
+    .map(p => ({
+      symbol: String(p.symbol || "").toUpperCase(),
+      qty: Number(p.quantity || 0),
+      upl: Number(p.current_pnl || 0),
+    }))
+    .filter(x => x.symbol && Math.abs(x.qty) > 0);
+
+  const totalUpl = stockRows.reduce((s, x) => s + (Number.isFinite(x.upl) ? x.upl : 0), 0)
+    + optRows.reduce((s, x) => s + (Number.isFinite(x.upl) ? x.upl : 0), 0);
+  if (meta) {
+    const sN = stockRows.length;
+    const oN = optRows.length;
+    meta.textContent = `${sN} stk · ${oN} opt`;
+    meta.title = `Positions: ${sN} stock lots, ${oN} option legs`;
+  }
+
+  if (stockRows.length === 0 && optRows.length === 0) {
+    wrap.innerHTML = `<div class="left-port-empty">No positions</div>`;
+    return;
+  }
+
+  const uplCls = totalUpl >= 0 ? "pos" : "neg";
+  const uplStr = `${totalUpl >= 0 ? "+" : ""}$${Math.abs(totalUpl).toFixed(2)}`;
+
+  const stocksHtml = stockRows.slice(0, 6).map(x => {
+    const cls = x.upl >= 0 ? "pos" : "neg";
+    const qty = Number.isFinite(x.qty) ? Math.round(x.qty) : 0;
+    return `<div class="left-port-row" data-ticker="${escAttr(x.ticker)}" title="Click to switch ticker">
+      <span class="sym">${esc(x.ticker)}</span>
+      <span class="qty">${qty} sh</span>
+      <span class="upl ${cls}">${x.upl >= 0 ? "+" : ""}$${Math.abs(x.upl).toFixed(2)}</span>
+    </div>`;
+  }).join("");
+
+  const optsHtml = optRows.slice(0, 4).map(x => {
+    const cls = x.upl >= 0 ? "pos" : "neg";
+    return `<div class="left-port-row left-port-row--opt" title="${escAttr(x.symbol)}">
+      <span class="sym">${esc(x.symbol.slice(0, 6))}</span>
+      <span class="qty">${Math.abs(Math.trunc(x.qty || 0))} ct</span>
+      <span class="upl ${cls}">${x.upl >= 0 ? "+" : ""}$${Math.abs(Number(x.upl || 0)).toFixed(2)}</span>
+    </div>`;
+  }).join("");
+
+  wrap.innerHTML = `
+    <div class="left-port-summary">Total UPL <span class="upl ${uplCls}">${uplStr}</span></div>
+    ${stocksHtml ? `<div class="left-port-block">
+      <div class="left-port-title">Stocks</div>
+      ${stocksHtml}
+    </div>` : ""}
+    ${optsHtml ? `<div class="left-port-block">
+      <div class="left-port-title">Options</div>
+      ${optsHtml}
+    </div>` : ""}
+  `;
+
+  wrap.querySelectorAll(".left-port-row[data-ticker]").forEach(row => {
+    row.addEventListener("click", () => {
+      const t = row.dataset.ticker;
+      if (t) switchTicker(t);
+    });
+  });
 }
 
 // ── Risk limits (user inputs) ───────────────────────────────────────────────
@@ -2771,7 +2943,7 @@ async function pollQuote() {
     const sdLast = el("sd-last");
     if (sdLast && q.last != null && Number.isFinite(Number(q.last))) {
       const v = Number(q.last);
-      sdLast.textContent = fmtNum(v, v >= 100 ? 2 : 4);
+      sdLast.textContent = fmtNum(v, 2);
     }
 
     // ── Update topbar price pill ──
@@ -2981,6 +3153,9 @@ async function pollReasoningLog() {
     if (!r.ok) return;
     const entries = await r.json();
     entries.slice(-100).forEach(appendReasoningEntry);
+    // The reasoning log advances right after agents run (including news sentiment processing).
+    // Refresh dashboard stats promptly so unseen queue counters don't lag behind.
+    try { void pollDashboardSafe?.({ force: true }); } catch { try { void pollDashboard?.({ force: true }); } catch {} }
   } catch { /* silent */ }
 }
 
@@ -3136,6 +3311,7 @@ function _fmtRecAge(iso) {
 }
 
 function _renderRecCard(rec) {
+  const intent = _recIntent(rec);
   const asset = String(rec.asset_type || "option");
   const confClass = rec.confidence >= 0.7 ? "rec-conf-high"
                   : rec.confidence >= 0.4 ? "rec-conf-mid"
@@ -3231,6 +3407,10 @@ function _renderRecCard(rec) {
   const stockRationale = esc(rec.stock_proposal?.rationale || "").slice(0, 2000);
   const sl = rec.proposal?.stop_loss_pct != null ? Number(rec.proposal.stop_loss_pct) : null;
   const tp = rec.proposal?.take_profit_pct != null ? Number(rec.proposal.take_profit_pct) : null;
+  const pop = rec.proposal?.pop != null ? Number(rec.proposal.pop) : null;
+  const ev = rec.proposal?.ev != null ? Number(rec.proposal.ev) : null;
+  const be = rec.proposal?.breakeven != null ? Number(rec.proposal.breakeven) : null;
+  const dte = rec.proposal?.dte != null ? Number(rec.proposal.dte) : null;
 
   const riskExplain = rec.proposal
     ? `<div class="rec-details-block">
@@ -3244,6 +3424,7 @@ function _renderRecCard(rec) {
            <div class="rec-kv"><span>From proposal</span><span>$${maxRisk.toFixed(0)} max risk · $${target.toFixed(0)} target</span></div>
            ${netMid != null ? `<div class="rec-kv"><span>Net premium (mid)</span><span>${netMid >= 0 ? "+" : "−"}$${Math.abs(Number(netMid)).toFixed(2)}</span></div>` : `<div class="rec-kv"><span>Net premium (mid)</span><span>—</span></div>`}
            ${maxLossEst != null ? `<div class="rec-kv"><span>Max loss (est)</span><span>$${Number(maxLossEst).toFixed(2)}</span></div>` : ""}
+           ${(pop != null || ev != null || be != null || dte != null) ? `<div class="rec-kv"><span>PoP / EV</span><span>${dte != null ? `${dte}d · ` : ""}${pop != null && Number.isFinite(pop) ? `PoP ${(pop*100).toFixed(0)}%` : "PoP —"}${ev != null && Number.isFinite(ev) ? ` · EV $${ev.toFixed(0)}` : ""}${be != null && Number.isFinite(be) ? ` · BE $${be.toFixed(2)}` : ""}</span></div>` : ""}
          </div>
          ${riskMath ? `<div class="rec-details-sub">${esc(String(riskMath))}</div>` : ""}
        </div>`
@@ -3291,7 +3472,7 @@ function _renderRecCard(rec) {
       ].filter(Boolean).join("");
 
   return `
-    <article class="rec-card ${isPending ? "rec-card--pending" : "rec-card--settled"}" data-rec-id="${esc(rec.id)}" data-rec-status="${esc(rec.status)}">
+    <article class="rec-card ${isPending ? "rec-card--pending" : "rec-card--settled"} rec-card--${esc(intent)}" data-rec-id="${esc(rec.id)}" data-rec-status="${esc(rec.status)}" data-rec-intent="${esc(intent)}">
       <div class="rec-card-top">
         <div class="rec-card-identity">
           <span class="rec-card-ticker">${esc(rec.ticker)}</span>
@@ -3333,9 +3514,30 @@ async function pollRecommendations() {
   } catch { /* ignore */ }
 }
 
+function _recIntent(rec) {
+  try {
+    const asset = String(rec?.asset_type || "option").toLowerCase();
+    if (asset === "stock") {
+      const s = String(rec?.stock_proposal?.side || "").toUpperCase();
+      if (s.startsWith("B")) return "buy";
+      if (s.startsWith("S")) return "sell";
+      return "other";
+    }
+    // option: use first leg side when available
+    const legs = rec?.proposal?.legs || [];
+    const s = String(legs?.[0]?.side || "").toUpperCase();
+    if (s.startsWith("B")) return "buy";
+    if (s.startsWith("S")) return "sell";
+    return "other";
+  } catch {
+    return "other";
+  }
+}
+
 function renderRecommendations(recs) {
-  const panel = el("recommendations-panel");
-  const count = el("rec-count");
+  // Support both legacy and "atlas-" prefixed ids (UI layout has evolved).
+  const panel = el("atlas-recommendations-panel") || el("recommendations-panel");
+  const count = el("atlas-rec-count") || el("rec-count");
   if (!panel) return;
 
   // Preserve UX across the 5s poll refresh:
@@ -3376,10 +3578,18 @@ function renderRecommendations(recs) {
 
   const parts = [];
   if (pending.length) {
+    // Single-column list (sorted by intent then recency): BUY → SELL → OTHER.
+    const intentRank = (r) => {
+      const k = _recIntent(r);
+      return k === "buy" ? 0 : k === "sell" ? 1 : 2;
+    };
+    const pendingSorted = pending
+      .slice()
+      .sort((a, b) => (intentRank(a) - intentRank(b)) || (recSortTs(b) - recSortTs(a)));
     parts.push(
       `<div class="rec-section">
         <div class="rec-section-label">Awaiting your decision</div>
-        ${pending.map(_renderRecCard).join("")}
+        ${pendingSorted.map(_renderRecCard).join("")}
       </div>`,
     );
   }
@@ -3739,17 +3949,73 @@ function _benchmarkChipHtml(it) {
   );
 }
 
+function _renderIndicesPanelFromBenchmarks(sections, items) {
+  const host = document.getElementById("atlas-scanner-indices");
+  if (!host) return;
+  const flat = [];
+  const src = Array.isArray(items) && items.length ? items
+            : Array.isArray(sections) ? sections.flatMap(s => Array.isArray(s.items) ? s.items : [])
+            : [];
+  for (const it of src) {
+    const t = String(it?.ticker || "").toUpperCase();
+    if (!t) continue;
+    if (!t.startsWith("^")) continue;
+    flat.push(it);
+  }
+  if (!flat.length) {
+    host.innerHTML = "";
+    return;
+  }
+  const labelMap = { "^GSPC": "SPX", "^IXIC": "NASDAQ", "^DJI": "DOW JONES", "^NDX": "NASDAQ 100" };
+  const rows = flat.slice(0, 6).map((it) => {
+    const t = String(it?.ticker || "").toUpperCase();
+    const sym = labelMap[t] || t.replace("^", "");
+    const lastN = Number(it?.last);
+    const chgN = Number(it?.change_pct);
+    const last = Number.isFinite(lastN) ? lastN.toFixed(lastN >= 100 ? 2 : 3) : "—";
+    let chgText = "—";
+    let chgCls = "scanner-index-chg flat";
+    if (Number.isFinite(chgN)) {
+      const s = (chgN >= 0 ? "+" : "") + chgN.toFixed(2) + "%";
+      chgText = s;
+      chgCls = "scanner-index-chg " + (chgN > 0 ? "pos" : chgN < 0 ? "neg" : "flat");
+    }
+    const tAttr = escAttr(t);
+    return (
+      `<div class="scanner-index-row" role="button" tabindex="0" data-ticker="${tAttr}">` +
+      `<span class="scanner-index-sym">${esc(sym)}</span>` +
+      `<span class="scanner-index-last">${esc(last)}</span>` +
+      `<span class="${chgCls}">${esc(chgText)}</span>` +
+      `</div>`
+    );
+  }).join("");
+  host.innerHTML =
+    `<div class="scanner-indices-head"><span class="scanner-indices-title">Indices</span></div>` +
+    `<div class="scanner-indices-grid">${rows}</div>`;
+  host.querySelectorAll(".scanner-index-row").forEach((row) => {
+    const tk = row.getAttribute("data-ticker");
+    row.addEventListener("click", () => { if (tk) switchTicker(tk); });
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        if (tk) switchTicker(tk);
+      }
+    });
+  });
+}
+
 /** Index / sector ETF strip under tier bar (GET /quotes/benchmarks). */
 async function pollBenchmarkStrip() {
   if (document.visibilityState !== "visible") return;
   const wrap = document.getElementById("atlas-context-strip-scroll");
-  if (!wrap) return;
   try {
     const r = await fetchWithTimeout(`${BACKEND}/quotes/benchmarks`, {}, 10000);
     if (!r.ok) return;
     const data = await r.json();
     const sections = Array.isArray(data.sections) ? data.sections : [];
     const items = Array.isArray(data.items) ? data.items : [];
+    try { _renderIndicesPanelFromBenchmarks(sections, items); } catch { /* ignore */ }
+    if (!wrap) return;
     const metaSig = _benchmarkSectionsMetaSig(sections, items);
     const prevChipsScroll = _snapshotBenchChipsScroll(wrap);
 
@@ -3935,35 +4201,7 @@ function _otOptSideUpdate() {
 el("ot-o-side-buy").addEventListener("click",  () => { _otOptSide = "buy";  _otOptSideUpdate(); });
 el("ot-o-side-sell").addEventListener("click", () => { _otOptSide = "sell"; _otOptSideUpdate(); });
 
-// Preference: restrict what option rights the agents propose (CALL/PUT/BOTH).
-el("ot-rights")?.addEventListener("change", async (e) => {
-  const rights = String(e.target.value || "BOTH").toUpperCase();
-  try {
-    await fetchWithTimeout(`${BACKEND}/set_option_rights`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rights }),
-    }, 4000);
-    try { pollState(); } catch { /* ignore */ }
-  } catch { /* ignore */ }
-});
-
-// Preference: restrict what option structures the agents propose.
-el("ot-structures")?.addEventListener("change", async () => {
-  const sel = el("ot-structures");
-  if (!sel) return;
-  const structures = Array.from(sel.selectedOptions || [])
-    .map(o => String(o.value || "").toUpperCase())
-    .filter(Boolean);
-  try {
-    await fetchWithTimeout(`${BACKEND}/set_option_structures`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ structures: structures.length ? structures : ["SINGLE"] }),
-    }, 5000);
-    try { pollState(); } catch { /* ignore */ }
-  } catch { /* ignore */ }
-});
+// Option strategy filters removed from UI (naked options only).
 
 el("ot-o-type").addEventListener("change", e => {
   el("ot-o-lmt-row").style.display =
@@ -4090,6 +4328,233 @@ async function pollLlmStatus() {
     const d = await r.json();
     _renderLlmBadge(d);
   } catch { /* silent */ }
+}
+
+// ── Token usage (backend aggregated) ───────────────────────────────────────────
+function _fmtK(n) {
+  const x = Number(n || 0);
+  if (!Number.isFinite(x) || x <= 0) return "0";
+  if (x >= 1e9) return `${(x / 1e9).toFixed(1)}b`;
+  if (x >= 1e6) return `${(x / 1e6).toFixed(1)}m`;
+  if (x >= 1e3) return `${Math.round(x / 1e3)}k`;
+  return `${Math.round(x)}`;
+}
+
+async function pollTokens() {
+  const badge = el("token-badge");
+  if (!badge) return;
+  try {
+    const r = await fetchWithTimeout(`${BACKEND}/llm/tokens`, {}, 4000);
+    if (!r.ok) return;
+    const d = await r.json();
+    window.__atlasLastTokens = d;
+    const p = Number(d?.prompt_tokens || 0);
+    const c = Number(d?.completion_tokens || 0);
+    const t = Number(d?.total_tokens || 0);
+    const w = Number(d?.window_days || 30);
+    badge.textContent = `TOK: ${_fmtK(p)}/${_fmtK(c)}`;
+    badge.className = "topbar-badge badge-neutral";
+    // Tooltip includes totals and a compact per-agent breakdown.
+    const by = d?.by_agent && typeof d.by_agent === "object" ? d.by_agent : {};
+    const top = Object.entries(by)
+      .map(([k, v]) => [k, Number(v?.total_tokens || 0)])
+      .sort((a, b) => (b[1] - a[1]))
+      .slice(0, 6)
+      .map(([k, v]) => `${k}: ${_fmtK(v)}`)
+      .join(" | ");
+    badge.title = `LLM tokens (${w}d): prompt=${p} completion=${c} total=${t}${top ? `\nTop agents: ${top}` : ""}`;
+  } catch { /* silent */ }
+}
+
+async function pollAgentTimings() {
+  const badge = el("latency-badge");
+  if (!badge) return;
+  try {
+    const r = await fetchWithTimeout(`${BACKEND}/agents/timings?window_days=30`, {}, 5000);
+    if (!r.ok) return;
+    const d = await r.json();
+    window.__atlasLastTimings = d;
+    const overall = d?.overall || {};
+    const w = Number(d?.window_days || 30);
+    const avg = Number(overall?.avg_s || 0);
+    const p50 = overall?.p50_s;
+    const p95 = overall?.p95_s;
+    const n = Number(overall?.count || 0);
+    badge.textContent = n > 0 ? `LAT: ${avg.toFixed(2)}s` : "LAT: --";
+    badge.className = "topbar-badge badge-neutral";
+
+    const by = d?.by_agent && typeof d.by_agent === "object" ? d.by_agent : {};
+    const top = Object.entries(by)
+      .map(([k, v]) => ({
+        agent: String(k || "unknown"),
+        avg_s: Number(v?.avg_s || 0),
+        p95_s: v?.p95_s,
+        count: Number(v?.count || 0),
+      }))
+      .sort((a, b) => (b.avg_s - a.avg_s))
+      .slice(0, 8)
+      .map(x => `${x.agent}: avg ${x.avg_s.toFixed(2)}s p95 ${(Number(x.p95_s || 0)).toFixed(2)}s n=${x.count}`)
+      .join("\n");
+
+    badge.title =
+      `Agent step timings (${w}d): n=${n}` +
+      `\nAvg=${avg.toFixed(3)}s` +
+      (p50 != null ? ` p50=${Number(p50).toFixed(3)}s` : "") +
+      (p95 != null ? ` p95=${Number(p95).toFixed(3)}s` : "") +
+      (top ? `\nSlowest avg (top):\n${top}` : "");
+  } catch { /* silent */ }
+}
+
+// ── Metrics modal (TOK / LAT) ────────────────────────────────────────────────
+function _setMetricsModalOpen(open) {
+  const modal = document.getElementById("atlas-metrics-modal");
+  if (!modal) return;
+  modal.hidden = !open;
+  document.body.classList.toggle("news-modal-open", open);
+}
+
+function _fmtNum(n, d = 0) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "—";
+  return x.toFixed(d);
+}
+
+function _renderTokensDetails(d) {
+  const w = Number(d?.window_days || 30);
+  const p = Number(d?.prompt_tokens || 0);
+  const c = Number(d?.completion_tokens || 0);
+  const t = Number(d?.total_tokens || 0);
+  const by = d?.by_agent && typeof d.by_agent === "object" ? d.by_agent : {};
+  const rows = Object.entries(by)
+    .map(([agent, v]) => ({
+      agent: String(agent || "unknown"),
+      prompt: Number(v?.prompt_tokens || 0),
+      completion: Number(v?.completion_tokens || 0),
+      total: Number(v?.total_tokens || 0),
+    }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 20);
+
+  const table = rows.length ? `
+    <table class="metrics-table">
+      <thead><tr><th>Agent</th><th>Prompt</th><th>Completion</th><th>Total</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `
+          <tr>
+            <td>${esc(r.agent)}</td>
+            <td>${esc(_fmtK(r.prompt))}</td>
+            <td>${esc(_fmtK(r.completion))}</td>
+            <td>${esc(_fmtK(r.total))}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>` : `<div class="metrics-note">No per-agent rows yet.</div>`;
+
+  return `
+    <p class="metrics-note">Token usage is aggregated over the last <strong>${w} days</strong>.</p>
+    <div class="metrics-kpis">
+      <span class="metrics-kpi">Prompt: ${_fmtK(p)}</span>
+      <span class="metrics-kpi">Completion: ${_fmtK(c)}</span>
+      <span class="metrics-kpi">Total: ${_fmtK(t)}</span>
+    </div>
+    <div class="metrics-card">
+      <div class="metrics-card-title">Top token consumers (by agent)</div>
+      ${table}
+    </div>
+  `;
+}
+
+function _renderTimingDetails(d) {
+  const w = Number(d?.window_days || 30);
+  const overall = d?.overall || {};
+  const n = Number(overall?.count || 0);
+  const avg = Number(overall?.avg_s || 0);
+  const p50 = Number(overall?.p50_s || 0);
+  const p95 = Number(overall?.p95_s || 0);
+  const by = d?.by_agent && typeof d.by_agent === "object" ? d.by_agent : {};
+  const rows = Object.entries(by)
+    .map(([agent, v]) => ({
+      agent: String(agent || "unknown"),
+      count: Number(v?.count || 0),
+      avg_s: Number(v?.avg_s || 0),
+      p50_s: Number(v?.p50_s || 0),
+      p95_s: Number(v?.p95_s || 0),
+    }))
+    .sort((a, b) => b.avg_s - a.avg_s)
+    .slice(0, 20);
+
+  const table = rows.length ? `
+    <table class="metrics-table">
+      <thead><tr><th>Agent</th><th>N</th><th>Avg (s)</th><th>P50</th><th>P95</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `
+          <tr>
+            <td>${esc(r.agent)}</td>
+            <td>${esc(String(r.count))}</td>
+            <td>${esc(_fmtNum(r.avg_s, 2))}</td>
+            <td>${esc(_fmtNum(r.p50_s, 2))}</td>
+            <td>${esc(_fmtNum(r.p95_s, 2))}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>` : `<div class="metrics-note">No timing rows yet.</div>`;
+
+  return `
+    <p class="metrics-note">Step timings are aggregated over the last <strong>${w} days</strong>.</p>
+    <div class="metrics-kpis">
+      <span class="metrics-kpi">Samples: ${Number.isFinite(n) ? n : 0}</span>
+      <span class="metrics-kpi">Avg: ${_fmtNum(avg, 2)}s</span>
+      <span class="metrics-kpi">P50: ${_fmtNum(p50, 2)}s</span>
+      <span class="metrics-kpi">P95: ${_fmtNum(p95, 2)}s</span>
+    </div>
+    <div class="metrics-card">
+      <div class="metrics-card-title">Slowest agents (avg time)</div>
+      ${table}
+    </div>
+  `;
+}
+
+async function _openMetrics(kind) {
+  const title = document.getElementById("atlas-metrics-title");
+  const body = document.getElementById("atlas-metrics-body");
+  if (!body) return;
+
+  const k = String(kind || "").toLowerCase();
+  if (title) title.textContent = k === "tokens" ? "TOKENS" : "AGENT TIMINGS";
+  body.innerHTML = `<div class="metrics-note">Loading…</div>`;
+  _setMetricsModalOpen(true);
+
+  try {
+    if (k === "tokens") {
+      const d = window.__atlasLastTokens || (await (await fetchWithTimeout(`${BACKEND}/llm/tokens`, {}, 4000)).json());
+      body.innerHTML = _renderTokensDetails(d || {});
+    } else {
+      const d = window.__atlasLastTimings || (await (await fetchWithTimeout(`${BACKEND}/agents/timings?window_days=30`, {}, 5000)).json());
+      body.innerHTML = _renderTimingDetails(d || {});
+    }
+  } catch (e) {
+    body.innerHTML = `<div class="metrics-note">Failed to load details.</div>`;
+  }
+}
+
+function _wireMetricsModalOnce() {
+  const modal = document.getElementById("atlas-metrics-modal");
+  const close = document.getElementById("atlas-metrics-close");
+  if (!modal || modal.dataset.wired === "1") return;
+  modal.dataset.wired = "1";
+  close?.addEventListener("click", () => _setMetricsModalOpen(false));
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) _setMetricsModalOpen(false);
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modal.hidden) _setMetricsModalOpen(false);
+  });
+
+  // Badge click opens details.
+  const tok = el("token-badge");
+  const lat = el("latency-badge");
+  tok?.addEventListener("click", (e) => { e.preventDefault(); _openMetrics("tokens"); });
+  lat?.addEventListener("click", (e) => { e.preventDefault(); _openMetrics("timings"); });
+  if (tok) tok.style.cursor = "pointer";
+  if (lat) lat.style.cursor = "pointer";
 }
 
 function _renderLlmBadge(d) {
@@ -4410,6 +4875,7 @@ function bootstrapCharts() {
   _wireChartStripButtons();
   _wireChainToolbar();
   _wireAllCollapsibles();
+  _wireMetricsModalOnce();
   _wireAgentLiveToggle();
   _wireAgentFlowModal();
   _wireL2Overlay();
@@ -4479,6 +4945,8 @@ async function pollNewsFeed() {
     const articles = await r.json();
     if (articles?.length) renderNews(articles, { replace: true });
     _updateNewsLastSync();
+    // After news refresh, update queue/processed stats so NA/SA unseen counters stay current.
+    try { void pollDashboardSafe?.({ force: true }); } catch { try { void pollDashboard?.({ force: true }); } catch {} }
   } catch { /* silent */ }
 }
 pollNewsFeed();
@@ -4660,8 +5128,10 @@ async function pollDashboard({ force = false } = {}) {
     const qStats = rq?.stats || {};
     const total = qStats.total ?? "—";
     const u1 = qStats.unseen_news_analyst ?? "—";
-    const u2 = qStats.unseen_sentiment_analyst ?? "—";
-    stats.textContent = `Q:${total}  unseen NA:${u1}  SA:${u2}`;
+    const procN = Array.isArray(rp) ? rp.length : (rp && typeof rp === "object" && Array.isArray(rp.items) ? rp.items.length : 0);
+    // Queue semantics: items represent "not yet processed by NewsProcessor".
+    // Processed tab is the durable record (processed_article store).
+    stats.textContent = `Q:${total}  UNPROCESSED:${u1}  PROCESSED:${procN}`;
 
     if (rq) _dashRenderQueue(rq);
     if (rp) _dashRenderProcessed(rp);
@@ -4810,14 +5280,16 @@ function _wireDashboard() {
   });
   refresh?.addEventListener("click", (e) => {
     e.preventDefault();
-    pollDashboard({ force: true });
+    // Use the in-flight guarded wrapper (defined near bottom) to avoid request pile-ups.
+    try { pollDashboardSafe({ force: true }); } catch { pollDashboard({ force: true }); }
   });
   // default tab
   _dashSetTab("queue");
 }
 
 try { _wireDashboard(); } catch (e) { console.error("_wireDashboard", e); }
-try { pollDashboard({ force: true }); } catch (e) { console.error("pollDashboard", e); }
+// NOTE: initial data loads are orchestrated by boot() below (parallel + staged),
+// so we avoid forcing heavy requests during initial parse/paint.
 
 // DB Explorer wiring (safe if elements missing)
 try {
@@ -4829,19 +5301,81 @@ try {
   }
 } catch (e) { console.error("db explorer wiring", e); }
 
+// ── Boot + polling orchestration ─────────────────────────────────────────────
+// Goal:
+// - fast first paint
+// - parallel loads (render as each resolves)
+// - no overlapping in-flight pollers (avoid backlog on cold start)
+// - stage heavy work (scanner/reasoning/benchmarks/dashboard) after initial UI is up
+
+const __atlasInFlight = new Map(); // name -> boolean
+function _wrapInFlight(name, fn) {
+  return async (...args) => {
+    if (__atlasInFlight.get(name)) return;
+    __atlasInFlight.set(name, true);
+    try {
+      return await fn(...args);
+    } finally {
+      __atlasInFlight.set(name, false);
+    }
+  };
+}
+
+const pollStateSafe          = _wrapInFlight("state", pollState);
+const pollQuoteSafe          = _wrapInFlight("quote", pollQuote);
+const pollOrdersSafe         = _wrapInFlight("orders", pollOrders);
+const pollNewsFeedSafe       = _wrapInFlight("news", pollNewsFeed);
+const pollDashboardSafe      = _wrapInFlight("dashboard", pollDashboard);
+const pollScannerSafe        = _wrapInFlight("scanner", pollScanner);
+const pollScannerQuotesSafe  = _wrapInFlight("scanner_quotes", pollScannerQuotes);
+const pollBenchmarkStripSafe = _wrapInFlight("benchmarks", pollBenchmarkStrip);
+const pollReasoningLogSafe   = _wrapInFlight("reasoning", pollReasoningLog);
+const loadPortfolioSeriesSafe= _wrapInFlight("portfolio_series", loadPortfolioSeries);
+const pollLlmStatusSafe      = _wrapInFlight("llm_status", pollLlmStatus);
+const pollMarketClockSafe    = _wrapInFlight("mkt_clock", pollMarketClock);
+const pollTokensSafe         = _wrapInFlight("tokens", pollTokens);
+const pollTimingsSafe        = _wrapInFlight("agent_timings", pollAgentTimings);
+
+function boot() {
+  // Start light tasks in parallel right away (incremental paint).
+  try { void pollStateSafe(); } catch {}
+  try { void pollMarketClockSafe(); } catch {}
+  try { void pollLlmStatusSafe(); } catch {}
+  try { void pollTokensSafe(); } catch {}
+  try { void pollTimingsSafe(); } catch {}
+  try { void pollQuoteSafe(); } catch {}
+  try { void pollOrdersSafe(); } catch {}
+  try { void pollNewsFeedSafe(); } catch {}
+  try { void loadPortfolioSeriesSafe(); } catch {}
+
+  // Stage heavy tasks so cold backend caches can settle and the UI becomes interactive first.
+  setTimeout(() => { try { void pollBenchmarkStripSafe(); } catch {} }, 2500);
+  setTimeout(() => { try { void pollDashboardSafe({ force: true }); } catch {} }, 4500);
+  setTimeout(() => { try { void pollReasoningLogSafe(); } catch {} }, 6500);
+  setTimeout(() => { try { void pollScannerSafe(); } catch {} }, 9000);
+}
+
+try { boot(); } catch (e) { console.error("boot", e); }
+
 // Polling intervals (pollState skips when WS is live)
-setInterval(pollState,           2000);   // metrics fallback
-setInterval(pollMarketClock,    60000);   // NYSE clock (every minute is enough)
-setInterval(pollLlmStatus,      30000);   // LLM backend badge (updates after cooldown expires)
-setInterval(pollScanner,        10000);   // full scanner (options metrics + quotes)
-setInterval(pollScannerQuotes,   1000);   // live last / day % only
-setInterval(pollBenchmarkStrip,  2000);   // index / sector strip under tier bar
-setInterval(pollReasoningLog,    4000);   // XAI log
-setInterval(loadPortfolioSeries, 15000);  // portfolio / greeks chart
+setInterval(pollStateSafe,           2000);    // metrics fallback
+setInterval(pollMarketClockSafe,    60000);    // NYSE clock
+setInterval(pollLlmStatusSafe,      30000);    // LLM backend badge
+setInterval(pollTokensSafe,         10000);    // token usage badge (live-ish)
+setInterval(pollTimingsSafe,        10000);    // agent timing badge (live-ish)
+
 // Quote is now pushed over /ws as well; keep REST poll as fallback but slower.
-setInterval(pollQuote,            4000);  // fallback quote poll
-setInterval(pollOrders,          15000);  // order blotter
-setInterval(pollNewsFeed,       30000);   // news headlines — full replace from GET /news
+setInterval(pollQuoteSafe,           5000);    // fallback quote poll (was 4s)
+setInterval(pollOrdersSafe,         20000);    // order blotter (was 15s)
+setInterval(pollNewsFeedSafe,       45000);    // news headlines (was 30s)
+setInterval(loadPortfolioSeriesSafe, 20000);   // portfolio / greeks series (was 15s)
+
+// Heavy loops: slower + protected from overlap.
+setInterval(pollBenchmarkStripSafe,  15000);   // index / sector strip (was 2s)
+setInterval(pollReasoningLogSafe,    12000);   // XAI log (was 4s)
+setInterval(pollScannerSafe,         20000);   // full scanner (was 10s)
+setInterval(pollScannerQuotesSafe,    1000);   // quote-only scanner refresh
+
 // Recompute “Xm ago” without waiting for the next HTTP poll (tape-only).
 setInterval(() => _renderNewsTapeFromBuffer(), 15000);
-setInterval(() => { try { pollDashboard(); } catch {} }, 15000);
+setInterval(() => { try { pollDashboardSafe(); } catch {} }, 30000);

@@ -42,11 +42,13 @@ Pipeline flow:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
 import time
 from typing import Any, Literal
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
@@ -60,16 +62,264 @@ from agents.agents.risk_manager       import risk_manager_node
 from agents.agents.strategist         import strategist_node
 from agents.agents.adversarial_debate import adversarial_debate_node
 from agents.agents.trader             import trader_node
-from agents.config                    import ENABLE_ADVERSARIAL_DEBATE, MODELS
+from agents.agents.paired_researcher  import paired_researcher_node
+from agents.config                    import (
+    COMBINED_BULL_BEAR_RESEARCH,
+    ENABLE_ADVERSARIAL_DEBATE,
+    ENABLE_BULL_BEAR_RESEARCH,
+    ENABLE_SENTIMENT_ANALYST,
+    MODELS,
+)
 from agents.llm_providers             import chat_llm
 from agents.llm_retry                 import invoke_llm
 
 log = logging.getLogger(__name__)
 
 
+# ── Parallel analysis (speed) ──────────────────────────────────────────────────
+
+def _parallel_analysis_node(state: FirmState) -> FirmState:
+    """
+    Stage 1 parallelization:
+    - StockSpecialist
+    - OptionsSpecialist
+    - SentimentAnalyst
+
+    Each runs on a deep-copied state snapshot. We merge back only agent-owned fields
+    plus append their reasoning entries.
+    """
+    _t0 = time.time()
+    base = state
+    snap = base.model_copy(deep=True)
+
+    jobs = {
+        "stock_specialist": stock_specialist_node,
+        "options_specialist": options_specialist_node,
+    }
+    if ENABLE_SENTIMENT_ANALYST:
+        jobs["sentiment_analyst"] = sentiment_analyst_node
+
+    results: dict[str, FirmState] = {}
+    errors: dict[str, str] = {}
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {
+            ex.submit(fn, snap.model_copy(deep=True)): name
+            for name, fn in jobs.items()
+        }
+        for fut in as_completed(futs):
+            name = futs[fut]
+            try:
+                results[name] = fut.result()
+            except Exception as e:
+                errors[name] = f"{type(e).__name__}: {str(e)[:220]}"
+
+    def _append_new_reasoning(from_state: FirmState) -> None:
+        try:
+            seen = {(e.agent, e.action, getattr(e, "timestamp", None)) for e in (base.reasoning_log or [])}
+            for e in (from_state.reasoning_log or []):
+                key = (e.agent, e.action, getattr(e, "timestamp", None))
+                if key in seen:
+                    continue
+                base.reasoning_log.append(e)
+                seen.add(key)
+        except Exception:
+            pass
+
+    if "stock_specialist" in results:
+        r = results["stock_specialist"]
+        base.stock_decision = r.stock_decision
+        base.stock_confidence = r.stock_confidence
+        base.pending_stock_proposal = r.pending_stock_proposal
+        _append_new_reasoning(r)
+
+    if "options_specialist" in results:
+        r = results["options_specialist"]
+        base.analyst_decision = r.analyst_decision
+        base.analyst_confidence = r.analyst_confidence
+        base.iv_atm = r.iv_atm
+        base.iv_skew_ratio = r.iv_skew_ratio
+        base.iv_regime = r.iv_regime
+        base.iv_term_structure = r.iv_term_structure
+        _append_new_reasoning(r)
+
+    if "sentiment_analyst" in results:
+        r = results["sentiment_analyst"]
+        base.sentiment_decision = r.sentiment_decision
+        base.sentiment_confidence = r.sentiment_confidence
+        base.aggregate_sentiment = r.aggregate_sentiment
+        base.sentiment_themes = r.sentiment_themes
+        base.sentiment_tail_risks = r.sentiment_tail_risks
+        _append_new_reasoning(r)
+
+    if errors:
+        base.reasoning_log.append(ReasoningEntry(
+            agent="System",
+            action="INFO",
+            reasoning="Parallel analysis: one or more agents failed; continuing with partial results.",
+            inputs={"errors": errors},
+            outputs={},
+        ))
+
+    try:
+        from agents.tracking.mlflow_tracing import log_agent_step
+        log_agent_step(
+            "parallel_analysis",
+            inputs={"ticker": base.ticker},
+            outputs={"ok": sorted(list(results.keys())), "errors": errors},
+            duration_s=max(0.0, time.time() - _t0),
+        )
+    except Exception:
+        pass
+
+    return base
+
+
+def _parallel_five_node(state: FirmState) -> FirmState:
+    """
+    Run 5 independent agents in parallel to reduce Tier‑3 latency:
+    - StockSpecialist
+    - OptionsSpecialist
+    - SentimentAnalyst
+    - BullResearcher
+    - BearResearcher
+
+    Each runs on a deep-copied state snapshot. We merge back only agent-owned fields
+    plus append their reasoning entries.
+    """
+    _t0 = time.time()
+    base = state
+    snap = base.model_copy(deep=True)
+
+    def _run_stock(s: FirmState) -> FirmState:
+        return stock_specialist_node(s)
+
+    def _run_options(s: FirmState) -> FirmState:
+        return options_specialist_node(s)
+
+    def _run_sentiment(s: FirmState) -> FirmState:
+        return sentiment_analyst_node(s)
+
+    jobs = {
+        "stock_specialist": _run_stock,
+        "options_specialist": _run_options,
+    }
+    if ENABLE_SENTIMENT_ANALYST:
+        jobs["sentiment_analyst"] = _run_sentiment
+    if ENABLE_BULL_BEAR_RESEARCH:
+        if COMBINED_BULL_BEAR_RESEARCH:
+            jobs["paired_researcher"] = paired_researcher_node
+        else:
+            jobs["bull_researcher"] = bull_researcher_node
+            jobs["bear_researcher"] = bear_researcher_node
+
+    results: dict[str, FirmState] = {}
+    errors: dict[str, str] = {}
+
+    # Use threads: each agent is I/O-bound (LLM calls) and already blocks.
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futs = {
+            ex.submit(fn, snap.model_copy(deep=True)): name
+            for name, fn in jobs.items()
+        }
+        for fut in as_completed(futs):
+            name = futs[fut]
+            try:
+                results[name] = fut.result()
+            except Exception as e:
+                errors[name] = f"{type(e).__name__}: {str(e)[:220]}"
+
+    # Merge results back into base state (only agent-owned fields).
+    # We also append only the "new" reasoning entries produced by each agent.
+    def _append_new_reasoning(from_state: FirmState) -> None:
+        try:
+            # base.reasoning_log is a list; since snap was deep-copied, compare lengths.
+            # safest: append entries whose timestamp/agent/action tuple isn't already present.
+            seen = {(e.agent, e.action, getattr(e, "timestamp", None)) for e in (base.reasoning_log or [])}
+            for e in (from_state.reasoning_log or []):
+                key = (e.agent, e.action, getattr(e, "timestamp", None))
+                if key in seen:
+                    continue
+                base.reasoning_log.append(e)
+                seen.add(key)
+        except Exception:
+            pass
+
+    if "stock_specialist" in results:
+        r = results["stock_specialist"]
+        base.stock_decision = r.stock_decision
+        base.stock_confidence = r.stock_confidence
+        base.pending_stock_proposal = r.pending_stock_proposal
+        _append_new_reasoning(r)
+
+    if "options_specialist" in results:
+        r = results["options_specialist"]
+        base.analyst_decision = r.analyst_decision
+        base.analyst_confidence = r.analyst_confidence
+        # IV metrics are owned by options ingest/specialist and used downstream
+        base.iv_atm = r.iv_atm
+        base.iv_skew_ratio = r.iv_skew_ratio
+        base.iv_regime = r.iv_regime
+        base.iv_term_structure = r.iv_term_structure
+        _append_new_reasoning(r)
+
+    if "sentiment_analyst" in results:
+        r = results["sentiment_analyst"]
+        base.sentiment_decision = r.sentiment_decision
+        base.sentiment_confidence = r.sentiment_confidence
+        base.aggregate_sentiment = r.aggregate_sentiment
+        base.sentiment_themes = r.sentiment_themes
+        base.sentiment_tail_risks = r.sentiment_tail_risks
+        _append_new_reasoning(r)
+
+    if "bull_researcher" in results:
+        r = results["bull_researcher"]
+        base.bull_argument = r.bull_argument
+        base.bull_conviction = r.bull_conviction
+        _append_new_reasoning(r)
+
+    if "bear_researcher" in results:
+        r = results["bear_researcher"]
+        base.bear_argument = r.bear_argument
+        base.bear_conviction = r.bear_conviction
+        _append_new_reasoning(r)
+
+    if "paired_researcher" in results:
+        r = results["paired_researcher"]
+        base.bull_argument = r.bull_argument
+        base.bull_conviction = r.bull_conviction
+        base.bear_argument = r.bear_argument
+        base.bear_conviction = r.bear_conviction
+        _append_new_reasoning(r)
+
+    if errors:
+        base.reasoning_log.append(ReasoningEntry(
+            agent="System",
+            action="INFO",
+            reasoning="Parallel agents: one or more agents failed; continuing with partial results.",
+            inputs={"errors": errors},
+            outputs={},
+        ))
+
+    try:
+        from agents.tracking.mlflow_tracing import log_agent_step
+        log_agent_step(
+            "parallel_five",
+            inputs={"ticker": base.ticker},
+            outputs={
+                "ok": sorted(list(results.keys())),
+                "errors": errors,
+            },
+        )
+    except Exception:
+        pass
+
+    return base
+
+
 # ── Bull Researcher prompt ─────────────────────────────────────────────────────
 
-BULL_RESEARCH_PROMPT = """You are the Bull Researcher at an autonomous options trading desk.
+BULL_RESEARCH_PROMPT = """You are the Bull Researcher.
 
 Your job: build the strongest possible BULLISH case for {ticker} using ALL available data.
 Be specific — reference actual numbers from the market context.
@@ -85,11 +335,13 @@ Market context you MUST use:
 - Key themes:         {themes}
 - Momentum signal:    {momentum:+.4f}
 - Volume ratio:       {vol_ratio:.2f}x avg
+- Technical context (deterministic): {technical_context}
 - Tier-2 structured digests (AI-enriched news lines; may overlap themes): {structured_digests}
 
 Instructions:
 1. Name 3-4 specific bullish catalysts grounded in the numbers above.
-2. State which options strategy benefits most and why (reference IV regime).
+2. State the market thesis in market terms: key level(s), what confirms, and what invalidates.
+3. State which allowed naked option expression fits that thesis best (short put vs short call) and why (reference IV regime).
 3. Identify the single strongest argument against your case — acknowledge it briefly.
 4. End with: "CONVICTION: X/10" where X is how strongly you believe in the bullish thesis.
 
@@ -99,15 +351,10 @@ STRICTNESS:
 
 Be concise (5-7 sentences). Do NOT output JSON."""
 
-BEAR_RESEARCH_PROMPT = """You are the Bear Researcher at an autonomous options trading desk.
+BEAR_RESEARCH_PROMPT = """You are the Bear Researcher.
 
-The Bull Researcher made the following argument:
----
-{bull_argument}
----
-
-Your job: challenge this with the strongest possible BEARISH case for {ticker}.
-Directly rebut the Bull's weakest points. Use specific numbers.
+Your job: build the strongest possible BEARISH case for {ticker} using the market context.
+Focus on concrete failure modes, tail risks, and what would invalidate a bullish thesis.
 
 Market context:
 - Price change today: {price_change_pct:+.2f}%
@@ -120,16 +367,17 @@ Market context:
 - Tail risks:         {tail_risks}
 - Drawdown so far:    {drawdown:.2%}
 - Portfolio delta:    {port_delta:+.3f}
+- Technical context (deterministic): {technical_context}
 - Tier-2 structured digests: {structured_digests}
 
 Instructions:
-1. Pick the Bull's 2 weakest points and dismantle them with data.
-2. Name 2-3 concrete downside risks or regime threats.
+1. Name 2-3 concrete downside risks or regime threats, including level-based invalidation risk if technical_context provides levels.
+2. State what would CONFIRM the bearish case and what would INVALIDATE it (price/level based when possible).
 3. Suggest what an overly-bearish case would get WRONG (stay calibrated).
 4. End with: "CONVICTION: X/10" where X is how strongly you believe in the bearish thesis.
 
 STRICTNESS:
-- Use ONLY the fields provided above and the Bull argument. Do NOT invent catalysts, dates, or “known” events.
+- Use ONLY the fields provided above. Do NOT invent catalysts, dates, or “known” events.
 - If fields are unknown/missing, explicitly say “not provided” and reduce conviction.
 
 Be concise (5-7 sentences). Do NOT output JSON."""
@@ -155,6 +403,14 @@ def bull_researcher_node(state: FirmState) -> FirmState:
         else "none"
     )
 
+    # If SentimentAnalyst hasn't populated aggregate_sentiment yet (parallel run),
+    # fall back to Tier-1 SentimentMonitor score.
+    _sent = (
+        float(state.aggregate_sentiment or 0.0)
+        if abs(float(state.aggregate_sentiment or 0.0)) > 1e-9
+        else float(state.sentiment_monitor_score or 0.0)
+    )
+
     prompt = BULL_RESEARCH_PROMPT.format(
         ticker           = state.ticker,
         price_change_pct = state.price_change_pct * 100,
@@ -162,13 +418,17 @@ def bull_researcher_node(state: FirmState) -> FirmState:
         iv_regime        = state.iv_regime,
         iv_atm           = state.iv_atm,
         skew_ratio       = state.iv_skew_ratio,
-        sentiment        = state.aggregate_sentiment,
+        sentiment        = _sent,
         market_bias      = state.market_bias_score,
         news_timing      = state.news_timing_regime,
         news_age         = _news_age,
         themes           = ", ".join(state.sentiment_themes) or "none",
         momentum         = state.momentum,
         vol_ratio        = state.vol_ratio,
+        technical_context = (
+            json.dumps(state.technical_context.model_dump(), separators=(",", ":"), ensure_ascii=False)
+            if state.technical_context else "none"
+        ),
         structured_digests = _dig[:900],
     )
 
@@ -219,21 +479,30 @@ def bear_researcher_node(state: FirmState) -> FirmState:
         else "none"
     )
 
+    _sent = (
+        float(state.aggregate_sentiment or 0.0)
+        if abs(float(state.aggregate_sentiment or 0.0)) > 1e-9
+        else float(state.sentiment_monitor_score or 0.0)
+    )
+
     prompt = BEAR_RESEARCH_PROMPT.format(
         ticker           = state.ticker,
-        bull_argument    = state.bull_argument or "(no bull argument provided)",
         price_change_pct = state.price_change_pct * 100,
         regime           = state.market_regime.value,
         iv_regime        = state.iv_regime,
         iv_atm           = state.iv_atm,
         skew_ratio       = state.iv_skew_ratio,
-        sentiment        = state.aggregate_sentiment,
+        sentiment        = _sent,
         market_bias      = state.market_bias_score,
         news_timing      = state.news_timing_regime,
         news_age         = _news_age,
         tail_risks       = ", ".join(state.sentiment_tail_risks) or "none identified",
         drawdown         = state.risk.drawdown_pct,
         port_delta       = state.risk.portfolio_delta,
+        technical_context = (
+            json.dumps(state.technical_context.model_dump(), separators=(",", ":"), ensure_ascii=False)
+            if state.technical_context else "none"
+        ),
         structured_digests = _dig[:900],
     )
 
@@ -263,6 +532,83 @@ def bear_researcher_node(state: FirmState) -> FirmState:
     return state
 
 
+# ── Parallel research (speed) ──────────────────────────────────────────────────
+
+def _parallel_research_node(state: FirmState) -> FirmState:
+    """
+    Run BullResearcher and BearResearcher in parallel.
+
+    After removing Bear's dependency on Bull's argument, both can be computed concurrently.
+    """
+    base = state
+    snap = base.model_copy(deep=True)
+
+    jobs = {
+        "bull_researcher": bull_researcher_node,
+        "bear_researcher": bear_researcher_node,
+    }
+    results: dict[str, FirmState] = {}
+    errors: dict[str, str] = {}
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = {
+            ex.submit(fn, snap.model_copy(deep=True)): name
+            for name, fn in jobs.items()
+        }
+        for fut in as_completed(futs):
+            name = futs[fut]
+            try:
+                results[name] = fut.result()
+            except Exception as e:
+                errors[name] = f"{type(e).__name__}: {str(e)[:220]}"
+
+    def _append_new_reasoning(from_state: FirmState) -> None:
+        try:
+            seen = {(e.agent, e.action, getattr(e, "timestamp", None)) for e in (base.reasoning_log or [])}
+            for e in (from_state.reasoning_log or []):
+                key = (e.agent, e.action, getattr(e, "timestamp", None))
+                if key in seen:
+                    continue
+                base.reasoning_log.append(e)
+                seen.add(key)
+        except Exception:
+            pass
+
+    if "bull_researcher" in results:
+        r = results["bull_researcher"]
+        base.bull_argument = r.bull_argument
+        base.bull_conviction = r.bull_conviction
+        _append_new_reasoning(r)
+
+    if "bear_researcher" in results:
+        r = results["bear_researcher"]
+        base.bear_argument = r.bear_argument
+        base.bear_conviction = r.bear_conviction
+        _append_new_reasoning(r)
+
+    if errors:
+        base.reasoning_log.append(ReasoningEntry(
+            agent="System",
+            action="INFO",
+            reasoning="Parallel research: one or more agents failed; continuing with partial results.",
+            inputs={"errors": errors},
+            outputs={},
+        ))
+
+    try:
+        from agents.tracking.mlflow_tracing import log_agent_step
+        log_agent_step(
+            "parallel_research",
+            inputs={"ticker": base.ticker},
+            outputs={"ok": sorted(list(results.keys())), "errors": errors},
+            duration_s=max(0.0, time.time() - _t0),
+        )
+    except Exception:
+        pass
+
+    return base
+
+
 # ── Helper nodes ───────────────────────────────────────────────────────────────
 
 def ingest_data_node(state: FirmState) -> FirmState:
@@ -278,6 +624,7 @@ def ingest_data_node(state: FirmState) -> FirmState:
     try:
         from agents.desk_context import update_market_bias_score, update_news_timing_from_feed
         from agents.features import build_vol_surface, classify_regime, compute_iv_metrics
+        from agents.technicals import build_technical_context_from_bars
 
         # Refresh spot price before any options analytics.
         # This prevents stale/incorrect `underlying_price` from poisoning near-ATM selection and regime metrics.
@@ -302,6 +649,23 @@ def ingest_data_node(state: FirmState) -> FirmState:
 
         attach_structured_news_digests(state, limit=10)
 
+        # Deterministic technical context from daily bars (EMA200, volume, S/R, outside-week flags).
+        # Uses the same bar fetcher as the UI and benefits from the daily bars cache DB.
+        try:
+            from agents.data.chart_data import fetch_bars
+
+            t = str(state.ticker or "").upper().strip()
+            # Pull enough daily history for EMA200 + some level structure; capped by chart_data logic.
+            bars, src = fetch_bars(t, timeframe="1Day", limit=260)
+            state.technical_context = build_technical_context_from_bars(
+                ticker=t,
+                bars=bars,
+                bars_source=src,
+                timeframe="1Day",
+            )
+        except Exception:
+            state.technical_context = None
+
         if state.latest_greeks:
             from agents.data.options_chain_filter import filter_greeks_for_agents
 
@@ -316,6 +680,25 @@ def ingest_data_node(state: FirmState) -> FirmState:
             state.iv_skew_ratio     = iv.skew_ratio
             state.iv_regime         = iv.iv_regime
             state.iv_term_structure = iv.term_structure
+
+            # Persist ATM IV to build a rolling historical IV rank, then attach it to technical_context.
+            try:
+                from agents.data.iv_history_db import append_atm_iv, iv_rank
+
+                append_atm_iv(str(state.ticker or ""), float(state.iv_atm or 0.0))
+                if state.technical_context is not None:
+                    r = iv_rank(str(state.ticker or ""), float(state.iv_atm or 0.0), lookback_days=30)
+                    state.technical_context.iv_rank_30d = r
+            except Exception:
+                pass
+
+        # A+ setup scorecard (deterministic confluence gate for naked calls/puts)
+        try:
+            from agents.aplus_setup import compute_aplus_setup
+
+            state.aplus_setup = compute_aplus_setup(state)
+        except Exception:
+            state.aplus_setup = None
     except Exception as exc:
         log.warning("ingest_data feature build error: %s", exc)
 
@@ -343,6 +726,7 @@ def ingest_data_node(state: FirmState) -> FirmState:
                 "iv_regime": state.iv_regime,
                 "iv_atm": float(state.iv_atm or 0.0),
                 "iv_skew_ratio": float(state.iv_skew_ratio or 0.0),
+                "has_technical_context": bool(state.technical_context is not None),
             },
             duration_s=max(0.0, time.time() - _t0),
         )
@@ -446,7 +830,9 @@ def recommend_node(state: FirmState) -> FirmState:
     if state.pending_stock_proposal and not state.pending_proposal:
         pick = "stock"
     elif state.pending_stock_proposal and state.pending_proposal:
-        pick = "stock" if float(state.stock_confidence or 0.0) >= float(state.strategy_confidence or 0.0) else "option"
+        # Prefer option recommendations when available so the UI actually sees them.
+        # (We already cap total pending recs per ticker.)
+        pick = "option"
 
     # Build a recommendation from the current pipeline outputs
     last_desk = next(
@@ -519,16 +905,27 @@ def recommend_node(state: FirmState) -> FirmState:
 
 def should_run_pipeline(
     state: FirmState,
-) -> Literal["stock_specialist", "early_abort"]:
+) -> Literal["parallel_analysis", "early_abort"]:
     if state.circuit_breaker_tripped or state.kill_switch_active:
         return "early_abort"
-    return "stock_specialist"
+    return "parallel_analysis"
 
 
 def should_debate(
     state: FirmState,
 ) -> Literal["adversarial_debate", "desk_head"]:
-    """Optional extra debate round on the proposal — only if enabled and proposal exists."""
+    """
+    Optional extra debate round on the proposal.
+
+    Policy:
+    - AUTOPILOT: run AdversarialDebate (extra safety gate) when enabled and a proposal exists.
+    - ADVISORY: skip AdversarialDebate (faster; user approves anyway).
+    """
+    try:
+        if str(getattr(state, "trading_mode", "advisory") or "advisory").lower() != "autopilot":
+            return "desk_head"
+    except Exception:
+        return "desk_head"
     if (
         ENABLE_ADVERSARIAL_DEBATE
         and state.pending_proposal is not None
@@ -556,11 +953,14 @@ def build_graph() -> StateGraph:
     # Register nodes
     g.add_node("ingest_data",        ingest_data_node)
     g.add_node("early_abort",        early_abort_node)
-    g.add_node("stock_specialist",   stock_specialist_node)
-    g.add_node("options_specialist", options_specialist_node)
-    g.add_node("bull_researcher",    bull_researcher_node)
-    g.add_node("bear_researcher",    bear_researcher_node)
-    g.add_node("sentiment_analyst",  sentiment_analyst_node)
+    g.add_node("parallel_analysis",  _parallel_analysis_node)
+    g.add_node("parallel_five",      _parallel_five_node)
+    g.add_node("stock_specialist",   stock_specialist_node)   # kept for compatibility / debugging
+    g.add_node("options_specialist", options_specialist_node)  # kept for compatibility / debugging
+    g.add_node("bull_researcher",    bull_researcher_node)   # kept for compatibility / debugging
+    g.add_node("bear_researcher",    bear_researcher_node)   # kept for compatibility / debugging
+    g.add_node("parallel_research",  _parallel_research_node)  # kept for compatibility / debugging
+    g.add_node("sentiment_analyst",  sentiment_analyst_node)  # kept for compatibility / debugging
     g.add_node("strategist",         strategist_node)
     g.add_node("risk_manager",       risk_manager_node)
     g.add_node("adversarial_debate", adversarial_debate_node)
@@ -572,17 +972,16 @@ def build_graph() -> StateGraph:
     # Entry → gate on circuit breaker
     g.add_edge(START, "ingest_data")
     g.add_conditional_edges("ingest_data", should_run_pipeline, {
-        "stock_specialist":  "stock_specialist",
+        "parallel_analysis":  "parallel_analysis",
         "early_abort":        "early_abort",
     })
     g.add_edge("early_abort", "xai_log")
 
-    # Analysis: stock → IV → sentiment → bull research → bear rebuttal → strategist
-    g.add_edge("stock_specialist",   "options_specialist")
-    g.add_edge("options_specialist", "sentiment_analyst")
-    g.add_edge("sentiment_analyst",  "bull_researcher")
-    g.add_edge("bull_researcher",    "bear_researcher")
-    g.add_edge("bear_researcher",    "strategist")
+    # Two-stage parallelization:
+    # Stage 1: stock/options/sentiment (parallel_analysis)
+    # Stage 2: bull/bear (parallel_research)
+    g.add_edge("parallel_analysis", "parallel_research")
+    g.add_edge("parallel_research", "strategist")
 
     # Risk gate → optional extra debate → desk head
     g.add_edge("strategist", "risk_manager")

@@ -15,45 +15,28 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.config import MODELS
 from agents.llm_providers import chat_llm
-from agents.llm_retry import invoke_llm
+from agents.llm_retry import invoke_llm, invoke_llm_with_metrics
 from agents.schemas import StockSpecialistOutput, parse_and_validate
 from agents.state import AgentDecision, FirmState, OrderSide, ReasoningEntry, StockTradeProposal
 
 
-SYSTEM_PROMPT = """ROLE: StockSpecialist (cash equity)
-You are the stock (shares) specialist at a multi-asset desk. You do NOT trade options here.
-Your job is to decide whether the underlying stock/ETF itself offers a clean trade.
-
-You will be given a JSON context containing:
-- ticker, underlying_price, market_regime
-- price_change_pct, momentum, vol_ratio, movement_signal, movement_anomaly
-- aggregate_sentiment, news_timing_regime, market_bias_score
-- portfolio context: current_nav, position_cap_dollars, existing_stock_qty
-
-Rules:
-- You MUST use ONLY the provided JSON context. Do NOT invent earnings, levels, or catalysts.
-- If underlying_price <= 0 or current_nav <= 0, output HOLD with low confidence.
-- Prefer HOLD unless there is alignment across (regime + movement_signal + bias/sentiment).
-- If you propose a trade (PROCEED):
-  - Choose side BUY or SELL.
-  - Choose qty as a small fraction of NAV, respecting position_cap_dollars.
-  - Use order_type market unless you have a strong reason for limit.
-  - limit_price must be omitted/null unless order_type=limit.
-  - Provide stop_loss_pct and take_profit_pct as guidance (0..1), or null if unsure.
-
-Output STRICT JSON:
-{
-  "decision": "PROCEED" | "HOLD" | "ABORT",
-  "side": "BUY" | "SELL",
-  "qty": <float>,
-  "order_type": "market" | "limit",
-  "limit_price": <float or null>,
-  "stop_loss_pct": <0..1 or null>,
-  "take_profit_pct": <0..1 or null>,
-  "confidence": 0.0-1.0,
-  "reasoning": "<3-5 sentences citing concrete fields from context>"
-}
-"""
+SYSTEM_PROMPT = (
+    "ROLE: StockSpecialist (shares only). You are the stock (shares) specialist; do NOT trade options here. "
+    "Your job is to decide whether the underlying stock/ETF itself offers a clean trade. "
+    "You will be given a JSON context containing: ticker, underlying_price, market_regime, price_change_pct, momentum, vol_ratio, "
+    "movement_signal, movement_anomaly, aggregate_sentiment, news_timing_regime, market_bias_score, technical_context (if present: "
+    "ema200/volume/levels/outside-week/pattern flags), and portfolio context (current_nav, position_cap_dollars, existing_stock_qty). "
+    "Rules: use ONLY the provided JSON context; do NOT invent earnings/levels/catalysts. Output must be VALID JSON only (no markdown). "
+    "All numeric fields MUST be JSON numbers (e.g. 0.12), never arithmetic or formulas like 1000/250. "
+    "If underlying_price <= 0 or current_nav <= 0, output HOLD with low confidence. Prefer HOLD unless there is alignment across "
+    "(regime + movement_signal + bias/sentiment). If technical_context is present, use regime_label/volume_state and nearest level "
+    "to state invalidation/confirmation. If you propose a trade (PROCEED): choose side BUY or SELL; choose qty as a small fraction "
+    "of NAV respecting position_cap_dollars; use order_type=market unless strong reason for limit; limit_price must be null unless "
+    "order_type=limit; provide stop_loss_pct and take_profit_pct as guidance (0..1) or null if unsure. "
+    "Output STRICT JSON schema: {\"decision\":\"PROCEED|HOLD|ABORT\",\"side\":\"BUY|SELL\",\"qty\":<float>,"
+    "\"order_type\":\"market|limit\",\"limit_price\":<float or null>,\"stop_loss_pct\":<0..1 or null>,"
+    "\"take_profit_pct\":<0..1 or null>,\"confidence\":0.0-1.0,\"reasoning\":\"<3-5 sentences citing concrete fields from context>\"}."
+)
 
 
 def stock_specialist_node(state: FirmState) -> FirmState:
@@ -62,7 +45,6 @@ def stock_specialist_node(state: FirmState) -> FirmState:
         MODELS.options_specialist.active,
         agent_role="stock_specialist",
         temperature=0.05,
-        max_tokens=650,
     )
 
     # Existing stock position qty (if any)
@@ -90,6 +72,7 @@ def stock_specialist_node(state: FirmState) -> FirmState:
         "aggregate_sentiment": float(state.aggregate_sentiment or 0.0),
         "news_timing_regime": str(state.news_timing_regime or "none"),
         "market_bias_score": float(state.market_bias_score or 0.0),
+        "technical_context": (state.technical_context.model_dump() if state.technical_context else None),
         "portfolio": {
             "current_nav": float(nav or 0.0),
             "position_cap_dollars": float(position_cap or 0.0),
@@ -103,8 +86,30 @@ def stock_specialist_node(state: FirmState) -> FirmState:
         HumanMessage(content=json.dumps(context, indent=2)),
     ]
 
-    response = invoke_llm(llm, messages)
+    response, llm_meta = invoke_llm_with_metrics(llm, messages)
     out = parse_and_validate(response.content, StockSpecialistOutput, "StockSpecialist")
+    if not out:
+        # One-shot repair pass: coerce STRICT JSON only (especially numeric fields like qty).
+        repair_sys = (
+            "You are a strict JSON repair tool. Return ONLY valid JSON matching this schema (no markdown, no prose). "
+            "All numeric fields MUST be JSON numbers (no arithmetic, no formulas). "
+            "Schema: {\"decision\":\"PROCEED|HOLD|ABORT\",\"side\":\"BUY|SELL\",\"qty\":0.0,\"order_type\":\"market|limit\","
+            "\"limit_price\":0.0,\"stop_loss_pct\":0.0,\"take_profit_pct\":0.0,\"confidence\":0.0,\"reasoning\":\"string\"}. "
+            "If you cannot comply, output HOLD with qty=0 and confidence=0."
+        )
+        try:
+            llm_repair = chat_llm(
+                MODELS.options_specialist.active,
+                agent_role="stock_specialist",
+                temperature=0.0,
+            )
+            resp2, llm_meta_repair = invoke_llm_with_metrics(llm_repair, [
+                SystemMessage(content=repair_sys),
+                HumanMessage(content=(response.content or "")),
+            ])
+            out = parse_and_validate(resp2.content, StockSpecialistOutput, "StockSpecialist")
+        except Exception:
+            out = None
     if not out:
         # Safe fallback
         state.stock_decision = AgentDecision.HOLD
@@ -115,13 +120,20 @@ def stock_specialist_node(state: FirmState) -> FirmState:
             action="HOLD",
             reasoning=(response.content or "")[:400],
             inputs={"ticker": state.ticker, "underlying_price": state.underlying_price},
-            outputs={"parse_failed": True},
+            outputs={
+                "parse_failed": True,
+                "llm_call": llm_meta,
+                "llm_repair_call": (llm_meta_repair if "llm_meta_repair" in locals() else None),
+            },
         ))
         return state
 
     decision = AgentDecision(out.decision)
     state.stock_decision = decision
     state.stock_confidence = float(out.confidence or 0.0)
+    reasoning_txt = str(out.reasoning or "")
+    if not reasoning_txt.strip():
+        reasoning_txt = (response.content or "").strip()[:400] or "No model output; defaulting to HOLD."
 
     stock_prop: StockTradeProposal | None = None
     if decision == AgentDecision.PROCEED:
@@ -135,6 +147,13 @@ def stock_specialist_node(state: FirmState) -> FirmState:
                 qty = max(0.0, position_cap / px)
         else:
             qty = 0.0
+        # UX policy: stock recommendations use whole shares (no fractional "1.97 sh" in UI).
+        # If the broker supports fractional shares you can relax this, but for now keep it simple.
+        try:
+            qty_i = int(round(qty))
+        except Exception:
+            qty_i = 0
+        qty = float(max(1, qty_i)) if qty > 0 else 0.0
         if qty > 0:
             stock_prop = StockTradeProposal(
                 side=OrderSide.BUY if out.side == "BUY" else OrderSide.SELL,
@@ -151,7 +170,7 @@ def stock_specialist_node(state: FirmState) -> FirmState:
     state.reasoning_log.append(ReasoningEntry(
         agent="StockSpecialist",
         action=decision.value,
-        reasoning=str(out.reasoning or ""),
+        reasoning=reasoning_txt,
         inputs={
             "market_regime": context.get("market_regime"),
             "movement_signal": context.get("movement_signal"),
@@ -163,6 +182,8 @@ def stock_specialist_node(state: FirmState) -> FirmState:
             "side": out.side,
             "qty": float(stock_prop.qty) if stock_prop else 0.0,
             "order_type": out.order_type,
+            "llm_call": llm_meta,
+            "llm_repair_call": (llm_meta_repair if "llm_meta_repair" in locals() else None),
         },
     ))
     try:

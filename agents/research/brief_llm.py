@@ -106,7 +106,6 @@ def run_brief_llm(
         MODELS.sentiment_analyst.active,
         agent_role="universe_brief",
         temperature=0.15,
-        max_tokens=900,
     )
     payload = {
         "ticker": ticker,
@@ -121,7 +120,41 @@ def run_brief_llm(
     try:
         resp = invoke_llm(llm, messages)
         raw = (resp.content or "").strip()
-        data = _parse_json_loose(raw)
+        try:
+            data = _parse_json_loose(raw)
+        except Exception:
+            # One-shot repair pass: coerce the model into STRICT JSON only.
+            repair_sys = (
+                "You are a strict JSON repair tool.\n"
+                "Return ONLY valid JSON matching exactly this schema (no markdown, no prose):\n\n"
+                "{\n"
+                '  "thesis_short": "string",\n'
+                '  "key_risks": ["string"],\n'
+                '  "what_changed": ["string"],\n'
+                '  "invalidation_triggers": ["string"],\n'
+                '  "stance": "LONG|SHORT|HOLD|NEUTRAL",\n'
+                '  "confidence": 0.0,\n'
+                '  "regime_note": "string",\n'
+                '  "next_watch": ["string"],\n'
+                '  "suggested_structure": "string or empty",\n'
+                '  "agent_notes": "string",\n'
+                '  "ttl_minutes": 60\n'
+                "}\n\n"
+                "If you cannot comply due to missing info, output HOLD/NEUTRAL with low confidence and "
+                "explicitly say what is missing in agent_notes."
+            )
+            repair_msgs = [
+                SystemMessage(content=repair_sys),
+                HumanMessage(content=(raw or "")[:2600]),
+            ]
+            llm_repair = chat_llm(
+                MODELS.sentiment_analyst.active,
+                agent_role="universe_brief",
+                temperature=0.0,
+            )
+            resp2 = invoke_llm(llm_repair, repair_msgs)
+            raw2 = (resp2.content or "").strip()
+            data = _parse_json_loose(raw2)
     except Exception as exc:
         log.warning("brief_llm failed for %s: %s", ticker, exc)
         ttl = 45

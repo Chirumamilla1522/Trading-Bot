@@ -1,5 +1,5 @@
 """
-LLM routing: local llama.cpp (default) or OpenRouter when OPENROUTER_ENABLED=true.
+LLM routing: local llama.cpp primary with optional OpenRouter fallback.
 
 Agents should use ``chat_llm(MODELS.<agent>.active, ...)`` — never import OpenRouter directly.
 """
@@ -14,19 +14,25 @@ def chat_llm(model: str, **kwargs: Any):
     """
     Return a LangChain ChatOpenAI client.
 
-    - OPENROUTER_ENABLED=false (default): local llama.cpp only (ignores ``model`` for API id;
-      the running server loads one GGUF — set LLAMA_LOCAL_MODEL if the server requires it).
-    - OPENROUTER_ENABLED=true: OpenRouter cloud using ``model`` as the route slug.
+    - Local is always constructed as the primary client.
+    - If OPENROUTER_ENABLED=true, the retry layer can fall back to OpenRouter using ``model``
+      as the route slug (see ``agents/llm_retry.py``).
 
     Optional ``agent_role`` (e.g. ``\"options_specialist\"``) selects per-agent local URLs
     when ``OPENROUTER_ENABLED=false`` (see ``agents/llm_local.resolve_local_base_url``).
     """
     agent_role = kwargs.pop("agent_role", None)
 
-    if OPENROUTER_ENABLED:
-        from agents.llm_openrouter import openrouter_chat_llm
-
-        return openrouter_chat_llm(model, **kwargs)
+    # Always build the local client first. If OPENROUTER_ENABLED is true, the invoke_llm()
+    # wrapper can fall back to OpenRouter using the provided `model` slug.
     from agents.llm_local import local_chat_llm
 
-    return local_chat_llm(agent_role=agent_role, **kwargs)
+    llm = local_chat_llm(agent_role=agent_role, **kwargs)
+    try:
+        setattr(llm, "_trading_agent_role", agent_role)
+        # Stash the OpenRouter route so invoke_llm can fall back without rebuilding context.
+        if OPENROUTER_ENABLED and isinstance(model, str) and model:
+            setattr(llm, "_openrouter_model", model)
+    except Exception:
+        pass
+    return llm

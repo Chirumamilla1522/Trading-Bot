@@ -14,7 +14,7 @@ import json
 import logging
 from typing import Any, Optional, Type, TypeVar
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from agents.state import AgentDecision
 
@@ -48,20 +48,64 @@ def parse_and_validate(raw: str, schema: Type[T], agent_name: str = "") -> T | N
     Failures are logged as warnings, not exceptions, so the agent can fall back
     to a safe default rather than crashing the cycle.
     """
+    data: Any = {}
     try:
         from agents.parse_llm_json import parse_llm_json
         data = parse_llm_json(raw)
     except Exception as e:
+        # Be tolerant: if parsing fails (empty / truncated / braces), fall back to
+        # schema defaults rather than failing the entire agent cycle.
         log.warning("[%s] JSON parse failed: %s | raw[:200]=%r", agent_name, e, raw[:200])
-        return None
+        data = {}
     try:
         return schema.model_validate(data)
     except Exception as e:
+        # Second fallback: validate an empty dict to get defaults.
         log.warning("[%s] Schema validation failed: %s | data=%r", agent_name, e, data)
-        return None
+        try:
+            return schema.model_validate({})
+        except Exception:
+            return None
 
 
 # ─── Options Specialist ────────────────────────────────────────────────────────
+
+class KeyLevelOut(BaseModel):
+    kind: str = ""     # "support" | "resistance"
+    price: float = 0.0
+    source: str = ""
+    distance_pct: float = 0.0
+    confidence: float = 0.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_from_scalar(cls, v):
+        # Some models emit key_levels as a list of floats (prices). Accept that shape
+        # and coerce into the expected object so the cycle doesn't fail.
+        if isinstance(v, (int, float)):
+            return {
+                "kind": "",
+                "price": float(v),
+                "source": "llm_scalar",
+                "distance_pct": 0.0,
+                "confidence": 0.0,
+            }
+        return v
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def norm_kind(cls, v):
+        s = str(v or "").strip().lower()
+        return "support" if s.startswith("sup") else "resistance" if s.startswith("res") else s or ""
+
+    @field_validator("price", "distance_pct", "confidence", mode="before")
+    @classmethod
+    def norm_float(cls, v):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
 
 class OptionsSpecialistOutput(BaseModel):
     decision:         str     = "HOLD"
@@ -72,6 +116,14 @@ class OptionsSpecialistOutput(BaseModel):
     preferred_dte_bucket: Optional[str] = None
     confidence:       float   = 0.5
     reasoning:        str     = ""
+    # Prompt contract fields (no hallucinated charting)
+    insufficient_data: bool = False
+    bias: str = "neutral"  # bullish | bearish | neutral
+    setup_type: str = "unknown"  # range_fade | breakout_continuation | breakout_rejection | trend_pullback | unknown
+    key_levels: list[KeyLevelOut] = Field(default_factory=list)
+    confirmation: str = ""
+    invalidation: str = ""
+    risk_notes: list[str] = Field(default_factory=list)
 
     @field_validator("decision", mode="before")
     @classmethod
@@ -80,6 +132,51 @@ class OptionsSpecialistOutput(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def norm_conf(cls, v): return _clamp_confidence(v)
+
+    @field_validator("bias", mode="before")
+    @classmethod
+    def norm_bias(cls, v):
+        s = str(v or "").strip().lower()
+        if s.startswith("bull"):
+            return "bullish"
+        if s.startswith("bear"):
+            return "bearish"
+        if s in ("neutral", "flat"):
+            return "neutral"
+        return "neutral"
+
+    @field_validator("setup_type", mode="before")
+    @classmethod
+    def norm_setup(cls, v):
+        s = str(v or "").strip().lower()
+        allowed = {
+            "range_fade",
+            "breakout_continuation",
+            "breakout_rejection",
+            "trend_pullback",
+            "unknown",
+        }
+        return s if s in allowed else "unknown"
+
+    @field_validator("confirmation", "invalidation", mode="before")
+    @classmethod
+    def norm_required_strings(cls, v):
+        # LLMs sometimes emit null for required prompt-contract strings, especially on ABORT/HOLD.
+        # Coerce to empty string so validation doesn't fail and the agent can proceed safely.
+        if v is None:
+            return ""
+        return str(v)
+
+    @field_validator("insufficient_data", mode="before")
+    @classmethod
+    def norm_insuf(cls, v):
+        try:
+            if isinstance(v, bool):
+                return v
+            s = str(v or "").strip().lower()
+            return s in ("1", "true", "yes", "y")
+        except Exception:
+            return False
 
 
 # ─── Stock Specialist ─────────────────────────────────────────────────────────
@@ -226,14 +323,108 @@ class StrategyProposalOutput(BaseModel):
     def norm_pct(cls, v): return _clamp_confidence(v)
 
 
+class StockProposalOutput(BaseModel):
+    side: str = "BUY"          # BUY | SELL
+    qty: float = 0.0
+    order_type: str = "market" # market | limit
+    limit_price: float | None = None
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+    rationale: str = ""
+    confidence: float = 0.0
+
+    @field_validator("side", mode="before")
+    @classmethod
+    def norm_side(cls, v):
+        s = str(v or "").strip().upper()
+        return "SELL" if s.startswith("S") else "BUY"
+
+    @field_validator("qty", mode="before")
+    @classmethod
+    def norm_qty(cls, v):
+        try:
+            return max(0.0, float(v))
+        except Exception:
+            return 0.0
+
+    @field_validator("order_type", mode="before")
+    @classmethod
+    def norm_ot(cls, v):
+        s = str(v or "").strip().lower()
+        return "limit" if s.startswith("l") else "market"
+
+    @field_validator("limit_price", mode="before")
+    @classmethod
+    def norm_lp(cls, v):
+        if v is None or v == "":
+            return None
+        try:
+            x = float(v)
+            return x if x > 0 else None
+        except Exception:
+            return None
+
+    @field_validator("stop_loss_pct", "take_profit_pct", "confidence", mode="before")
+    @classmethod
+    def norm_pct(cls, v):
+        if v is None or v == "":
+            return None
+        return _clamp_confidence(v)
+
+
 class StrategistOutput(BaseModel):
     decision: str                          = "HOLD"
     reason:   Optional[str]                = None
     proposal: Optional[StrategyProposalOutput] = None
+    stock_proposal: Optional[StockProposalOutput] = None
+    # Prompt contract fields (thesis must be falsifiable)
+    insufficient_data: bool = False
+    bias: str = "neutral"
+    setup_type: str = "unknown"
+    key_levels: list[KeyLevelOut] = Field(default_factory=list)
+    confirmation: str = ""
+    invalidation: str = ""
+    risk_notes: list[str] = Field(default_factory=list)
 
     @field_validator("decision", mode="before")
     @classmethod
     def norm_decision(cls, v): return _coerce_decision(v)
+
+    @field_validator("bias", mode="before")
+    @classmethod
+    def norm_bias(cls, v):
+        s = str(v or "").strip().lower()
+        if s.startswith("bull"):
+            return "bullish"
+        if s.startswith("bear"):
+            return "bearish"
+        if s in ("neutral", "flat"):
+            return "neutral"
+        return "neutral"
+
+    @field_validator("setup_type", mode="before")
+    @classmethod
+    def norm_setup(cls, v):
+        s = str(v or "").strip().lower()
+        allowed = {
+            "range_fade",
+            "breakout_continuation",
+            "breakout_rejection",
+            "trend_pullback",
+            "unknown",
+        }
+        return s if s in allowed else "unknown"
+
+    @field_validator("insufficient_data", mode="before")
+    @classmethod
+    def norm_insuf(cls, v):
+        try:
+            if isinstance(v, bool):
+                return v
+            s = str(v or "").strip().lower()
+            return s in ("1", "true", "yes", "y")
+        except Exception:
+            return False
 
 
 # ─── Risk Manager ─────────────────────────────────────────────────────────────

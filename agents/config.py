@@ -37,44 +37,41 @@ class AgentModels:
     When using local llama.cpp only, these strings are ignored for inference — keep them
     for documentation / future cloud toggle.
 
-    Example OpenRouter free-tier slugs (TRADING_ENV=testing):
-      - meta-llama/llama-4-scout:free      — 109B MoE, strong reasoning
-      - meta-llama/llama-4-maverick:free   — 400B MoE, best free quality
-      - google/gemini-2.0-flash-thinking-exp:free — reasoning model
-      - deepseek/deepseek-r1:free          — strong math/analysis
-      - qwen/qwq-32b:free                  — good quantitative reasoning
+    Note on testing models:
+    - Free-tier routes change often. Prefer a stable, fast route for testing.
+    - Default testing route in this repo: deepseek/deepseek-v4-flash
     """
     desk_head: ModelConfig = field(default_factory=lambda: ModelConfig(
-        testing    = "meta-llama/llama-4-maverick:free",
+        testing    = "deepseek/deepseek-v4-flash",
         production = "anthropic/claude-3.5-sonnet",
     ))
     options_specialist: ModelConfig = field(default_factory=lambda: ModelConfig(
-        testing    = "google/gemini-2.0-flash-thinking-exp:free",
+        testing    = "deepseek/deepseek-v4-flash",
         production = "anthropic/claude-3.5-sonnet",
     ))
     sentiment_analyst: ModelConfig = field(default_factory=lambda: ModelConfig(
-        testing    = "meta-llama/llama-4-scout:free",
+        testing    = "deepseek/deepseek-v4-flash",
         production = "google/gemini-1.5-flash",
     ))
     risk_manager: ModelConfig = field(default_factory=lambda: ModelConfig(
-        testing    = "deepseek/deepseek-r1:free",
+        testing    = "deepseek/deepseek-v4-flash",
         production = "openai/gpt-4o",
     ))
     trader_agent: ModelConfig = field(default_factory=lambda: ModelConfig(
         # Trader is now deterministic — model only used for fallback logging.
-        testing    = "meta-llama/llama-4-scout:free",
+        testing    = "deepseek/deepseek-v4-flash",
         production = "anthropic/claude-3.5-sonnet",
     ))
     bull_researcher: ModelConfig = field(default_factory=lambda: ModelConfig(
-        testing    = "meta-llama/llama-4-scout:free",
+        testing    = "deepseek/deepseek-v4-flash",
         production = "anthropic/claude-3.5-sonnet",
     ))
     bear_researcher: ModelConfig = field(default_factory=lambda: ModelConfig(
-        testing    = "qwen/qwq-32b:free",
+        testing    = "deepseek/deepseek-v4-flash",
         production = "anthropic/claude-3.5-sonnet",
     ))
     strategist: ModelConfig = field(default_factory=lambda: ModelConfig(
-        testing    = "meta-llama/llama-4-maverick:free",
+        testing    = "deepseek/deepseek-v4-flash",
         production = "anthropic/claude-3.5-sonnet",
     ))
 
@@ -104,6 +101,22 @@ def llm_models_snapshot() -> dict[str, str]:
 OPENROUTER_ENABLED = os.getenv("OPENROUTER_ENABLED", "false").lower() in (
     "1", "true", "yes",
 )
+
+# Reflex / fast gate model (hybrid setups)
+# ---------------------------------------------------------------------------
+# This is optional and does NOT affect the main agent graph unless you call it.
+# Use it for "pulse checks" / cheap validation before invoking heavyweight reasoning.
+#
+# Values:
+# - REFLEX_BACKEND=local   → use your local OpenAI-compatible server (llama.cpp / vLLM / etc.)
+# - REFLEX_BACKEND=openrouter → use OpenRouter for the reflex model (fast + cheap cloud)
+#
+# Recommended OpenRouter slug for fast reflex calls:
+#   deepseek/deepseek-v4-flash
+# ---------------------------------------------------------------------------
+REFLEX_BACKEND = os.getenv("REFLEX_BACKEND", "local").strip().lower()  # local | openrouter
+REFLEX_OPENROUTER_MODEL = (os.getenv("REFLEX_OPENROUTER_MODEL", "deepseek/deepseek-v4-flash") or "").strip()
+REFLEX_MAX_TOKENS = int(os.getenv("REFLEX_MAX_TOKENS", "64"))
 
 # Local LLM (OpenAI-compatible HTTP: llama.cpp, vLLM, etc.)
 # ---------------------------------------------------------------------------
@@ -136,11 +149,29 @@ ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
 # News feeds
 BENZINGA_API_KEY    = os.getenv("BENZINGA_API_KEY", "")
 REUTERS_MRN_TOKEN   = os.getenv("REUTERS_MRN_TOKEN", "")
+# Source-level toggle: allow turning off Benzinga without disabling the whole news tape.
+ENABLE_BENZINGA = os.getenv("ENABLE_BENZINGA", "true").lower() in ("1", "true", "yes")
 # Master switch: Benzinga + yfinance ingestion (api_server + paper_trader background tasks)
 # Falls back to yfinance if no Benzinga key. Synthetic headlines are off by default.
 ENABLE_NEWS_FEED = os.getenv("ENABLE_NEWS_FEED", "true").lower() in ("1", "true", "yes")
 ENABLE_SYNTHETIC_NEWS = os.getenv("ENABLE_SYNTHETIC_NEWS", "false").lower() in (
     "1", "true", "yes",
+)
+
+# News & sentiment agent switches
+# ---------------------------------------------------------------------------
+# These let you disable the LLM agents that consume news, even if the news feed is enabled.
+# - ENABLE_NEWS_PROCESSOR: Tier-2 LLM that structures headlines into impact maps/digests
+# - ENABLE_SENTIMENT_MONITOR: Tier-1 loop that synthesizes a desk sentiment score from structured news
+# - ENABLE_SENTIMENT_ANALYST: Tier-3 node that reads raw headlines for the current ticker
+ENABLE_NEWS_PROCESSOR = os.getenv("ENABLE_NEWS_PROCESSOR", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+ENABLE_SENTIMENT_MONITOR = os.getenv("ENABLE_SENTIMENT_MONITOR", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+ENABLE_SENTIMENT_ANALYST = os.getenv("ENABLE_SENTIMENT_ANALYST", "true").strip().lower() in (
+    "1", "true", "yes", "on",
 )
 
 # Tier-3 SentimentAnalyst: recent-headline window (hours). Must overlap the feed you keep
@@ -162,6 +193,43 @@ MAX_POSITION_PCT    = float(os.getenv("MAX_POSITION_PCT",   "0.02"))  # 2%
 ENABLE_ADVERSARIAL_DEBATE = os.getenv("ENABLE_ADVERSARIAL_DEBATE", "true").lower() == "true"
 ENABLE_SEMANTIC_CACHE     = os.getenv("ENABLE_SEMANTIC_CACHE",     "true").lower() == "true"
 DEBATE_ROUNDS             = int(os.getenv("DEBATE_ROUNDS", "3"))
+
+# Prompt / token controls
+# ---------------------------------------------------------------------------
+# These flags let you reduce token usage without changing the core deterministic
+# calculations (technicals, PoP/EV, A+ gates, risk gates).
+COMPACT_PROMPTS = os.getenv("COMPACT_PROMPTS", "true").strip().lower() in ("1", "true", "yes", "on")
+
+# Bull/Bear researchers are helpful but expensive. If disabled, we skip running
+# those agents and do not include their arguments in Strategist context.
+ENABLE_BULL_BEAR_RESEARCH = os.getenv("ENABLE_BULL_BEAR_RESEARCH", "false").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
+# If bull/bear research is enabled, you can run it as ONE combined LLM call.
+COMBINED_BULL_BEAR_RESEARCH = os.getenv("COMBINED_BULL_BEAR_RESEARCH", "true").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
+# If enabled, Strategist can see a short text snippet of bull/bear arguments.
+# Otherwise it only sees conviction numbers (cheaper).
+INCLUDE_RESEARCHER_ARGUMENTS = os.getenv("INCLUDE_RESEARCHER_ARGUMENTS", "false").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+try:
+    MAX_RESEARCHER_ARGUMENT_CHARS = int(os.getenv("MAX_RESEARCHER_ARGUMENT_CHARS", "220"))
+except Exception:
+    MAX_RESEARCHER_ARGUMENT_CHARS = 220
+
+# OptionsSpecialist: include a long-call/put candidate table (7–14 DTE) in context.
+# This is informative but large; default OFF.
+ENABLE_LONG_OPTION_CANDIDATES_TABLE = os.getenv("ENABLE_LONG_OPTION_CANDIDATES_TABLE", "false").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+try:
+    LONG_OPTION_CANDIDATES_LIMIT = int(os.getenv("LONG_OPTION_CANDIDATES_LIMIT", "6"))
+except Exception:
+    LONG_OPTION_CANDIDATES_LIMIT = 6
 
 # News prioritization (reduce LLM pressure)
 # ---------------------------------------------------------------------------
@@ -188,3 +256,14 @@ MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "").strip()
 MLFLOW_EXPERIMENT_NAME = (os.getenv("MLFLOW_EXPERIMENT_NAME", "atlas-agents") or "atlas-agents").strip()
 MLFLOW_DISABLED = os.getenv("MLFLOW_DISABLED", "").lower() in ("1", "true", "yes")
 MLFLOW_ENABLED = bool(MLFLOW_TRACKING_URI) and not MLFLOW_DISABLED
+# Log every LLM call (prompt + response + latency + model + backend) as a nested run.
+# Defaults to ON when MLflow is enabled. Set MLFLOW_LOG_LLM_CALLS=0 to disable only this.
+MLFLOW_LOG_LLM_CALLS = (
+    os.getenv("MLFLOW_LOG_LLM_CALLS", "1").strip().lower() not in ("0", "false", "no", "off")
+)
+# Max characters we persist per prompt/response artifact. Keep reasonably small — MLflow stores
+# these as artifacts, not metrics; both local disk and the UI slow down with huge blobs.
+try:
+    MLFLOW_LLM_TEXT_MAX_CHARS = int(os.getenv("MLFLOW_LLM_TEXT_MAX_CHARS", "40000"))
+except Exception:
+    MLFLOW_LLM_TEXT_MAX_CHARS = 40000

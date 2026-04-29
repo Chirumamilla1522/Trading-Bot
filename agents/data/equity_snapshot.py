@@ -453,12 +453,17 @@ def fetch_stock_quotes_batch(symbols: list[str]) -> dict[str, dict[str, Any]]:
             need.append(u)
     if not need:
         return out
+    # Alpaca batch snapshots do not support caret-prefixed index symbols (e.g. ^GSPC).
+    # For those (and for any tickers Alpaca does not return), fall back to yfinance.
+    index_need = [u for u in need if u.startswith("^")]
+    alpaca_need = [u for u in need if not u.startswith("^")]
+
     if not (ALPACA_API_KEY and ALPACA_SECRET_KEY):
-        return out
+        alpaca_need = []
     _feed = (ALPACA_STOCK_DATA_FEED or "iex").lower()
     chunk_size = 80
-    for i in range(0, len(need), chunk_size):
-        chunk = need[i : i + chunk_size]
+    for i in range(0, len(alpaca_need), chunk_size):
+        chunk = alpaca_need[i : i + chunk_size]
         sym_param = ",".join(chunk)
         try:
             with httpx.Client(timeout=25.0) as client:
@@ -514,6 +519,18 @@ def fetch_stock_quotes_batch(symbols: list[str]) -> dict[str, dict[str, Any]]:
                         pass
         except Exception as e:
             log.debug("Alpaca batch snapshots: %s", e)
+
+    # yfinance fallback for indices and any missing symbols (best-effort; slower, but low volume).
+    for u in (index_need + [x for x in alpaca_need if x not in out]):
+        try:
+            yf = _quote_from_yfinance(u)
+            if not yf:
+                continue
+            key = u.upper().strip()
+            out[key] = yf
+            _quote_cache[key] = (yf, time.monotonic() + _QUOTE_TTL)
+        except Exception:
+            continue
     return out
 
 

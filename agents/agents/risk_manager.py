@@ -7,6 +7,7 @@ LLM soft assessment only runs when hard limits pass.
 from __future__ import annotations
 
 import json
+import os
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -17,24 +18,27 @@ from agents.llm_retry import invoke_llm
 from agents.schemas import RiskManagerOutput, parse_and_validate
 
 # Hard limits (deterministic, not adjustable via LLM)
-_DELTA_LIMIT         =  0.10   # abs portfolio delta
+# NOTE: RiskMetrics.portfolio_delta is stored as "share-equivalent delta" (≈ $ PnL per $1 move),
+# computed as sum(delta × qty × 100). It is NOT normalized to [-1,1].
+# We therefore limit delta exposure as % of NAV (delta_notional / NAV), not by an absolute 0.1 band.
+_DELTA_LIMIT_PCT_NAV  = float(os.getenv("PORTFOLIO_DELTA_LIMIT_PCT_NAV", "0.5"))  # 25% NAV notional delta
 _GAMMA_LIMIT         =  500.0  # $ per 1-point move
 _VEGA_LIMIT          = 1_000.0  # $ per 1% IV move
 _MAX_OPEN_POSITIONS  =  10      # max simultaneous option spreads
 _MIN_STRATEGY_CONF   =  0.40    # reject proposals with confidence < this
 
 SYSTEM_PROMPT = """ROLE: RiskManager (Capital preservation / execution risk)
-You are the Chief Risk Officer of an autonomous options desk.
+You are the risk manager.
 
 All hard limits have already been checked deterministically. Your role is a softer
 second-opinion on market-risk and execution risk.
 
 Evaluate:
 1. MARKET RISK: Does the proposal's max_risk / target_return ratio make sense for the regime?
-   A credit spread in EXTREME IV is fine; the same spread in LOW IV is over-risky for the return.
+   For naked short options: runaway trend + confirming volume + outside-week confirmed is high tail risk.
 2. CONCENTRATION: Is the trade correlated with existing positions? Too many longs/shorts in same direction?
 3. EXECUTION RISK: Are the bid-ask spreads acceptable? Wide spread → uncertain fill price.
-4. TIMING: Any upcoming events (earnings, Fed, macro) visible in term structure backwardation?
+4. TIMING: Use term-structure stress (backwardation) as a risk flag. Do NOT assume specific events.
 
 UNITS (must follow):
 - `pending_proposal.max_risk` and `target_return` are USD. Options are quoted per-share; all dollar risk math is assumed to already include the 100x contract multiplier.
@@ -49,7 +53,7 @@ GROUNDING REQUIREMENTS (must follow):
 Hard limits already enforced (do NOT revisit them):
 - Max daily drawdown: {max_dd}%
 - Max position size: {max_pos}%
-- Delta band: ±{delta_limit}
+- Delta exposure (notional): ≤ {delta_limit_pct:.0%} of NAV
 - Gamma limit: ${gamma_limit}/pt
 - Vega limit: ${vega_limit}/1% IV
 
@@ -89,11 +93,22 @@ def risk_manager_node(state: FirmState) -> FirmState:
             f"DAILY_DRAWDOWN {r.drawdown_pct:.2%} >= limit {r.max_drawdown_pct:.2%}"
         )
 
-    # ── Gate 2: Portfolio delta ───────────────────────────────────────────────
-    if abs(r.portfolio_delta) > _DELTA_LIMIT:
-        violations.append(
-            f"PORTFOLIO_DELTA {r.portfolio_delta:+.3f} outside [±{_DELTA_LIMIT}]"
-        )
+    # ── Gate 2: Portfolio delta exposure (notional % of NAV) ──────────────────
+    # portfolio_delta is share-equivalent; convert to notional exposure using spot.
+    try:
+        nav = max(float(r.current_nav or 0.0), float(state.account_equity or 0.0), 1.0)
+        spot = max(float(state.underlying_price or 0.0), 0.0)
+        delta_shares = float(r.portfolio_delta or 0.0)
+        delta_notional = abs(delta_shares) * spot if spot > 0 else abs(delta_shares)
+        delta_pct_nav = delta_notional / nav if nav > 0 else 0.0
+        if delta_pct_nav > _DELTA_LIMIT_PCT_NAV:
+            violations.append(
+                f"PORTFOLIO_DELTA_EXPOSURE {delta_pct_nav:.1%} NAV "
+                f"(delta_shares={delta_shares:+.1f}, spot={spot:.2f}, nav=${nav:,.0f}) "
+                f"> limit {(_DELTA_LIMIT_PCT_NAV):.0%}"
+            )
+    except Exception:
+        pass
 
     # ── Gate 3: Portfolio gamma ────────────────────────────────────────────────
     if abs(r.portfolio_gamma) > _GAMMA_LIMIT:
@@ -149,7 +164,7 @@ def risk_manager_node(state: FirmState) -> FirmState:
     system = SYSTEM_PROMPT.format(
         max_dd=f"{MAX_DAILY_DRAWDOWN * 100:.0f}",
         max_pos=f"{MAX_POSITION_PCT * 100:.0f}",
-        delta_limit=_DELTA_LIMIT,
+        delta_limit_pct=_DELTA_LIMIT_PCT_NAV,
         gamma_limit=_GAMMA_LIMIT,
         vega_limit=_VEGA_LIMIT,
     )
@@ -164,6 +179,7 @@ def risk_manager_node(state: FirmState) -> FirmState:
         "iv_regime":            state.iv_regime,
         "iv_skew_ratio":        state.iv_skew_ratio,
         "iv_term_structure":    state.iv_term_structure,
+        "technical_context":    (state.technical_context.model_dump() if state.technical_context else None),
         "aggregate_sentiment":  state.aggregate_sentiment,
         "tail_risks":           state.sentiment_tail_risks,
         "strategy_confidence":  state.strategy_confidence,
@@ -198,7 +214,6 @@ def risk_manager_node(state: FirmState) -> FirmState:
             MODELS.risk_manager.active,
             agent_role="risk_manager",
             temperature=0.0,
-            max_tokens=450,
         )
         resp2 = invoke_llm(llm_repair, [
             SystemMessage(content=repair_sys),

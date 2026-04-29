@@ -22,13 +22,13 @@ from agents.config import (
     SENTIMENT_HEADLINE_LOOKBACK_HOURS,
 )
 from agents.llm_providers import chat_llm
-from agents.llm_retry import invoke_llm
+from agents.llm_retry import invoke_llm, invoke_llm_with_metrics
 from agents.schemas import SentimentAnalystOutput, parse_and_validate
 
 CACHE_TTL_SECONDS = 600   # 10 min per headline
 
-SYSTEM_PROMPT = """You are a buy-side financial sentiment analyst with a strict
-risk-first mandate. Analyse the provided headlines for {ticker} (current price ${price:.2f}).
+SYSTEM_PROMPT = """You are a financial news sentiment analyst with a strict
+risk-first mandate. Analyze the provided headlines for {ticker} (current price ${price:.2f}).
 
 PRIOR CONTEXT (Tier-1 SentimentMonitor — already ran on Tier-2 structured news):
 The JSON includes `desk_sentiment_monitor`: score/confidence/source from structured articles.
@@ -239,7 +239,7 @@ def sentiment_analyst_node(state: FirmState) -> FirmState:
             )),
             HumanMessage(content=json.dumps(context, indent=2)),
         ]
-        response = invoke_llm(llm, messages)
+        response, llm_meta = invoke_llm_with_metrics(llm, messages)
         out = parse_and_validate(response.content, SentimentAnalystOutput, "SentimentAnalyst")
         if not out:
             # One-shot repair pass: coerce STRICT JSON only.
@@ -264,9 +264,8 @@ def sentiment_analyst_node(state: FirmState) -> FirmState:
                 MODELS.sentiment_analyst.active,
                 agent_role="sentiment_analyst",
                 temperature=0.0,
-                max_tokens=650,
             )
-            resp2 = invoke_llm(llm_repair, [
+            resp2, llm_meta_repair = invoke_llm_with_metrics(llm_repair, [
                 SystemMessage(content=repair_sys),
                 HumanMessage(content=(response.content or "")[:2600]),
             ])
@@ -277,8 +276,12 @@ def sentiment_analyst_node(state: FirmState) -> FirmState:
             weighted_sent = out.weighted_sentiment
             tail_risks    = out.tail_risks
             key_themes    = out.key_themes
-            reasoning     = out.reasoning
+            reasoning     = str(out.reasoning or "")
             confidence    = out.confidence
+            if not reasoning.strip():
+                # When parsing falls back to schema defaults (or provider returns empty),
+                # keep the log readable by storing a short raw preview.
+                reasoning = (response.content or "").strip()[:400] or "No model output; defaulting to HOLD."
             # Cache individual scores
             if r:
                 for hs in out.headline_scores:
@@ -351,6 +354,8 @@ def sentiment_analyst_node(state: FirmState) -> FirmState:
             "aggregate_sentiment": agg_sent,
             "weighted_sentiment":  weighted_sent,
             "confidence":          confidence,
+            "llm_call": (llm_meta if "llm_meta" in locals() else None),
+            "llm_repair_call": (llm_meta_repair if "llm_meta_repair" in locals() else None),
         },
     ))
     try:

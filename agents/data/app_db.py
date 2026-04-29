@@ -355,3 +355,51 @@ def append_market_event(*, ticker: str, channel: str, payload: Any) -> None:
     finally:
         con.close()
 
+
+def purge_non_allowlisted(*, allowed_tickers: set[str]) -> dict[str, int]:
+    """
+    Delete rows for tickers not in `allowed_tickers`.
+
+    Used to enforce a strict app universe (SCANNER_TICKERS + BENCHMARK_TICKERS).
+    Returns counts of deleted rows.
+    """
+    ensure_schema()
+    allowed = {str(t or "").upper().strip() for t in (allowed_tickers or set()) if str(t or "").strip()}
+    if not allowed:
+        return {"xai_log": 0, "market_event": 0}
+
+    # Postgres path
+    if _pg_enabled():
+        from agents.data.warehouse import postgres as wh
+
+        deleted_xai = 0
+        deleted_me = 0
+        with wh.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM xai_log WHERE symbol IS NOT NULL AND symbol <> ALL(%s);", (list(allowed),))
+                deleted_xai = int(getattr(cur, "rowcount", 0) or 0)
+                cur.execute("DELETE FROM market_event WHERE ticker IS NOT NULL AND ticker <> ALL(%s);", (list(allowed),))
+                deleted_me = int(getattr(cur, "rowcount", 0) or 0)
+        return {"xai_log": deleted_xai, "market_event": deleted_me}
+
+    # SQLite path
+    con = connect()
+    try:
+        placeholders = ",".join(["?"] * len(allowed))
+        deleted_xai = 0
+        deleted_me = 0
+        cur = con.execute(
+            f"DELETE FROM xai_log WHERE UPPER(ticker) NOT IN ({placeholders});",
+            tuple(sorted(allowed)),
+        )
+        deleted_xai = int(getattr(cur, "rowcount", 0) or 0)
+        cur = con.execute(
+            f"DELETE FROM market_event WHERE UPPER(ticker) NOT IN ({placeholders});",
+            tuple(sorted(allowed)),
+        )
+        deleted_me = int(getattr(cur, "rowcount", 0) or 0)
+        con.commit()
+        return {"xai_log": deleted_xai, "market_event": deleted_me}
+    finally:
+        con.close()
+

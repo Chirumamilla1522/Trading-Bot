@@ -13,12 +13,11 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from agents.state import AgentDecision, FirmState, ReasoningEntry
 from agents.config import MODELS
 from agents.llm_providers import chat_llm
-from agents.llm_retry import invoke_llm
+from agents.llm_retry import invoke_llm, invoke_llm_with_metrics
 from agents.schemas import DeskHeadOutput, parse_and_validate
 
 SYSTEM_PROMPT = """ROLE: DeskHead (Supervisor / final decision)
-You are the Desk Head of an autonomous trading desk (options + stocks).
-You review reports from specialist agents and make the final go/no-go decision.
+You are the supervisor. You review reports from specialist agents and make the final go/no-go decision.
 
 Weighting guide (higher weight = more authoritative):
 - RiskManager ABORT → always override to ABORT (non-negotiable)
@@ -109,6 +108,7 @@ def desk_head_node(state: FirmState) -> FirmState:
         "iv_regime":            state.iv_regime,
         "iv_atm":               f"{state.iv_atm:.1%}",
         "skew_ratio":           state.iv_skew_ratio,
+        "technical_context":    (state.technical_context.model_dump() if state.technical_context else None),
         "aggregate_sentiment":  state.aggregate_sentiment,
         "key_themes":           state.sentiment_themes,
         "tail_risks":           state.sentiment_tail_risks,
@@ -185,7 +185,7 @@ def desk_head_node(state: FirmState) -> FirmState:
         HumanMessage(content=f"Sub-agent reports:\n{json.dumps(context, indent=2)}"),
     ]
 
-    response = invoke_llm(llm, messages)
+    response, llm_meta = invoke_llm_with_metrics(llm, messages)
     out = parse_and_validate(response.content, DeskHeadOutput, "DeskHead")
     if not out:
         repair_sys = (
@@ -203,10 +203,9 @@ def desk_head_node(state: FirmState) -> FirmState:
             MODELS.desk_head.active,
             agent_role="desk_head",
             temperature=0.0,
-            max_tokens=450,
             default_headers={"X-Title": "Agentic Trading Terminal"},
         )
-        resp2 = invoke_llm(llm_repair, [
+        resp2, llm_meta_repair = invoke_llm_with_metrics(llm_repair, [
             SystemMessage(content=repair_sys),
             HumanMessage(content=(response.content or "")[:2400]),
         ])
@@ -226,7 +225,11 @@ def desk_head_node(state: FirmState) -> FirmState:
         agent="DeskHead", action=decision.value,
         reasoning=reasoning,
         inputs=context,
-        outputs={"confidence": confidence},
+        outputs={
+            "confidence": confidence,
+            "llm_call": llm_meta,
+            "llm_repair_call": (llm_meta_repair if "llm_meta_repair" in locals() else None),
+        },
     ))
     try:
         from agents.tracking.mlflow_tracing import log_agent_step

@@ -150,6 +150,13 @@ class NewsPriorityQueue:
                 if q is not None and agent not in q.seen:
                     q.seen.add(agent)
                     count += 1
+                # Queue semantics:
+                # - When the Tier-2 NewsProcessor ("news_analyst") processes an item, it should
+                #   leave the queue and appear in the processed store (served via /news/processed).
+                # - Other agents should not keep already-processed items "stuck" in the queue.
+                q2 = self._items.get(nid)
+                if q2 is not None and agent == AGENT_NEWS_ANALYST and (AGENT_NEWS_ANALYST in q2.seen):
+                    self._items.pop(nid, None)
         return count
 
     def remove(self, ids: Iterable[str]) -> int:
@@ -219,6 +226,13 @@ class NewsPriorityQueue:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=self._ttl_hours)
         stale = [k for k, v in self._items.items() if v.added_at < cutoff]
         for k in stale:
+            self._items.pop(k, None)
+
+        # Queue semantics: the queue represents "not yet processed by NewsProcessor".
+        # If an item has been marked seen by the Tier-2 processor (news_analyst),
+        # drop it so `/news/queue` doesn't show already-processed headlines.
+        done = [k for k, v in self._items.items() if AGENT_NEWS_ANALYST in (v.seen or set())]
+        for k in done:
             self._items.pop(k, None)
 
         if len(self._items) <= self._max_size:

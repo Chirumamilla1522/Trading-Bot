@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agents.state import FirmState, ReasoningEntry
@@ -58,7 +58,7 @@ def _agent_slug_for_file(agent: str) -> str:
 def persist_reasoning_log(state: FirmState) -> None:
     """Append all new reasoning entries to SQLite (and optionally JSONL when enabled)."""
     write_jsonl = os.getenv("XAI_JSONL", "0").strip().lower() in ("1", "true", "yes", "on")
-    date_str = datetime.utcnow().strftime("%Y%m%d")
+    date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
     log_file = LOG_DIR / f"reasoning_{date_str}.jsonl"
 
     new_entries = [e for e in state.reasoning_log
@@ -75,7 +75,13 @@ def persist_reasoning_log(state: FirmState) -> None:
     per_agent_lines: dict[Path, list[str]] = {}
     for entry in new_entries:
         record = {
-            "timestamp": entry.timestamp.isoformat(),
+            # Always serialize as timezone-aware ISO-8601.
+            # UI renders this in America/New_York (ET), but storage remains UTC.
+            "timestamp": (
+                entry.timestamp
+                if getattr(entry.timestamp, "tzinfo", None) is not None
+                else entry.timestamp.replace(tzinfo=timezone.utc)
+            ).isoformat(),
             "agent":     entry.agent,
             "action":    entry.action,
             "reasoning": entry.reasoning,
@@ -116,7 +122,7 @@ def log_cycle_failure(reasoning: str, *, ticker: str | None = None) -> None:
     When the LangGraph run throws before `xai_log`, nothing is persisted.
     Append a SYSTEM/ERROR line so the terminal reasoning panel and JSONL stay useful.
     """
-    ts = datetime.utcnow().isoformat()
+    ts = datetime.now(timezone.utc).isoformat()
     record = {
         "timestamp": ts,
         "agent": "SYSTEM",
@@ -137,7 +143,7 @@ def log_cycle_failure(reasoning: str, *, ticker: str | None = None) -> None:
     # Optional JSONL mirror
     if os.getenv("XAI_JSONL", "0").strip().lower() in ("1", "true", "yes", "on"):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        date_str = datetime.utcnow().strftime("%Y%m%d")
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
         log_file = LOG_DIR / f"reasoning_{date_str}.jsonl"
         import json as _json
         line = _json.dumps(record) + "\n"
@@ -177,7 +183,7 @@ def get_today_log(
     except Exception:
         # Fallback to legacy JSONL if SQLite isn't available yet
         import json as _json
-        date_str = datetime.utcnow().strftime("%Y%m%d")
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
         log_file = LOG_DIR / f"reasoning_{date_str}.jsonl"
         if not log_file.exists():
             return []

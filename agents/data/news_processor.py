@@ -229,7 +229,7 @@ IMPORTANT for cross-stock impacts:
 - Think about sector effects: macro news (Fed, CPI) affects broad sectors
 - Only include S&P 500 tickers in affected_tickers
 
-Our trading universe (top 50 S&P 500): {universe}
+Our trading universe: {universe}
 
 STRICTNESS (must follow):
 - Use ONLY the provided headline/summary text; do NOT inject outside knowledge or “known” relationships.
@@ -286,7 +286,7 @@ def process_news_batch_sync(
 
     try:
         from agents.llm_providers import chat_llm
-        from agents.llm_retry import invoke_llm
+        from agents.llm_retry import invoke_llm_with_metrics
         from agents.config import MODELS
         from langchain_core.messages import HumanMessage, SystemMessage
     except ImportError as exc:
@@ -309,8 +309,13 @@ def process_news_batch_sync(
             agent_role="news_processor",
             temperature=0.0,
         )
-        response = invoke_llm(llm, messages)
-        raw = response.content.strip()
+        response, llm_meta = invoke_llm_with_metrics(llm, messages)
+        raw = (response.content or "").strip()
+        if not raw:
+            # Retry once: empty response bodies happen occasionally on flaky upstreams.
+            response, llm_meta_retry = invoke_llm_with_metrics(llm, messages)
+            raw = (response.content or "").strip()
+            llm_meta = {"first": llm_meta, "retry": llm_meta_retry}
 
         # Extract & parse JSON array robustly (handle fences + trailing junk).
         # Models sometimes append commentary after the closing bracket, which breaks json.loads.
@@ -343,6 +348,11 @@ def process_news_batch_sync(
                 a.processed        = True
                 a.llm_model        = MODELS.sentiment_analyst.active
                 a.processing_time_ms = elapsed_ms
+                # Persist per-call token usage for debugging/cost attribution.
+                try:
+                    a.llm_model = str((llm_meta.get("model") if isinstance(llm_meta, dict) else "") or a.llm_model)
+                except Exception:
+                    pass
 
         log.info(
             "News processor: analysed %d articles in %dms",
@@ -350,7 +360,66 @@ def process_news_batch_sync(
         )
 
     except json.JSONDecodeError as exc:
+        # One-shot repair: ask the model to return ONLY the JSON array.
         log.warning("News processor JSON parse error: %s", exc)
+        try:
+            repair_sys = (
+                "You are a strict JSON repair tool.\n"
+                "Return ONLY a valid JSON array (no markdown, no prose).\n"
+                "Schema:\n"
+                "[\n"
+                "  {\n"
+                '    "headline_idx": 0,\n'
+                '    "sentiment": 0.0,\n'
+                '    "confidence": 0.0,\n'
+                '    "category": "general",\n'
+                '    "impact_magnitude": 1,\n'
+                '    "affected_tickers": [{"ticker":"SPY","impact":0.0,"relationship":"..."}],\n'
+                '    "themes": ["..."],\n'
+                '    "tail_risks": ["..."]\n'
+                "  }\n"
+                "]\n"
+                "If you cannot comply, return []"
+            )
+            repair_msgs = [
+                SystemMessage(content=repair_sys),
+                HumanMessage(content=raw[:6000] if isinstance(raw, str) else ""),
+            ]
+            llm_repair = chat_llm(
+                MODELS.sentiment_analyst.active,
+                agent_role="news_processor",
+                temperature=0.0,
+            )
+            resp2, _meta2 = invoke_llm_with_metrics(llm_repair, repair_msgs)
+            raw2 = (resp2.content or "").strip()
+            if "```" in raw2:
+                s2 = raw2.find("[")
+                e2 = raw2.rfind("]") + 1
+                if s2 >= 0 and e2 > s2:
+                    raw2 = raw2[s2:e2]
+            raw2 = raw2.strip()
+            if "[" in raw2:
+                raw2 = raw2[raw2.find("[") :].lstrip()
+            results2, _ = json.JSONDecoder().raw_decode(raw2)
+            if not isinstance(results2, list):
+                results2 = [results2]
+            elapsed_ms = int((_time.monotonic() - t0) * 1000)
+            for entry in results2:
+                idx = entry.get("headline_idx", -1)
+                if 0 <= idx < len(articles):
+                    a = articles[idx]
+                    a.sentiment        = float(entry.get("sentiment", 0))
+                    a.confidence       = float(entry.get("confidence", 0))
+                    a.category         = entry.get("category", "general")
+                    a.impact_magnitude = int(entry.get("impact_magnitude", 1))
+                    a.affected_tickers = entry.get("affected_tickers", [])
+                    a.themes           = entry.get("themes", [])
+                    a.tail_risks       = entry.get("tail_risks", [])
+                    a.processed        = True
+                    a.llm_model        = MODELS.sentiment_analyst.active
+                    a.processing_time_ms = elapsed_ms
+        except Exception as _exc2:
+            log.warning("News processor repair failed: %s", _exc2)
     except Exception as exc:
         log.warning("News processor LLM error: %s", exc)
 

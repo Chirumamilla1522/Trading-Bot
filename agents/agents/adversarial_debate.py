@@ -21,7 +21,7 @@ from agents.llm_retry import invoke_llm
 from agents.schemas import DebateJudgeOutput, parse_and_validate
 
 BULL_SYSTEM = """ROLE: Bull (Advocate / best-case)
-You are the Bull side of a structured desk debate. Your job is to argue FOR the proposed trade
+You are the Bull side of a structured debate. Your job is to argue FOR the proposed trade
 using ONLY the provided market context and the proposal details.
 
 GROUNDING REQUIREMENTS:
@@ -37,7 +37,7 @@ Output: 4-6 sentences, no lists. End with exactly: CONVICTION: X/10 (X=1..10).
 Do NOT discuss risk controls (Bear handles that)."""
 
 BEAR_SYSTEM = """ROLE: Bear (Skeptic / failure modes)
-You are the Bear side of a structured desk debate. Your job is to argue AGAINST the proposed trade
+You are the Bear side of a structured debate. Your job is to argue AGAINST the proposed trade
 by identifying concrete failure modes, execution risk, and regime mismatch using ONLY the provided context.
 
 GROUNDING REQUIREMENTS:
@@ -51,7 +51,7 @@ STRICTNESS:
 
 Output: 4-6 sentences, no lists. End with exactly: CONVICTION: X/10 (X=1..10)."""
 
-JUDGE_SYSTEM = """You are the Desk Head judging a structured Bull/Bear debate.
+JUDGE_SYSTEM = """You are judging a structured Bull/Bear debate.
 Review all turns AND the market context. Produce a final verdict.
 
 Weigh arguments by specificity (data-backed > opinion) and conviction score.
@@ -111,6 +111,7 @@ def adversarial_debate_node(state: FirmState) -> FirmState:
         "iv_atm":              f"{state.iv_atm:.1%}",
         "skew_ratio":          state.iv_skew_ratio,
         "term_structure":      state.iv_term_structure,
+        "technical_context":   (state.technical_context.model_dump() if state.technical_context else None),
         "aggregate_sentiment": state.aggregate_sentiment,
         "key_themes":          state.sentiment_themes,
         "tail_risks":          state.sentiment_tail_risks,
@@ -193,7 +194,6 @@ def adversarial_debate_node(state: FirmState) -> FirmState:
             MODELS.desk_head.active,
             agent_role="adversarial_judge",
             temperature=0.0,
-            max_tokens=650,
         )
         resp2 = invoke_llm(judge_llm_repair, [
             SystemMessage(content=repair_sys),

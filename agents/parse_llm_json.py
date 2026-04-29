@@ -67,10 +67,42 @@ def parse_llm_json(content: str | Any) -> dict[str, Any]:
     except Exception:
         pass
 
-    # Robust path: extract first object and allow trailing junk ("extra data").
-    snippet = _first_json_object(text)
+    # Robust path: try to decode starting at the first '{' and ignore trailing junk.
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("no JSON object found")
+    candidate = text[start:].lstrip()
     dec = json.JSONDecoder()
-    obj, _end = dec.raw_decode(snippet)
-    if not isinstance(obj, dict):
-        raise ValueError("expected JSON object")
-    return obj
+    try:
+        obj, _end = dec.raw_decode(candidate)
+        if not isinstance(obj, dict):
+            raise ValueError("expected JSON object")
+        return obj
+    except Exception:
+        # Heuristic repair for common truncation: balance braces outside strings.
+        depth = 0
+        in_str = False
+        esc = False
+        for ch in candidate:
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+        if depth > 0:
+            repaired = candidate + ("}" * depth)
+            obj = json.loads(repaired)
+            if not isinstance(obj, dict):
+                raise ValueError("expected JSON object")
+            return obj
+        raise

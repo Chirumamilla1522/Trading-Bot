@@ -102,7 +102,13 @@ class _WSManager:
         dead: list[WebSocket] = []
         for ws in list(self._clients):
             try:
-                await ws.send_json(data)
+                # Fast path: orjson bytes (lower CPU, less allocations than json.dumps).
+                try:
+                    import orjson
+
+                    await ws.send_bytes(orjson.dumps(data))
+                except Exception:
+                    await ws.send_json(data)
             except Exception:
                 dead.append(ws)
         for ws in dead:
@@ -410,53 +416,172 @@ async def _greeks_update_task():
 
 async def _position_monitor_task():
     """
-    Every 20 s: check open option positions against their stop-loss and
-    take-profit thresholds. Auto-submits a closing order when either is hit.
-    Uses the last trade proposal's stop_loss_pct / take_profit_pct, defaulting
-    to 50% loss / 75% gain if no proposal is stored.
+    Every ~30 s: evaluate open positions and decide whether to close.
+
+    Policy:
+    - Advisory mode: create CLOSE recommendations for user approval.
+    - Autopilot mode: submit closing orders directly (risk-first).
+
+    Exit triggers are deterministic and use entry-time mandates when available.
     """
     while True:
-        await asyncio.sleep(20)
+        await asyncio.sleep(30)
         try:
             if firm_state.kill_switch_active or firm_state.circuit_breaker_tripped:
                 continue
-            if not firm_state.open_positions:
+            if not firm_state.open_positions and not firm_state.stock_positions:
                 continue
 
+            # Portfolio kill-switch: if drawdown breaches configured max, flatten (autopilot)
+            # or queue CLOSE recommendations (advisory).
+            try:
+                dd = float(getattr(firm_state.risk, "drawdown_pct", 0.0) or 0.0)
+                dd_lim = float(getattr(firm_state.risk, "max_drawdown_pct", 0.05) or 0.05)
+                if dd_lim > 0 and dd >= dd_lim:
+                    mode = str(getattr(firm_state, "trading_mode", "advisory") or "advisory").lower()
+                    firm_state.kill_switch_active = True
+                    firm_state.reasoning_log.append(ReasoningEntry(
+                        agent="System",
+                        action="ABORT",
+                        reasoning=f"Portfolio kill-switch tripped: drawdown {dd:.1%} >= limit {dd_lim:.1%}.",
+                        inputs={"drawdown_pct": dd, "limit": dd_lim, "mode": mode},
+                        outputs={"kill_switch_active": True},
+                    ))
+                    ems = _get_ems()
+                    try:
+                        await asyncio.to_thread(ems.cancel_all)
+                    except Exception:
+                        pass
+
+                    if mode == "autopilot":
+                        # Flatten stocks
+                        for sp in list(firm_state.stock_positions or []):
+                            try:
+                                tkr = str(getattr(sp, "ticker", "") or "").upper().strip()
+                                q = float(getattr(sp, "quantity", 0.0) or 0.0)
+                                if not tkr or abs(q) < 1e-9:
+                                    continue
+                                side = "sell" if q > 0 else "buy"
+                                await asyncio.to_thread(ems.place_stock_order, tkr, side, float(abs(q)), "market", None, "day")
+                            except Exception:
+                                continue
+                        # Flatten option legs
+                        for op in list(firm_state.open_positions or []):
+                            try:
+                                sym = str(getattr(op, "symbol", "") or "").upper().strip()
+                                q = int(getattr(op, "quantity", 0) or 0)
+                                if not sym or q == 0:
+                                    continue
+                                side = "sell" if q > 0 else "buy"
+                                await asyncio.to_thread(ems.place_option_order, sym, side, int(abs(q)), "market", None, "day")
+                            except Exception:
+                                continue
+
+                        asyncio.create_task(_post_order_sync())
+                        await _persist_firm_state()
+                        continue
+                    else:
+                        # Advisory: continue to normal close-rec generation (it will queue closes).
+                        pass
+            except Exception:
+                pass
+
+            from agents.position_monitor import build_close_recommendations
+            close_recs = build_close_recommendations(firm_state)
+            if not close_recs:
+                continue
+
+            # Build a view of "reserved/held" shares: if there is already an open SELL for a symbol,
+            # do not spam another SELL close (this causes Alpaca 403 insufficient available qty).
+            open_sell_symbols: set[str] = set()
+            open_order_ids_by_symbol: dict[str, list[str]] = {}
+            try:
+                ems = _get_ems()
+                orders = await asyncio.to_thread(ems.get_orders, 200)
+                for o in (orders or []):
+                    try:
+                        sym = str(o.get("symbol") or o.get("symbol_id") or o.get("asset_id") or "").upper().strip()
+                        side = str(o.get("side") or "").lower().strip()
+                        status = str(o.get("status") or "").lower().strip()
+                        oid = str(o.get("id") or "")
+                        if not sym or side != "sell":
+                            continue
+                        # Alpaca statuses vary; treat these as "still working".
+                        if status in ("new", "accepted", "pending_new", "partially_filled", "held", "replaced"):
+                            open_sell_symbols.add(sym)
+                            if oid:
+                                open_order_ids_by_symbol.setdefault(sym, []).append(oid)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # Advisory: park recommendations. Autopilot: execute immediately.
+            mode = str(getattr(firm_state, "trading_mode", "advisory") or "advisory").lower()
+            if mode != "autopilot":
+                for r in close_recs:
+                    try:
+                        if getattr(r, "asset_type", "option") == "stock":
+                            # Skip duplicate SELL closes when shares are already held for orders.
+                            sp = getattr(r, "stock_proposal", None)
+                            if sp is not None and sp.side.value.upper() == "SELL":
+                                if str(r.ticker or "").upper().strip() in open_sell_symbols:
+                                    continue
+                    except Exception:
+                        pass
+                    firm_state.pending_recommendations.append(r)
+                    firm_state.reasoning_log.append(ReasoningEntry(
+                        agent="System",
+                        action="INFO",
+                        reasoning=f"Position monitor: queued close recommendation '{r.strategy_name}'.",
+                        inputs={"recommendation_id": r.id, "asset_type": r.asset_type},
+                        outputs={"status": "pending"},
+                    ))
+                await _persist_firm_state()
+                continue
+
+            # Autopilot: send closing orders.
             ems = _get_ems()
-            for pos in list(firm_state.open_positions):
-                cost_basis = abs(pos.avg_cost) * abs(pos.quantity) * 100
-                if cost_basis <= 0:
+            for r in close_recs:
+                try:
+                    if getattr(r, "asset_type", "option") == "stock":
+                        sp = r.stock_proposal
+                        if sp is None:
+                            continue
+                        sym = str(r.ticker or "").upper().strip()
+                        # If there is an existing open SELL for this symbol, cancel it first (autopilot only).
+                        if sp.side.value.upper() == "SELL" and sym in open_sell_symbols:
+                            for oid in open_order_ids_by_symbol.get(sym, [])[:6]:
+                                try:
+                                    await asyncio.to_thread(ems.cancel_order, oid)
+                                except Exception:
+                                    continue
+                        await asyncio.to_thread(
+                            ems.place_stock_order,
+                            r.ticker,
+                            sp.side.value.lower(),
+                            float(sp.qty),
+                            str(sp.order_type),
+                            float(sp.limit_price) if sp.limit_price is not None else None,
+                            "day",
+                        )
+                    else:
+                        prop = r.proposal
+                        if not prop or not prop.legs:
+                            continue
+                        leg = prop.legs[0]
+                        await asyncio.to_thread(
+                            ems.place_option_order,
+                            leg.symbol,
+                            leg.side.value.lower(),
+                            int(leg.qty),
+                            "market",
+                            None,
+                            "day",
+                        )
+                except Exception:
                     continue
-
-                pnl_pct = pos.current_pnl / cost_basis   # signed
-
-                # Find matching proposal thresholds (if still current)
-                sl_pct = 0.50   # default: close at 50% loss
-                tp_pct = 0.75   # default: close at 75% gain
-                if firm_state.pending_proposal:
-                    sl_pct = firm_state.pending_proposal.stop_loss_pct
-                    tp_pct = firm_state.pending_proposal.take_profit_pct
-
-                hit_sl = pnl_pct <= -sl_pct
-                hit_tp = pnl_pct >= tp_pct
-
-                if hit_sl or hit_tp:
-                    reason = "STOP_LOSS" if hit_sl else "TAKE_PROFIT"
-                    log.warning(
-                        "Position monitor: %s on %s (P&L %.1f%%)",
-                        reason, pos.symbol, pnl_pct * 100,
-                    )
-                    # Determine closing side: if we're long, sell; if short, buy
-                    close_side = "sell" if pos.quantity > 0 else "buy"
-                    result = await asyncio.to_thread(
-                        ems.place_option_order,
-                        pos.symbol, close_side, abs(pos.quantity),
-                        "market", None, "day",
-                    )
-                    log.info("Auto-close order result: %s", result)
-                    # Schedule a position refresh
-                    asyncio.create_task(_post_order_sync())
+            asyncio.create_task(_post_order_sync())
         except Exception as e:
             log.debug("position_monitor_task error: %s", e)
 
@@ -486,11 +611,39 @@ async def _news_task():
                 tickers.append(m.group(1))
         return list(dict.fromkeys(tickers))
 
+    def _allow_set() -> set[str]:
+        raw = os.getenv("SCANNER_TICKERS", "").strip()
+        if raw:
+            return set([t.strip().upper() for t in raw.replace(";", ",").split(",") if t.strip()])
+        return set(["SPY", "NVDA", "GOOG", "GOOGL", "MU", "LITE", "SNDK"])
+
     async for item in unified_news_stream(_current_tickers, _portfolio_tickers):
+        # Backstop filter: do not keep irrelevant items in the in-memory feed even if a source
+        # slips through (or older code is still running elsewhere).
+        try:
+            allow = _allow_set()
+            its = [str(t or "").upper() for t in (getattr(item, "tickers", None) or [])]
+            mts = [str(t or "").upper() for t in (getattr(item, "mentioned_tickers", None) or [])]
+            if not any(t in allow for t in (its + mts)):
+                continue
+        except Exception:
+            pass
         firm_state.news_feed.append(item)
         try:
             from agents.data.news_priority_queue import get_queue
-            get_queue().push(item)
+            # Do not re-enqueue already-processed headlines. Otherwise, the queue
+            # count never stabilizes because the same headline gets pushed again
+            # on every poll loop.
+            try:
+                from agents.data.news_processed_db import has_processed_article_id
+                from agents.data.news_processor import _article_id
+
+                _aid = _article_id(getattr(item, "headline", "") or "")
+                if not has_processed_article_id(_aid):
+                    get_queue().push(item)
+            except Exception:
+                # If the processed DB check fails, fall back to queueing (best-effort).
+                get_queue().push(item)
         except Exception as _exc:
             log.debug("NewsPriorityQueue push failed: %s", _exc)
         if len(firm_state.news_feed) > 300:
@@ -925,6 +1078,62 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.debug("post-restore expiry cleanup skipped: %s", e)
 
+    # Universe enforcement: if SCANNER_TICKERS / BENCHMARK_TICKERS is set, do not retain or pull other symbols.
+    try:
+        from agents.data.sp500 import _normalize_universe_symbol
+
+        def _parse_csv_env(name: str) -> list[str]:
+            raw = os.getenv(name, "").strip()
+            if not raw:
+                return []
+            out: list[str] = []
+            for x in raw.replace(";", ",").split(","):
+                t = str(x or "").strip()
+                if t:
+                    out.append(str(t).upper())
+            return list(dict.fromkeys(out))
+
+        allow = set(_normalize_universe_symbol(t) for t in (_parse_csv_env("SCANNER_TICKERS") + _parse_csv_env("BENCHMARK_TICKERS")))
+        allow = {str(t or "").upper().strip() for t in allow if str(t or "").strip()}
+
+        if allow:
+            # Clamp active ticker to allowlist (avoid accidental pulls for old tickers).
+            if str(firm_state.ticker or "").upper().strip() not in allow:
+                firm_state.ticker = next(iter(sorted(allow)))
+
+            # Drop in-memory items for non-allowlisted symbols.
+            try:
+                firm_state.pending_recommendations = [
+                    r for r in (firm_state.pending_recommendations or [])
+                    if str(getattr(r, "ticker", "") or "").upper().strip() in allow
+                ]
+            except Exception:
+                pass
+            try:
+                firm_state.news_feed = [
+                    n for n in (firm_state.news_feed or [])
+                    if any(str(t or "").upper().strip() in allow for t in (getattr(n, "tickers", []) or []))
+                    or any(str(t or "").upper().strip() in allow for t in (getattr(n, "mentioned_tickers", []) or []))
+                ]
+            except Exception:
+                pass
+
+            # Purge persisted DB rows for non-allowlisted tickers (best-effort).
+            try:
+                from agents.data.app_db import purge_non_allowlisted
+                await asyncio.to_thread(purge_non_allowlisted, allowed_tickers=allow)
+            except Exception:
+                pass
+
+            # Persist clamped state so removed tickers don't reappear on next restart.
+            try:
+                from agents.state_persistence import save_state
+                await asyncio.to_thread(save_state, firm_state)
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug("universe enforcement skipped: %s", e)
+
     # Optional PostgreSQL warehouse: durable copy of pulled data via background queue (SQLite stays UI L1).
     try:
         from agents.data.warehouse import (
@@ -1039,6 +1248,32 @@ app.add_middleware(
 )
 
 
+def _reset_t3_fields_for_new_ticker(*, new_ticker: str) -> None:
+    """
+    When switching tickers, clear any ticker-specific Tier-3 analysis artifacts so we don't
+    carry over stale debate/proposals/reasoning to the new symbol.
+    """
+    from agents.state import AgentDecision
+
+    firm_state.pending_proposal = None
+    firm_state.pending_stock_proposal = None
+    firm_state.debate_record = None
+    firm_state.strategy_confidence = 0.0
+    firm_state.stock_confidence = 0.0
+    firm_state.analyst_confidence = 0.0
+    firm_state.sentiment_confidence = 0.0
+    firm_state.trader_decision = AgentDecision.HOLD
+    firm_state.bull_argument = ""
+    firm_state.bear_argument = ""
+    firm_state.bull_conviction = 0
+    firm_state.bear_conviction = 0
+    try:
+        firm_state.tier3_structured_digests = []
+    except Exception:
+        pass
+    firm_state.ticker = new_ticker
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -1115,7 +1350,12 @@ async def websocket_market_feed(websocket: WebSocket):
             try:
                 while True:
                     item = out_q.get_nowait()
-                    await websocket.send_json(item)
+                    try:
+                        import orjson
+
+                        await websocket.send_bytes(orjson.dumps(item))
+                    except Exception:
+                        await websocket.send_json(item)
             except _queue.Empty:
                 pass
             await asyncio.sleep(0.02)
@@ -1133,7 +1373,7 @@ async def websocket_market_feed(websocket: WebSocket):
                 if isinstance(ns, str) and ns.strip():
                     t = ns.strip().upper()
                     market_activity.touch(t)
-                    firm_state.ticker = t
+                    _reset_t3_fields_for_new_ticker(new_ticker=t)
                     await asyncio.to_thread(hub.resubscribe_on_focus_change, t)
 
     pump_task = asyncio.create_task(pump_out())
@@ -1178,6 +1418,22 @@ async def get_state():
     payload = firm_state.model_dump()
     payload["agent_runtime"] = agent_status.to_dict()
     payload["news_feed_enabled"] = ENABLE_NEWS_FEED
+    # Backstop: the UI also renders news from /state (fallback path). Ensure we only expose
+    # universe-related items here as well.
+    try:
+        raw = os.getenv("SCANNER_TICKERS", "").strip()
+        allow = set([t.strip().upper() for t in raw.replace(";", ",").split(",") if t.strip()]) if raw else set()
+        if not allow:
+            allow = set(["SPY", "NVDA", "GOOG", "GOOGL", "MU", "LITE", "SNDK"])
+        nf = payload.get("news_feed") or []
+        if isinstance(nf, list):
+            payload["news_feed"] = [
+                n for n in nf
+                if any(str(t or "").upper() in allow for t in ((n.get("tickers") if isinstance(n, dict) else None) or []))
+                or any(str(t or "").upper() in allow for t in ((n.get("mentioned_tickers") if isinstance(n, dict) else None) or []))
+            ]
+    except Exception:
+        pass
     return payload
 
 
@@ -1187,7 +1443,27 @@ async def get_news(limit: int = Query(80, ge=1, le=300)):
     Latest headlines for the UI.
     Sorted strictly by published_at (newest first).
     """
-    items = list(firm_state.news_feed)
+    # Safety filter: only return news related to our restricted universe.
+    # (Ingestion already filters, but keep this as a backstop for older cached items.)
+    def _parse_csv_env(name: str) -> set[str]:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return set()
+        out: list[str] = []
+        for x in raw.replace(";", ",").split(","):
+            t = str(x or "").strip().upper()
+            if t:
+                out.append(t)
+        return set(out)
+
+    allow = _parse_csv_env("SCANNER_TICKERS")
+    if not allow:
+        allow = set(["SPY", "NVDA", "GOOG", "GOOGL", "MU", "LITE", "SNDK"])
+    items = [
+        n for n in list(firm_state.news_feed)
+        if any(str(t or "").upper() in allow for t in (getattr(n, "tickers", None) or []))
+        or any(str(t or "").upper() in allow for t in (getattr(n, "mentioned_tickers", None) or []))
+    ]
     items.sort(key=lambda n: n.published_at.timestamp() if getattr(n, "published_at", None) else 0, reverse=True)
     return [n.model_dump() for n in items[:limit]]
 
@@ -1416,6 +1692,40 @@ async def llm_status():
     status["pool_healthy"] = server_pool.healthy_count
     status["pool_total"] = len(server_pool.all_urls)
     return status
+
+
+@app.get("/llm/tokens")
+async def llm_tokens():
+    """Token usage totals across all agent LLM calls (persisted locally)."""
+    try:
+        from agents.tracking.token_usage import total_tokens_summary
+
+        return total_tokens_summary(lookback_days=30)
+    except Exception as e:
+        return {
+            "error": str(e)[:300],
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "by_agent": {},
+        }
+
+
+@app.get("/agents/timings")
+async def agent_timings(window_days: int = 30):
+    """Average + percentile timing per agent step (persisted locally)."""
+    try:
+        from agents.tracking.agent_timing import agent_timing_summary
+
+        d = int(max(1, min(90, window_days)))
+        return agent_timing_summary(lookback_days=d)
+    except Exception as e:
+        return {
+            "error": str(e)[:300],
+            "window_days": int(window_days or 30),
+            "overall": {"count": 0, "avg_s": 0.0, "p50_s": None, "p95_s": None},
+            "by_agent": {},
+        }
 
 
 @app.get("/perception/{ticker}")
@@ -1915,6 +2225,8 @@ async def set_ticker(req: TickerRequest):
     t = req.ticker.upper()
     market_activity.touch(t)
     firm_state.ticker = t
+    # Clear any stale T3 artifacts from the previous symbol before switching.
+    _reset_t3_fields_for_new_ticker(new_ticker=t)
     # Always refresh spot on ticker switch so chain filters + agents start from real stock price.
     try:
         from agents.data.equity_snapshot import fetch_stock_quote
@@ -2260,6 +2572,8 @@ async def list_recommendations():
 
         proposal = rec_dict.get("proposal") or {}
         legs = proposal.get("legs") or []
+        stop_loss_pct = proposal.get("stop_loss_pct", None)
+        take_profit_pct = proposal.get("take_profit_pct", None)
         today = date.today()
 
         def _build_quotes() -> tuple[list[dict], list[str], float]:
@@ -2365,6 +2679,62 @@ async def list_recommendations():
             if not missing and legs:
                 puts = [l for l in legs if str(l.get("right") or "").upper().startswith("P")]
                 calls = [l for l in legs if str(l.get("right") or "").upper().startswith("C")]
+                # Single-leg naked option: special-case so the UI doesn't treat credit as "max loss".
+                if len(legs) == 1:
+                    leg = legs[0] or {}
+                    side = str(leg.get("side") or "").upper()
+                    right = str(leg.get("right") or "").upper()
+                    try:
+                        strike = float(leg.get("strike") or 0.0)
+                    except Exception:
+                        strike = 0.0
+
+                    # net_premium_mid_usd is already signed (+ credit for SELL, - debit for BUY).
+                    credit_usd = max(0.0, float(net_premium_mid))
+                    debit_usd = max(0.0, -float(net_premium_mid))
+
+                    # For single-leg, also provide a stop/take derived P&L estimate if configured.
+                    try:
+                        sl = float(stop_loss_pct) if stop_loss_pct is not None else None
+                    except Exception:
+                        sl = None
+                    try:
+                        tp = float(take_profit_pct) if take_profit_pct is not None else None
+                    except Exception:
+                        tp = None
+                    if credit_usd > 0:
+                        if isinstance(sl, float) and 0.0 < sl <= 1.0:
+                            out["stop_loss_estimate_usd"] = round(credit_usd * sl, 2)
+                        if isinstance(tp, float) and 0.0 < tp <= 1.0:
+                            out["take_profit_estimate_usd"] = round(credit_usd * tp, 2)
+
+                    if side.startswith("S") and credit_usd > 0:
+                        if right.startswith("P") and strike > 0:
+                            # Short put worst-case at expiry: underlying to 0 → lose K*100, keep credit.
+                            max_loss_est = max(0.0, strike * 100.0 - credit_usd)
+                            out["max_loss_estimate_usd"] = round(max_loss_est, 2)
+                            out["risk_math"] = (
+                                "Estimate (Naked short put): max_loss_expiry ≈ strike×100 − net_credit "
+                                f"(strike={strike:.2f}, net_credit≈${credit_usd:.2f}). "
+                                "Note: this ignores early assignment and assumes the desk can hold to expiry."
+                            )
+                        elif right.startswith("C"):
+                            # Short call worst-case at expiry is unbounded.
+                            out["max_loss_estimate_usd"] = None
+                            out["risk_math"] = (
+                                "Estimate (Naked short call): max_loss_expiry is theoretically unlimited. "
+                                "Use stop-loss policy to bound trade-level risk, but tail gaps/squeezes can exceed it."
+                            )
+                        else:
+                            out["risk_math"] = "Estimate: unrecognized option right for single-leg structure."
+                    elif debit_usd > 0:
+                        # Long single-leg: max loss is debit paid.
+                        out["max_loss_estimate_usd"] = round(debit_usd, 2)
+                        out["risk_math"] = (
+                            "Estimate (Long option): max_loss ≈ net_debit "
+                            f"(net_debit≈${debit_usd:.2f})."
+                        )
+
                 # Iron condor heuristic: 2 puts + 2 calls, same expiry, qty 1.
                 if len(puts) == 2 and len(calls) == 2:
                     exp = {str(l.get("expiry") or "") for l in legs}
@@ -2437,6 +2807,21 @@ async def approve_recommendation(rec_id: str):
             sp = rec.stock_proposal
             if sp is None:
                 return {"error": "Stock recommendation missing stock_proposal"}
+            # Record an entry mandate for later exit management (best-effort).
+            try:
+                from agents.state import PositionMandate
+
+                firm_state.position_mandates[rec.ticker.upper().strip()] = PositionMandate(
+                    key=rec.ticker.upper().strip(),
+                    asset_type="stock",
+                    underlying=rec.ticker.upper().strip(),
+                    opened_reason=str(getattr(rec, "desk_head_reasoning", "") or "")[:400],
+                    stop_loss_pct=sp.stop_loss_pct,
+                    take_profit_pct=sp.take_profit_pct,
+                    time_stop_days=5,
+                )
+            except Exception:
+                pass
             result = await asyncio.to_thread(
                 _get_ems().place_stock_order,
                 rec.ticker,
@@ -2464,6 +2849,43 @@ async def approve_recommendation(rec_id: str):
         from agents.state import GreeksSnapshot
 
         proposal = rec.proposal
+        # Record an entry mandate for later exit management (best-effort).
+        try:
+            from agents.state import PositionMandate
+
+            for leg in (proposal.legs or []):
+                sym = str(getattr(leg, "symbol", "") or "").strip().upper()
+                if not sym:
+                    continue
+                # Default mandates for LONG naked options (A+ policy):
+                # - hard stop out at -25% (weekly options wealth protection)
+                # - take profit at +75% (full close; partials not supported yet)
+                # - time stop at 48h
+                # - theta veto: 4h no-move band -> exit (best-effort, uses intraday bars)
+                # - trailing EMA stop once in profit (best-effort, uses intraday bars)
+                # Use proposal overrides if provided.
+                leg_side = str(getattr(leg, "side", "") or "").upper()
+                default_stop = 0.25 if leg_side == "BUY" else None
+                default_tp = 0.75 if leg_side == "BUY" else None
+                default_days = 2 if leg_side == "BUY" else 7
+                firm_state.position_mandates[sym] = PositionMandate(
+                    key=sym,
+                    asset_type="option",
+                    underlying=str(getattr(rec, "ticker", "") or getattr(firm_state, "ticker", "") or "").upper().strip(),
+                    opened_reason=str(getattr(rec, "desk_head_reasoning", "") or "")[:400],
+                    entry_underlying_px=float(getattr(firm_state, "underlying_price", 0.0) or 0.0) or None,
+                    stop_loss_pct=float(getattr(proposal, "stop_loss_pct", None)) if getattr(proposal, "stop_loss_pct", None) is not None else default_stop,
+                    take_profit_pct=float(getattr(proposal, "take_profit_pct", None)) if getattr(proposal, "take_profit_pct", None) is not None else default_tp,
+                    time_stop_days=default_days,
+                    trailing_ema_enabled=(True if leg_side == "BUY" else False),
+                    trailing_ema_timeframe="15Min",
+                    trailing_ema_period=10,
+                    trailing_activate_profit_pct=0.20,
+                    theta_veto_hours=(4.0 if leg_side == "BUY" else None),
+                    theta_veto_band_pct=(0.5 if leg_side == "BUY" else None),
+                )
+        except Exception:
+            pass
 
         from agents.data.opra_client import occ_expiry_as_date
 

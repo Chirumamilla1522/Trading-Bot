@@ -113,7 +113,25 @@ async def _scan_loop(
     job_queue: asyncio.Queue,
 ) -> None:
     global _seq
-    tickers = list(SP500_TOP50)
+    # Universe research should follow the same restricted universe as the UI/scanner
+    # when configured, instead of always using SP500_TOP50.
+    def _parse_csv_env(name: str) -> list[str]:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return []
+        out: list[str] = []
+        for x in raw.replace(";", ",").split(","):
+            t = str(x or "").strip().upper()
+            if t:
+                out.append(t)
+        return list(dict.fromkeys(out))
+
+    # Default restricted universe (matches user-requested shortlist).
+    # Note: indices are quotes-only and excluded here because this loop depends on options scanner signals.
+    default_equities = ["SPY", "NVDA", "GOOG", "GOOGL", "MU", "LITE", "SNDK"]
+    tickers = _parse_csv_env("SCANNER_TICKERS") or default_equities
+    # Filter out index-like symbols (quotes-only) if someone accidentally includes them.
+    tickers = [t for t in tickers if not t.startswith("^")]
     store.ensure_seed_tickers(tickers)
 
     while not _stop.is_set():

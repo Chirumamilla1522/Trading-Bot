@@ -173,6 +173,12 @@ class TradeProposal(BaseModel):
     confidence:    float = 0.0   # 0.0-1.0
     stop_loss_pct: float = 0.50  # exit if position loses >50% of max_risk
     take_profit_pct: float = 0.75  # exit at 75% of target_return
+    # Optional quantitative diagnostics for LONG naked calls/puts (deterministic).
+    dte: int | None = None
+    delta: float | None = None
+    breakeven: float | None = None
+    pop: float | None = None  # probability of profit at expiry (0..1)
+    ev: float | None = None   # expected value in USD for 1 contract at expiry (undiscounted, subtract premium)
 
 
 # ─── Adversarial debate record ───────────────────────────────────────────────────
@@ -212,6 +218,46 @@ class Recommendation(BaseModel):
     resolved_at:          datetime | None = None
 
 
+# ─── Position mandate (entry-time management rules) ─────────────────────────────
+
+class PositionMandate(BaseModel):
+    """
+    Persistent position-management rules captured at entry time.
+    Used by the position monitor to decide when to close.
+    """
+
+    # Identifier for the position.
+    # - options: OCC symbol
+    # - stocks: ticker
+    key: str
+    asset_type: str = "option"  # "option" | "stock"
+    underlying: str = ""  # for options: underlying ticker (best-effort)
+
+    opened_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    opened_reason: str = ""  # human-readable thesis summary (optional)
+    entry_underlying_px: float | None = None
+
+    # Profit/stop rules expressed as return on cost basis (PnL / cost_basis).
+    # Example: 0.50 means take profit at +50% return.
+    take_profit_pct: float | None = None
+    stop_loss_pct: float | None = None
+
+    # Time stop (in days). Example: 5 means if thesis doesn't work within 5 days, exit.
+    time_stop_days: int | None = None
+
+    # Weekly-options style exit overlays (optional)
+    trailing_ema_enabled: bool = False
+    trailing_ema_timeframe: str = "15Min"
+    trailing_ema_period: int = 10
+    trailing_activate_profit_pct: float = 0.20  # only after +20% return
+
+    theta_veto_hours: float | None = None
+    theta_veto_band_pct: float | None = None  # underlying ± band from entry
+
+    # Optional thesis invalidation text or level note (best-effort; not always available).
+    invalidation: str = ""
+
+
 # ─── Risk metrics ────────────────────────────────────────────────────────────────
 
 class RiskMetrics(BaseModel):
@@ -238,6 +284,121 @@ class ReasoningEntry(BaseModel):
     outputs:    dict[str, Any] = {}
     timestamp:  datetime = Field(default_factory=datetime.utcnow)
     trade_id:   str | None = None
+
+
+# ─── Technical context (deterministic, chart-derived) ───────────────────────────
+
+class TechnicalLevel(BaseModel):
+    kind: str = ""  # "support" | "resistance"
+    price: float = 0.0
+    source: str = ""  # "pivot_low" | "pivot_high" | "prev_week_low" | "prev_week_high" | ...
+    distance_pct: float = 0.0
+    confidence: float = 0.0  # 0..1 (deterministic heuristic)
+    touches: int = 0
+    last_reaction_unix: int | None = None
+
+
+class TrianglePattern(BaseModel):
+    type: str = "NONE"  # "ASCENDING" | "DESCENDING" | "SYMMETRICAL" | "NONE"
+    upper: float | None = None
+    lower: float | None = None
+    breakout_rule: str = ""       # short text, e.g. "daily close > upper"
+    invalidation_rule: str = ""   # short text
+    target: float | None = None   # simple measured-move target (optional)
+    confidence: float = 0.0       # 0..1
+
+
+class TechnicalContext(BaseModel):
+    as_of_unix: int | None = None
+    bars_source: str = ""
+    bars_count: int = 0
+    timeframe: str = "1Day"
+
+    px_last: float = 0.0
+    ema200: float | None = None
+    ema200_slope_5d: float | None = None
+    dist_to_ema200_pct: float | None = None
+    regime_label: str = "unknown"  # "trend_up" | "trend_down" | "range" | "unknown"
+
+    # Momentum
+    rsi14: float | None = None
+    rsi_state: str = "unknown"  # "oversold" | "neutral" | "overbought" | "unknown"
+
+    # Short-term trend (useful for ATH / weekly setups)
+    ema10: float | None = None
+    dist_to_ema10_pct: float | None = None
+
+    vol_last: float | None = None
+    vol_avg20: float | None = None
+    vol_ratio20: float | None = None
+    vol_avg30: float | None = None
+    vol_ratio30: float | None = None
+    volume_state: str = "unknown"  # "confirming" | "neutral" | "fading" | "unknown"
+    unusual_volume: bool | None = None
+    volume_confirms_direction: str = "unknown"  # "up" | "down" | "neither" | "unknown"
+
+    # ATH / contraction diagnostics (daily)
+    ath_252_high: float | None = None
+    dist_to_ath_pct: float | None = None
+    range_std_5: float | None = None
+    range_std_20: float | None = None
+    range_avg_20: float | None = None
+    vcp_contraction: bool | None = None  # True if short-term range std is materially lower than 20d
+
+    # Inflection signals (deterministic)
+    bb_mid_20: float | None = None
+    bb_upper_20: float | None = None
+    bb_lower_20: float | None = None
+    bb_bandwidth_20: float | None = None  # (upper-lower)/mid
+    bb_squeeze: bool | None = None
+
+    macd: float | None = None
+    macd_signal: float | None = None
+    macd_hist: float | None = None
+
+    candle_shape: str = "unknown"  # "hammer" | "shooting_star" | "doji" | "other" | "unknown"
+    vol_price_climax: bool | None = None  # volume surge + price stall (absorption/exhaustion proxy)
+    rsi_divergence: str = "none"  # "bullish" | "bearish" | "none"
+    macd_divergence: str = "none"  # "bullish" | "bearish" | "none"
+
+    # Single, prompt-friendly inflection summary label (derived from the flags above).
+    # Use this when you want a simple "what kind of inflection is present?" field.
+    # Values are intentionally coarse; details live in `inflection_tags`.
+    inflection_point: str = "none"  # "bullish" | "bearish" | "volatility" | "none"
+    inflection_tags: list[str] = []
+
+    # Historical IV rank (computed from persisted per-ticker ATM IV history)
+    iv_rank_30d: float | None = None  # 0..1 (None if insufficient history)
+
+    prev_week_high: float | None = None
+    prev_week_low: float | None = None
+    curr_week_high: float | None = None
+    curr_week_low: float | None = None
+    outside_prev_week: bool | None = None
+    outside_week_state: str = "UNCLEAR"  # "CONFIRMED" | "REJECTED" | "UNCLEAR"
+
+    supports: list[TechnicalLevel] = []
+    resistances: list[TechnicalLevel] = []
+    triangle: TrianglePattern = Field(default_factory=TrianglePattern)
+
+    # Swing-based stop/target guidance (underlying price levels)
+    stop_long: float | None = None
+    target_long_3r: float | None = None
+    stop_short: float | None = None
+    target_short_3r: float | None = None
+
+
+# ─── A+ Setup (deterministic confluence scorecard) ─────────────────────────────
+
+class APlusSetup(BaseModel):
+    as_of_unix: int | None = None
+    direction: str = "none"  # "call" | "put" | "none"
+    score: int = 0
+    required: int = 5
+    passed: list[str] = []
+    failed: list[str] = []
+    details: dict[str, Any] = Field(default_factory=dict)
+    recommendation: str = "ABORT"  # "PROCEED" | "ABORT"
 
 
 # ─── Master firm state ───────────────────────────────────────────────────────────
@@ -305,6 +466,12 @@ class FirmState(BaseModel):
     iv_regime:    str = "UNKNOWN"  # LOW / NORMAL / ELEVATED / EXTREME
     iv_term_structure: dict[str, float] = Field(default_factory=dict)
 
+    # ── Deterministic technical context (from daily bars) ─────────────────────
+    technical_context: TechnicalContext | None = None
+
+    # ── A+ naked options setup score (deterministic gate) ─────────────────────
+    aplus_setup: APlusSetup | None = None
+
     # Sentiment themes from analyst (list of short strings)
     sentiment_themes:  list[str] = []
     sentiment_tail_risks: list[str] = []
@@ -369,6 +536,8 @@ class FirmState(BaseModel):
     # ── Trading mode ─────────────────────────────────────────────────────────
     trading_mode:              str = "advisory"   # "advisory" | "autopilot"
     pending_recommendations:   list[Recommendation] = []
+    # Persisted entry mandates keyed by position identifier (OCC symbol or ticker).
+    position_mandates:         dict[str, PositionMandate] = Field(default_factory=dict)
 
     # XAI audit trail
     reasoning_log:    list[ReasoningEntry] = []

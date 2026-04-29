@@ -133,9 +133,15 @@ If `MLFLOW_TRACKING_URI` is set, each agent cycle is logged to MLflow:
 
 - **Parent run**: one cycle (tags: ticker, trigger, trading_mode)
 - **Child runs**: one per step (artifacts: `inputs.json`, `outputs.json`, metrics: duration)
+- **LLM call child runs** (`kind=llm_call`): every `invoke_llm` call logs the full prompt
+  (`prompt.json`), raw model response (`response.json`), model name, backend (local vs
+  OpenRouter), latency (`duration_s`), character counts, and token usage when the provider
+  returns it. Set `MLFLOW_LOG_LLM_CALLS=0` to disable, or `MLFLOW_LLM_TEXT_MAX_CHARS` to
+  cap persisted prompt/response size (default 40 000).
 
 Implementation:
-- `agents/tracking/mlflow_tracing.py`
+- `agents/tracking/mlflow_tracing.py` (`start_cycle_run`, `end_cycle_run`, `log_agent_step`, `log_llm_call`)
+- `agents/llm_retry.py` (`invoke_llm` wraps every LLM call with MLflow instrumentation)
 - Cycle hook: `agents/api_server.py` `_run_one_cycle`
 - Step hooks: agent node implementations + `ingest_data`/`recommend` in `agents/graph.py`
 

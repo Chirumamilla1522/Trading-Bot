@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+from agents.config import ENABLE_NEWS_PROCESSOR, ENABLE_SENTIMENT_MONITOR
+
 # ── Trigger thresholds ─────────────────────────────────────────────────────────
 T1_SENTIMENT_THRESH  = 0.40   # |score| must exceed this
 T1_MOVEMENT_THRESH   = 0.30   # |signal| must exceed this
@@ -419,7 +421,8 @@ async def _t3_watchdog_loop(firm_state: "FirmState") -> None:
             if firm_state.kill_switch_active or firm_state.circuit_breaker_tripped:
                 continue
 
-            sentiment = abs(firm_state.sentiment_monitor_score)
+            # If SentimentMonitor is disabled, don't use its score as an auto-trigger input.
+            sentiment = abs(firm_state.sentiment_monitor_score) if ENABLE_SENTIMENT_MONITOR else 0.0
             movement  = abs(firm_state.movement_signal)
             bias      = abs(firm_state.market_bias_score)
 
@@ -590,12 +593,15 @@ async def start_tier_loops(firm_state: "FirmState") -> None:
     global _running_tasks
 
     loops = [
-        ("T1-SentimentMonitor",    _sentiment_monitor_loop(firm_state)),
         ("T1-MovementTracker",     _movement_tracker_loop(firm_state)),
         ("T2-FundamentalsRefresh", _fundamentals_loop(firm_state)),
-        ("T2-NewsProcessor",       _news_processor_loop(firm_state)),
         ("T3-Watchdog",            _t3_watchdog_loop(firm_state)),
     ]
+    if ENABLE_SENTIMENT_MONITOR:
+        loops.insert(0, ("T1-SentimentMonitor", _sentiment_monitor_loop(firm_state)))
+    if ENABLE_NEWS_PROCESSOR:
+        # NewsProcessor is Tier-2 LLM workload; keep it optional even when the feed is enabled.
+        loops.insert(3, ("T2-NewsProcessor", _news_processor_loop(firm_state)))
 
     for name, coro in loops:
         task = asyncio.create_task(coro, name=name)

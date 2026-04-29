@@ -23,6 +23,38 @@ _init_lock = threading.Lock()
 _inited = False
 
 
+def has_processed_article_id(article_id: str) -> bool:
+    """
+    Fast existence check: has this headline/article already been processed by NewsProcessor?
+    `article_id` should match ProcessedArticle.id (sha1(headline.lower().strip())[:16]).
+    """
+    _ensure()
+    aid = str(article_id or "").strip()
+    if not aid:
+        return False
+    if _pg_enabled():
+        try:
+            from agents.data.warehouse import postgres as wh
+
+            with wh.connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM processed_article WHERE id = %s LIMIT 1;", (aid,))
+                    return cur.fetchone() is not None
+        except Exception:
+            return False
+    con = _connect_raw()
+    try:
+        row = con.execute("SELECT 1 FROM processed_article WHERE id = ? LIMIT 1;", (aid,)).fetchone()
+        return row is not None
+    except Exception:
+        return False
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 def _pg_enabled() -> bool:
     try:
         from agents.data.warehouse import postgres as wh

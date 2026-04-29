@@ -11,46 +11,120 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
+def _parse_csv_env(name: str) -> list[str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return []
+    parts = []
+    for x in raw.replace(";", ",").split(","):
+        t = str(x or "").strip()
+        if not t:
+            continue
+        parts.append(t.upper())
+    # de-dupe, keep order
+    return list(dict.fromkeys(parts))
+
+
+def _normalize_universe_symbol(t: str) -> str:
+    """
+    Friendly aliases used in UI/config → quote symbols.
+    Note: indices are *quotes-only* (no options chain). Scanner should avoid them.
+    """
+    u = (t or "").strip().upper()
+    alias = {
+        "SPX": "^GSPC",
+        "SP500": "^GSPC",
+        "S&P500": "^GSPC",
+        # Indices
+        "NDX": "^NDX",          # Nasdaq 100
+        "NASDAQ100": "^NDX",
+        "IXIC": "^IXIC",        # Nasdaq Composite
+        "NASDAQ": "^IXIC",
+        "DJI": "^DJI",
+        "DOW": "^DJI",
+        "DOWJONES": "^DJI",
+        "DOW_JONES": "^DJI",
+    }
+    return alias.get(u, u)
+
+# Default restricted universe (requested shortlist).
+# Benchmarks can include indices (mapped to yfinance symbols); scanner must exclude indices.
+_DEFAULT_BENCHMARK_TICKERS: list[str] = [
+    "^GSPC",  # SPX / S&P 500 index (quotes-only)
+    "^IXIC",  # Nasdaq Composite (quotes-only)
+    "^DJI",   # Dow Jones (quotes-only)
+    "NVDA",
+    "GOOG",
+    "GOOGL",
+    "MU",
+    "SNDK",
+    "LITE",
+    "SPY",
+]
+
+_DEFAULT_SCANNER_TICKERS: list[str] = [
+    "NVDA",
+    "GOOG",
+    "GOOGL",
+    "MU",
+    "SNDK",
+    "LITE",
+    "SPY",
+]
+
 
 # ─── Index / sector / macro ETFs (always first in ``SP500_TICKERS``) ─────────
 # Broad + sector SPDRs + common tradable proxies; equities follow in sector blocks below.
-INDEX_SECTOR_ETF_TICKERS: list[str] = [
+_CUSTOM_BENCH = [_normalize_universe_symbol(x) for x in _parse_csv_env("BENCHMARK_TICKERS")]
+INDEX_SECTOR_ETF_TICKERS: list[str] = (
+    _CUSTOM_BENCH
+    if _CUSTOM_BENCH
+    else list(_DEFAULT_BENCHMARK_TICKERS)
+    if os.getenv("RESTRICT_UNIVERSE", "1").strip().lower() not in ("0", "false", "no", "off")
+    else [
     "SPY", "QQQ", "IWM", "DIA",
     "VOO", "VTI", "IJH", "IJR", "MDY",
     "XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC",
     "SMH", "SOXX",
     "GLD", "SLV", "TLT", "EEM",
     "ARKK", "VXX", "UVXY", "SQQQ", "TQQQ", "SPXL", "SPXU",
-]
+])
 _ETF_TICKERS_UPPER: frozenset[str] = frozenset(t.upper() for t in INDEX_SECTOR_ETF_TICKERS)
 
-# UI / API: benchmark strip + scanner section headers (order matches ``INDEX_SECTOR_ETF_TICKERS``)
-BENCHMARK_SCANNER_SECTIONS: list[dict[str, str | list[str]]] = [
-    {
-        "id": "core",
-        "label": "Core indices",
-        "tickers": ["SPY", "QQQ", "IWM", "DIA", "VOO", "VTI", "IJH", "IJR", "MDY"],
-    },
-    {
-        "id": "sectors",
-        "label": "Sectors & semis",
-        "tickers": ["XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC", "SMH", "SOXX"],
-    },
-    {
-        "id": "macro",
-        "label": "Macro & vol",
-        "tickers": ["GLD", "SLV", "TLT", "EEM", "ARKK", "VXX", "UVXY", "SQQQ", "TQQQ", "SPXL", "SPXU"],
-    },
-]
-_flat_sec = [t for sec in BENCHMARK_SCANNER_SECTIONS for t in sec["tickers"]]  # type: ignore[misc]
-if _flat_sec != INDEX_SECTOR_ETF_TICKERS:
-    raise RuntimeError("BENCHMARK_SCANNER_SECTIONS must partition INDEX_SECTOR_ETF_TICKERS in order")
+# UI / API: benchmark strip + scanner section headers.
+# If BENCHMARK_TICKERS is set, expose it as a single section (keeps UI simple).
+if _CUSTOM_BENCH:
+    BENCHMARK_SCANNER_SECTIONS: list[dict[str, str | list[str]]] = [
+        {"id": "custom", "label": "Markets", "tickers": list(INDEX_SECTOR_ETF_TICKERS)},
+    ]
+else:
+    BENCHMARK_SCANNER_SECTIONS = [
+        {
+            "id": "core",
+            "label": "Core indices",
+            "tickers": ["SPY", "QQQ", "IWM", "DIA", "VOO", "VTI", "IJH", "IJR", "MDY"],
+        },
+        {
+            "id": "sectors",
+            "label": "Sectors & semis",
+            "tickers": ["XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC", "SMH", "SOXX"],
+        },
+        {
+            "id": "macro",
+            "label": "Macro & vol",
+            "tickers": ["GLD", "SLV", "TLT", "EEM", "ARKK", "VXX", "UVXY", "SQQQ", "TQQQ", "SPXL", "SPXU"],
+        },
+    ]
+    _flat_sec = [t for sec in BENCHMARK_SCANNER_SECTIONS for t in sec["tickers"]]  # type: ignore[misc]
+    if _flat_sec != INDEX_SECTOR_ETF_TICKERS:
+        raise RuntimeError("BENCHMARK_SCANNER_SECTIONS must partition INDEX_SECTOR_ETF_TICKERS in order")
 
 # ─── S&P 500 + high-liquidity names (equities; ETFs removed — re-prefixed above) ─
 _SP500_EQUITIES: list[str] = [
@@ -241,9 +315,23 @@ class SP500Scanner:
 
         Env:
           - ``SCANNER_UNIVERSE`` = ``top50`` | ``top100`` | ``full`` (default ``top50``)
+          - ``SCANNER_TICKERS`` = comma-separated allowlist (overrides all above)
           - Legacy: ``SP500_FULL_SCAN=true`` → full list (overrides SCANNER_UNIVERSE)
         """
-        import os
+        allow = _parse_csv_env("SCANNER_TICKERS")
+        if allow:
+            # Scanner must only include optionable underlyings. Filter out common index
+            # symbols (quotes-only) that may appear in custom universes.
+            out: list[str] = []
+            for t in allow:
+                u = _normalize_universe_symbol(t)
+                if u.startswith("^"):  # indices are quotes-only (no options chains)
+                    continue
+                out.append(u)
+            return out
+        # Default: restricted scanner universe unless explicitly disabled.
+        if os.getenv("RESTRICT_UNIVERSE", "1").strip().lower() not in ("0", "false", "no", "off"):
+            return list(_DEFAULT_SCANNER_TICKERS)
         if os.getenv("SP500_FULL_SCAN", "false").lower() in ("1", "true", "yes"):
             return list(SP500_TICKERS)
         mode = os.getenv("SCANNER_UNIVERSE", "top50").strip().lower()

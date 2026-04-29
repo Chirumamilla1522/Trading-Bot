@@ -36,7 +36,7 @@ from typing import AsyncIterator, Callable
 
 import httpx
 
-from agents.config import ENABLE_NEWS_FEED, ENABLE_SYNTHETIC_NEWS
+from agents.config import ENABLE_BENZINGA, ENABLE_NEWS_FEED, ENABLE_SYNTHETIC_NEWS
 from agents.state import NewsItem
 
 log = logging.getLogger(__name__)
@@ -66,17 +66,77 @@ YF_MODE = os.getenv("YF_NEWS_MODE", "always").strip().lower()  # "always" | "fal
 BENZINGA_GENERAL_MIN_S = float(os.getenv("BENZINGA_GENERAL_MIN_S", "6"))  # general feed (paginated)
 BENZINGA_TIER_MIN_S    = float(os.getenv("BENZINGA_TIER_MIN_S", "2"))     # ticker-filtered feed per tier group
 
-# ── Ticker tiers (order = fetch priority) ─────────────────────────────────────
+# ── Universe restriction (order = fetch priority) ─────────────────────────────
+#
+# This project supports a restricted "desk universe" (see agents.data.sp500 defaults and
+# env vars SCANNER_TICKERS / BENCHMARK_TICKERS). News ingestion should only include
+# headlines related to that universe.
 
-TIER_INDICES = ["SPY", "QQQ", "IWM", "DIA", "VXX"]          # macro pulse
+def _parse_csv_env(name: str) -> list[str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    for x in raw.replace(";", ",").split(","):
+        t = str(x or "").strip().upper()
+        if t:
+            out.append(t)
+    return list(dict.fromkeys(out))
 
-# Use the canonical top-50 list from sp500.py (same universe the scanner uses)
-from agents.data.sp500 import SP500_TOP50 as _SP500_TOP50
-TIER_TOP_STOCKS = [t for t in _SP500_TOP50 if t not in TIER_INDICES]
 
-# Universe for entity extraction (ticker mentions)
-from agents.data.sp500 import SP500_TICKERS as _SP500_TICKERS
-_TICKER_SET = set([t.upper() for t in _SP500_TICKERS])
+def _normalize_universe_symbol(t: str) -> str:
+    u = (t or "").strip().upper()
+    alias = {
+        "SPX": "^GSPC",
+        "SP500": "^GSPC",
+        "SPX500": "^GSPC",
+        "S&P500": "^GSPC",
+        "NDX": "^NDX",
+        "NASDAQ100": "^NDX",
+        "DJI": "^DJI",
+        "DOW": "^DJI",
+        "DOWJONES": "^DJI",
+        "DOW_JONES": "^DJI",
+    }
+    return alias.get(u, u)
+
+
+# Benchmarks (can include indices; used to allow "macro" news tagging)
+_BENCH = [_normalize_universe_symbol(x) for x in _parse_csv_env("BENCHMARK_TICKERS")]
+# Scanner/equities (optionable; do not include indices)
+_SCAN = [_normalize_universe_symbol(x) for x in _parse_csv_env("SCANNER_TICKERS")]
+
+# Default restricted universe (kept in sync with agents.data.sp500 defaults)
+if not _BENCH:
+    _BENCH = ["^GSPC", "^NDX", "^DJI", "SPY", "NVDA", "GOOG", "GOOGL", "MU", "LITE", "SNDK"]
+if not _SCAN:
+    _SCAN = ["SPY", "NVDA", "GOOG", "GOOGL", "MU", "LITE", "SNDK"]
+
+# For Benzinga ticker-filtered calls: only pass optionable tickers (no ^ indices).
+TIER_INDICES = [t for t in _SCAN if not t.startswith("^")]  # first tier = our universe itself
+TIER_TOP_STOCKS: list[str] = []  # disabled under restricted universe
+
+# Universe for entity extraction (ticker mentions). Include both equities and aliases, but
+# exclude caret-prefixed indices (won't appear as bare tokens anyway).
+_TICKER_SET = set([t.upper() for t in _SCAN if t and not t.startswith("^")])
+_TICKER_SET |= {"SPY", "NVDA", "GOOG", "GOOGL", "MU", "LITE", "SNDK"}
+
+
+def _universe_intersects(item_tickers: list[str] | None, mentioned: list[str] | None) -> bool:
+    """
+    True if a NewsItem is related to our restricted universe.
+    We accept:
+    - explicit tickers from the source (Benzinga/Yahoo)
+    - extracted mentions from headline/summary
+    - macro/index headlines are allowed only if they come from the index tier (SPY etc.) fetch
+      or explicitly mention a universe ticker.
+    """
+    its = [(t or "").strip().upper() for t in (item_tickers or []) if (t or "").strip()]
+    mts = [(t or "").strip().upper() for t in (mentioned or []) if (t or "").strip()]
+    for t in its + mts:
+        if t in _TICKER_SET:
+            return True
+    return False
 
 
 # ── Category detection ────────────────────────────────────────────────────────
@@ -480,6 +540,9 @@ def _fetch_yf_tier(
             ni.urgency_tier = tier
             ni.vol_prob = round(float(volp), 4)
             ni.reliability_weight = 1.10 if (ni.source or "").upper().startswith("BENZINGA") else 1.0
+            # Universe filter: only keep news related to our restricted universe.
+            if not _universe_intersects(ni.tickers, ni.mentioned_tickers):
+                continue
             fresh.append(ni)
             if h not in seen:
                 seen.add(h)
@@ -601,6 +664,13 @@ async def _fetch_benzinga_tier(
             ni.reliability_weight = 1.10
         except Exception:
             pass
+        # Universe filter
+        try:
+            if not _universe_intersects(items[-1].tickers, getattr(items[-1], "mentioned_tickers", None)):
+                items.pop()
+                continue
+        except Exception:
+            pass
 
     if items:
         log.info("Benzinga [%s] %d new articles (tickers: %s)",
@@ -664,7 +734,7 @@ async def _fetch_benzinga_general(
                 for stk in (art.get("stocks") or [])
                 if stk.get("name") or stk.get("symbol")
             ]
-            items.append(NewsItem(
+            ni = NewsItem(
                 headline     = title,
                 source       = "Benzinga",
                 published_at = pub,
@@ -677,7 +747,16 @@ async def _fetch_benzinga_general(
                 ticker_tier  = "index",
                 summary      = teaser,
                 url          = art.get("url") or "",
-            ))
+            )
+            # Universe filter: general feed is broad — keep only if related to our universe.
+            try:
+                mentions = _extract_ticker_mentions(f"{title} {teaser or ''}")
+                ni.mentioned_tickers = [t for t in mentions if t]
+            except Exception:
+                pass
+            if not _universe_intersects(ni.tickers, getattr(ni, "mentioned_tickers", None)):
+                continue
+            items.append(ni)
 
     if items:
         log.info(
@@ -710,7 +789,7 @@ async def unified_news_stream(
     global _last_yf_active_cache_bust_m
 
     seen: set[str] = set()
-    bz_available   = bool(BENZINGA_API_KEY)   # False after hard auth failure
+    bz_available   = bool(ENABLE_BENZINGA) and bool(BENZINGA_API_KEY)   # False after hard auth failure
     bz_hard_fail   = False                    # True on 401/403 — stop retrying forever
     cycle          = 0
     last_bz_general_fetch = 0.0
@@ -718,7 +797,7 @@ async def unified_news_stream(
 
     log.info(
         "News stream started: Benzinga=%s  yfinance=%s  tiers=indices+portfolio+active+top_stocks",
-        "enabled (key set)" if bz_available else "disabled (no key)",
+        ("enabled (key set)" if bz_available else ("disabled (ENABLE_BENZINGA=false)" if not ENABLE_BENZINGA else "disabled (no key)")),
         YF_MODE,
     )
 
@@ -743,14 +822,15 @@ async def unified_news_stream(
             include_top = True
 
             tiers: list[tuple[str, list[str], int]] = [
-                ("index",     TIER_INDICES,                           5),
+                ("index",     TIER_INDICES,                           8),
                 ("portfolio", list(dict.fromkeys(portfolio_tickers)), 12),
                 ("active",    list(dict.fromkeys(active_tickers)),    6),
             ]
             if include_top:
-                # Benzinga handles all tickers in one API call (comma-separated),
-                # yfinance rotates through them with TTL caching per ticker.
-                tiers.append(("top", TIER_TOP_STOCKS, 50))
+                # Under a restricted universe we do not include the broad SP500 top names.
+                # Keep this list empty to avoid pulling irrelevant news.
+                if TIER_TOP_STOCKS:
+                    tiers.append(("top", TIER_TOP_STOCKS, 50))
 
             all_items: list[NewsItem] = []
 

@@ -17,6 +17,8 @@ from urllib.parse import urlparse, urlunparse
 from agents.config import (
     MLFLOW_ENABLED,
     MLFLOW_EXPERIMENT_NAME,
+    MLFLOW_LLM_TEXT_MAX_CHARS,
+    MLFLOW_LOG_LLM_CALLS,
     MLFLOW_TRACKING_URI,
 )
 
@@ -48,6 +50,8 @@ def mlflow_status_dict() -> dict[str, Any]:
         "enabled": MLFLOW_ENABLED,
         "experiment": MLFLOW_EXPERIMENT_NAME,
         "tracking_uri_hint": tracking_uri_public_hint() if MLFLOW_ENABLED else "",
+        "log_llm_calls": bool(MLFLOW_ENABLED and MLFLOW_LOG_LLM_CALLS),
+        "llm_text_max_chars": int(MLFLOW_LLM_TEXT_MAX_CHARS),
     }
 
 
@@ -189,6 +193,13 @@ def end_cycle_run(state: FirmState, err: Exception | None, duration_s: float) ->
         pass
 
 
+def _has_active_run(mlflow: Any) -> bool:
+    try:
+        return mlflow.active_run() is not None
+    except Exception:
+        return False
+
+
 def log_agent_step(
     agent: str,
     *,
@@ -200,13 +211,23 @@ def log_agent_step(
 ) -> None:
     """
     Log one agent step as a nested run under the active cycle run.
-    Shows up in MLflow UI as a child run you can click into to inspect artifacts.
+    If no cycle run is active (e.g. Tier-2 calls outside Tier-3), log a standalone run
+    so nothing is lost.
     """
+    # Always persist timing locally when available (independent of MLflow).
+    try:
+        if duration_s is not None:
+            from agents.tracking.agent_timing import record_agent_timing
+            record_agent_timing(agent=str(agent), duration_s=float(duration_s))
+    except Exception:
+        pass
+
     mlflow = _mlflow()
     if not mlflow:
         return
     try:
-        with mlflow.start_run(run_name=str(agent), nested=True):
+        nested = _has_active_run(mlflow)
+        with mlflow.start_run(run_name=str(agent), nested=nested):
             mlflow.set_tag("agent", str(agent))
             if tags:
                 mlflow.set_tags({str(k): str(v) for k, v in tags.items()})
@@ -224,3 +245,206 @@ def log_agent_step(
                 mlflow.log_dict(outputs, "outputs.json")
     except Exception:
         log.debug("MLflow log_agent_step failed", exc_info=True)
+
+
+# ── LLM call tracing ──────────────────────────────────────────────────────────
+
+def _messages_to_payload(messages: Any) -> list[dict[str, Any]]:
+    """Serialize LangChain message list (or plain list of dicts) to JSON-safe form."""
+    out: list[dict[str, Any]] = []
+    try:
+        for m in messages or []:
+            if isinstance(m, dict):
+                out.append({
+                    "role": str(m.get("role") or m.get("type") or "user"),
+                    "content": str(m.get("content") or ""),
+                })
+                continue
+            role = getattr(m, "type", None) or m.__class__.__name__
+            role_s = str(role).lower().replace("message", "")
+            # Map LangChain class names to OpenAI-style roles
+            role_map = {"system": "system", "human": "user", "ai": "assistant", "tool": "tool"}
+            out.append({
+                "role": role_map.get(role_s, role_s or "user"),
+                "content": str(getattr(m, "content", "") or ""),
+            })
+    except Exception:
+        return []
+    return out
+
+
+def _truncate_payload(payload: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
+    if max_chars <= 0:
+        return payload
+    out: list[dict[str, Any]] = []
+    budget = int(max_chars)
+    for m in payload:
+        c = str(m.get("content") or "")
+        if len(c) > budget:
+            m = {**m, "content": c[: max(0, budget)] + f"... [truncated {len(c) - budget} chars]"}
+            budget = 0
+        else:
+            budget -= len(c)
+        out.append(m)
+        if budget <= 0:
+            out.append({"role": "system", "content": "[further messages truncated by MLFLOW_LLM_TEXT_MAX_CHARS]"})
+            break
+    return out
+
+
+def _extract_response_text(response: Any) -> str:
+    try:
+        c = getattr(response, "content", None)
+        if isinstance(c, str):
+            if c.strip():
+                return c
+        if isinstance(c, list):
+            parts = []
+            for p in c:
+                if isinstance(p, dict):
+                    parts.append(str(p.get("text") or p.get("content") or ""))
+                else:
+                    parts.append(str(p))
+            out = "\n".join(x for x in parts if str(x).strip())
+            if out.strip():
+                return out
+    except Exception:
+        pass
+    # Some adapters stash text in additional_kwargs even when content is empty.
+    try:
+        ak = getattr(response, "additional_kwargs", None) or {}
+        if isinstance(ak, dict):
+            for k in ("text", "output_text", "reasoning", "thinking", "answer"):
+                v = ak.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v
+            msg = ak.get("message")
+            if isinstance(msg, dict):
+                v = msg.get("content") or msg.get("text")
+                if isinstance(v, str) and v.strip():
+                    return v
+    except Exception:
+        pass
+    # OpenAI-style choices in metadata
+    try:
+        meta = getattr(response, "response_metadata", None) or {}
+        if isinstance(meta, dict):
+            choices = meta.get("choices")
+            if isinstance(choices, list) and choices:
+                m = choices[0].get("message") if isinstance(choices[0], dict) else None
+                if isinstance(m, dict):
+                    v = m.get("content")
+                    if isinstance(v, str) and v.strip():
+                        return v
+    except Exception:
+        pass
+    try:
+        return str(response)
+    except Exception:
+        return ""
+
+
+def _extract_token_usage(response: Any) -> dict[str, int]:
+    usage: dict[str, int] = {}
+    try:
+        meta = getattr(response, "response_metadata", None) or {}
+        u = (meta or {}).get("token_usage") or (meta or {}).get("usage") or {}
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            v = u.get(k) if isinstance(u, dict) else None
+            if isinstance(v, (int, float)):
+                usage[k] = int(v)
+    except Exception:
+        return {}
+    try:
+        um = getattr(response, "usage_metadata", None) or {}
+        alias = {"input_tokens": "prompt_tokens", "output_tokens": "completion_tokens", "total_tokens": "total_tokens"}
+        for k, std in alias.items():
+            v = um.get(k) if isinstance(um, dict) else None
+            if isinstance(v, (int, float)) and std not in usage:
+                usage[std] = int(v)
+    except Exception:
+        pass
+    return usage
+
+
+def log_llm_call(
+    *,
+    agent_role: str | None,
+    model: str | None,
+    backend: str | None,
+    messages: Any,
+    response: Any,
+    duration_s: float,
+    error: BaseException | None = None,
+    extra_tags: dict[str, str] | None = None,
+) -> None:
+    """
+    Persist a single LLM call to MLflow as a nested run (or standalone when no parent).
+
+    Logs:
+      - params: agent, model, backend
+      - metrics: duration_s, prompt_chars, completion_chars, prompt/completion/total tokens (if provided)
+      - artifacts: prompt.json (messages), response.json, error.json (on failure)
+    """
+    if not MLFLOW_LOG_LLM_CALLS:
+        return
+    mlflow = _mlflow()
+    if not mlflow:
+        return
+    try:
+        role = str(agent_role or "unknown")
+        prompt_payload = _messages_to_payload(messages)
+        prompt_payload = _truncate_payload(prompt_payload, MLFLOW_LLM_TEXT_MAX_CHARS)
+        response_text = _extract_response_text(response) if response is not None else ""
+        if MLFLOW_LLM_TEXT_MAX_CHARS > 0 and len(response_text) > MLFLOW_LLM_TEXT_MAX_CHARS:
+            response_text = response_text[:MLFLOW_LLM_TEXT_MAX_CHARS] + "... [truncated]"
+        usage = _extract_token_usage(response) if response is not None else {}
+        nested = _has_active_run(mlflow)
+        with mlflow.start_run(run_name=f"llm:{role}", nested=nested):
+            mlflow.set_tag("kind", "llm_call")
+            mlflow.set_tag("agent", role)
+            if model:
+                mlflow.set_tag("model", str(model))
+                mlflow.log_param("model", str(model))
+            if backend:
+                mlflow.set_tag("backend", str(backend))
+                mlflow.log_param("backend", str(backend))
+            mlflow.log_param("agent", role)
+            if extra_tags:
+                try:
+                    mlflow.set_tags({str(k): str(v) for k, v in extra_tags.items()})
+                except Exception:
+                    pass
+            try:
+                mlflow.log_metric("duration_s", float(max(0.0, duration_s)))
+                prompt_chars = sum(len(str(m.get("content") or "")) for m in prompt_payload)
+                mlflow.log_metric("prompt_chars", float(prompt_chars))
+                mlflow.log_metric("completion_chars", float(len(response_text or "")))
+                for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    if k in usage:
+                        mlflow.log_metric(k, float(usage[k]))
+                mlflow.log_metric("success", 0.0 if error is not None else 1.0)
+            except Exception:
+                pass
+            try:
+                mlflow.log_dict({"messages": prompt_payload}, "prompt.json")
+            except Exception:
+                pass
+            try:
+                mlflow.log_dict(
+                    {"content": response_text, "usage": usage},
+                    "response.json",
+                )
+            except Exception:
+                pass
+            if error is not None:
+                try:
+                    mlflow.set_tag("error_type", type(error).__name__)
+                    mlflow.log_dict(
+                        {"error_type": type(error).__name__, "message": str(error)[:2000]},
+                        "error.json",
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        log.debug("MLflow log_llm_call failed", exc_info=True)

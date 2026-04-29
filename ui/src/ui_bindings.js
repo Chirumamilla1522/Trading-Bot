@@ -167,6 +167,8 @@ export const LEGACY_IDS = {
   "chart-range-group": "atlas-chart-range-group",
   "col-centre-scroll": "atlas-col-centre-scroll",
   "llm-backend-badge": "atlas-llm-backend-badge",
+  "token-badge": "atlas-token-badge",
+  "latency-badge": "atlas-latency-badge",
   "news-impact-strip": "atlas-news-impact-strip",
   "news-exposure-btn": "atlas-news-exposure-btn",
   "news-modal-badges": "atlas-news-modal-badges",

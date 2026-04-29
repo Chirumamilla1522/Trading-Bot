@@ -29,6 +29,9 @@
       <input id="atlas-gobar" type="text" placeholder="Search symbol…" autocomplete="off" spellcheck="false" enterkeyhint="search"/>
     </div>
 
+    <!-- Small-universe ticker strip (replaces left scanner for daily use) -->
+    <nav id="atlas-top-tickers" class="atlas-top-tickers" aria-label="Tickers"></nav>
+
     <!-- Active ticker price block -->
     <div id="atlas-price-pill">
       <span id="atlas-pp-ticker">SPY</span>
@@ -49,6 +52,10 @@
         <span id="atlas-ws-indicator" class="topbar-badge ws-indicator ws-poll" title="Data feed status">● POLL</span>
 
         <span id="atlas-llm-backend-badge" class="topbar-badge llm-badge-unknown" title="LLM backend">LLM: --</span>
+
+        <span id="atlas-token-badge" class="topbar-badge badge-neutral" title="LLM tokens (30d window)">TOK: --</span>
+
+        <span id="atlas-latency-badge" class="topbar-badge badge-neutral" title="Agent step timings (30d window)">LAT: --</span>
 
         <span id="atlas-cb-badge" class="topbar-badge badge-ok">CIRCUIT OK</span>
       </div>
@@ -135,35 +142,214 @@
     <!-- ═══ Left (small) — Scanner ════════════════════════════════════════ -->
     <section id="atlas-col-left">
       <div id="atlas-col-left-scroll">
-        <div class="panel-header">
-          <span>Scanner</span>
-          <span id="atlas-scanner-count" class="col-header-sub">0 / 0</span>
+        <!-- Left: plot/graph → fundamentals → data dashboard (vertical stack) -->
+        <div class="atlas-left-stack">
+          <!-- Chart section -->
+          <div id="atlas-underlying-chart-section">
+              <div class="chart-price-header">
+                <span class="chart-ticker-name" id="atlas-chart-ticker-label">SPY</span>
+                <span class="chart-last-price"  id="atlas-sd-last">—</span>
+                <span class="chart-chg-badge"   id="atlas-sd-chg1">—</span>
+                <span class="chart-chg-pct"     id="atlas-sd-chgper">—</span>
+                <span class="chart-hl-meta"     id="atlas-sd-hl">—</span>
+                <span class="chart-vol-meta"    id="atlas-sd-vol">—</span>
+                <span id="atlas-ticker-chart-source"  class="chart-src-badge">—</span>
+                <button id="atlas-l2-toggle-btn" class="header-action-btn" title="Show or hide L2/L3 depth &amp; tape below the chart">L2/L3</button>
+                <!-- hidden selects for JS compatibility -->
+                <select id="atlas-ticker-chart-style" class="chart-style-hidden">
+                  <option value="candles" selected>Candles</option>
+                  <option value="line">Line</option>
+                  <option value="area">Area</option>
+                </select>
+                <select id="atlas-ticker-chart-tf" class="chart-style-hidden">
+                  <option value="5D" selected>5D</option>
+                  <option value="1M">1M</option><option value="3M">3M</option>
+                  <option value="6M">6M</option><option value="1Y">1Y</option>
+                  <option value="2Y">2Y</option><option value="5Y">5Y</option><option value="MAX">MAX</option>
+                  <option value="1D">1D</option><option value="1Day">1Day</option>
+                  <option value="1Hour">1H</option><option value="15Min">15m</option>
+                  <option value="5Min">5m</option><option value="1Min">1m</option>
+                </select>
+              </div>
+
+              <div class="chart-wrap chart-wrap-underlying">
+                <div id="atlas-ticker-chart-crosshair" class="chart-crosshair-hint" aria-live="polite"></div>
+                <div id="atlas-ticker-chart" class="chart-inner"></div>
+              </div>
+
+              <div class="chart-tf-strip chart-tf-strip--compact">
+                <span class="chart-strip-label">RANGE</span>
+                <div class="chart-tf-group" id="atlas-chart-range-group">
+                  <button class="chart-range-btn" data-range="1D">1D</button>
+                  <button class="chart-range-btn active" data-range="5D">5D</button>
+                  <button class="chart-range-btn" data-range="1M">1M</button>
+                  <button class="chart-range-btn" data-range="3M">3M</button>
+                  <button class="chart-range-btn" data-range="6M">6M</button>
+                  <button class="chart-range-btn" data-range="1Y">1Y</button>
+                  <button class="chart-range-btn" data-range="2Y">2Y</button>
+                  <button class="chart-range-btn" data-range="5Y">5Y</button>
+                  <button class="chart-range-btn" data-range="MAX" title="Daily candles — full Yahoo history (trimmed)">MAX</button>
+                </div>
+                <span id="atlas-ticker-chart-bar-size" class="chart-bar-size-meta"></span>
+                <div class="chart-settings-wrap">
+                  <button type="button" id="atlas-chart-settings-btn" class="chart-settings-btn" aria-expanded="false" aria-haspopup="dialog" aria-controls="atlas-chart-settings-popover" title="Chart interval and type">⚙</button>
+                  <div id="atlas-chart-settings-popover" class="chart-settings-popover" role="dialog" aria-label="Chart settings" hidden>
+                    <div class="chart-settings-section">
+                      <span class="chart-settings-heading">Bar interval</span>
+                      <div class="chart-tf-group chart-tf-group--popover" id="atlas-chart-interval-group">
+                        <button type="button" class="chart-interval-btn" data-interval="1m">1m</button>
+                        <button type="button" class="chart-interval-btn" data-interval="5m">5m</button>
+                        <button type="button" class="chart-interval-btn" data-interval="15m">15m</button>
+                        <button type="button" class="chart-interval-btn active" data-interval="1H">1H</button>
+                        <button type="button" class="chart-interval-btn" data-interval="1D">1D</button>
+                      </div>
+                    </div>
+                    <div class="chart-settings-section">
+                      <span class="chart-settings-heading">Chart type</span>
+                      <div class="chart-style-group chart-style-group--popover">
+                        <button type="button" class="chart-style-btn chart-style-active" data-style="candles">Candles</button>
+                        <button type="button" class="chart-style-btn" data-style="line">Line</button>
+                        <button type="button" class="chart-style-btn" data-style="area">Area</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- L2/L3: below the chart (hidden until you tap L2/L3 — does not cover the price plot) -->
+              <div id="atlas-l2-market-panel" class="atlas-l2-market-panel" hidden>
+                <div class="atlas-l2-market-panel__head">
+                  <span class="atlas-l2-market-panel__title">Live market · L2 / L3</span>
+                  <button type="button" id="atlas-l2-panel-close" class="header-action-btn" title="Hide L2/L3">✕</button>
+                </div>
+                <div class="trading-viz-host atlas-l2-market-panel__body" id="atlas-trading-viz-host">
+                  <div id="atlas-trading-viz-root"></div>
+                </div>
+              </div>
         </div>
-        <div id="atlas-scanner-controls">
-          <input id="atlas-scanner-filter" type="text" placeholder="Filter…" autocomplete="off" />
-          <select id="atlas-scanner-sort">
-            <option value="iv">IV ↓</option>
-            <option value="chg">Day % ↓</option>
-            <option value="price">Price ↓</option>
-            <option value="pc">P/C ↓</option>
-            <option value="oi">OI ↓</option>
-            <option value="ticker">A–Z</option>
-          </select>
+
+        <div id="atlas-stock-info-panel" class="stock-info-panel">
+          <div class="si-tabs" role="tablist" aria-label="Company info">
+            <button type="button" class="si-tab si-tab-active" data-tab="fundamentals" role="tab" aria-selected="true">Fundamentals</button>
+            <button type="button" class="si-tab" data-tab="peers" role="tab" aria-selected="false">Peers</button>
+            <button type="button" class="si-tab" data-tab="ecosystem" role="tab" aria-selected="false">Ecosystem</button>
+          </div>
+          <div id="atlas-si-fundamentals" class="si-section si-section-active">
+            <div class="si-name-row">
+              <span id="atlas-si-name" class="si-name">—</span>
+              <span id="atlas-si-sector" class="si-sector-badge">—</span>
+            </div>
+            <div class="si-rh-list" role="list">
+              <div class="si-rh-row si-rh-row--emph" role="listitem"><span class="si-lab">Market cap</span><span id="atlas-si-mktcap" class="si-val">—</span></div>
+              <div class="si-rh-row si-rh-row--emph" role="listitem"><span class="si-lab">P/E ratio</span><span id="atlas-si-pe" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">Forward P/E</span><span id="atlas-si-fpe" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">PEG</span><span id="atlas-si-peg" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">EPS (TTM)</span><span id="atlas-si-eps" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">Revenue</span><span id="atlas-si-rev" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">Gross margin</span><span id="atlas-si-gm" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">Net margin</span><span id="atlas-si-nm" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">Beta</span><span id="atlas-si-beta" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">Dividend yield</span><span id="atlas-si-div" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">52-week high</span><span id="atlas-si-52h" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">52-week low</span><span id="atlas-si-52l" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">Return on equity</span><span id="atlas-si-roe" class="si-val">—</span></div>
+              <div class="si-rh-row" role="listitem"><span class="si-lab">Analyst rating</span><span id="atlas-si-rec" class="si-val">—</span></div>
+            </div>
+            <div id="atlas-si-desc" class="si-desc">—</div>
+          </div>
+          <div id="atlas-si-peers" class="si-section">
+            <div class="si-subsection-label">COMPETITORS</div>
+            <div id="atlas-si-competitors" class="si-chips"></div>
+            <div class="si-subsection-label mt4">SIMILAR</div>
+            <div id="atlas-si-similar" class="si-chips"></div>
+          </div>
+          <div id="atlas-si-ecosystem" class="si-section">
+            <div class="si-subsection-label">UPSTREAM SUPPLIERS</div>
+            <div id="atlas-si-depends-on" class="si-chips si-chips-upstream"></div>
+            <div class="si-subsection-label mt4">KEY CUSTOMERS</div>
+            <div id="atlas-si-depended-by" class="si-chips si-chips-downstream"></div>
+          </div>
         </div>
-        <div id="atlas-scanner-table-wrap">
-          <table class="data-table scanner-table" id="atlas-scanner-table">
-            <thead><tr>
-              <th>TICKER</th>
-              <th title="Last trade">LAST</th>
-              <th title="Day change">CHG</th>
-              <th title="30d implied vol">IV</th>
-              <th title="Put/Call ratio">P/C</th>
-              <th title="Contracts">CTRS</th>
-            </tr></thead>
-            <tbody id="atlas-scanner-body">
-              <tr><td colspan="6" class="empty-row">Scanning…</td></tr>
-            </tbody>
-          </table>
+
+        <!-- Data dashboard stays here (same IDs) -->
+        <div class="atlas-panel atlas-panel--left">
+          <div class="panel-header collapsible collapsed" id="ph-dashboard" data-target="dashboard-body">
+            <span>DATA DASHBOARD</span>
+            <span id="dash-stats" class="panel-header-sub">—</span>
+            <span class="ph-arrow">▾</span>
+          </div>
+          <div class="collapsible-body collapsed" id="dashboard-body">
+            <div class="dash-tabs" id="dash-tabs" style="display:flex;gap:6px;align-items:center;margin:8px 0 10px;">
+              <button type="button" class="mini-btn dash-tab dash-tab-active" data-tab="queue">Queue</button>
+              <button type="button" class="mini-btn dash-tab" data-tab="processed">Processed</button>
+              <button type="button" class="mini-btn dash-tab" data-tab="impacts">Impacts</button>
+              <button type="button" class="mini-btn dash-tab" data-tab="db">DB</button>
+              <span style="margin-left:auto;display:flex;gap:6px;align-items:center;">
+                <input id="dash-filter" type="text" placeholder="Filter…" class="mini-input" style="width:160px;" />
+                <button type="button" id="dash-refresh" class="mini-btn" title="Refresh dashboard tables">Refresh</button>
+              </span>
+            </div>
+
+            <div class="dash-pane" id="dash-pane-queue">
+              <div class="table-scroll" style="max-height:260px">
+                <table class="data-table">
+                  <thead><tr>
+                    <th>PRI</th><th>URG</th><th>IMPACT</th><th>SENT</th><th>CONF</th><th>AGE</th><th>HEADLINE</th><th>SEEN</th>
+                  </tr></thead>
+                  <tbody id="dash-queue-body"><tr><td colspan="8" class="empty-row">Loading queue…</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="dash-pane" id="dash-pane-processed" style="display:none">
+              <div class="table-scroll" style="max-height:260px">
+                <table class="data-table">
+                  <thead><tr>
+                    <th>TIME</th><th>TICKERS</th><th>CAT</th><th>IMP</th><th>SENT</th><th>CONF</th><th>HEADLINE</th>
+                  </tr></thead>
+                  <tbody id="dash-processed-body"><tr><td colspan="7" class="empty-row">Loading processed…</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="dash-pane" id="dash-pane-impacts" style="display:none">
+              <div class="table-scroll" style="max-height:260px">
+                <table class="data-table">
+                  <thead><tr>
+                    <th>TICKER</th><th>TOTAL</th><th>ART</th><th>RELATIONSHIPS</th>
+                  </tr></thead>
+                  <tbody id="dash-impacts-body"><tr><td colspan="4" class="empty-row">Loading impacts…</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="dash-pane" id="dash-pane-db" style="display:none">
+              <div style="display:flex;gap:8px;align-items:center;margin:6px 0 10px;flex-wrap:wrap;">
+                <label class="atlas-news-sort-wrap" for="db-source">SOURCE</label>
+                <select id="db-source" class="atlas-mini-select" title="Database source"></select>
+                <label class="atlas-news-sort-wrap" for="db-table">TABLE</label>
+                <select id="db-table" class="atlas-mini-select" title="Table"></select>
+                <button type="button" id="db-load" class="mini-btn" title="Load table schema + rows">Load</button>
+                <span id="db-meta" class="panel-header-sub" style="margin-left:auto;">—</span>
+              </div>
+
+              <div class="table-scroll" style="max-height:180px;margin-bottom:10px;">
+                <table class="data-table">
+                  <thead><tr>
+                    <th>COLUMN</th><th>TYPE</th><th>PK</th><th>NN</th><th>DEFAULT</th><th>FK →</th>
+                  </tr></thead>
+                  <tbody id="db-schema-body"><tr><td colspan="6" class="empty-row">Select a source and table…</td></tr></tbody>
+                </table>
+              </div>
+
+              <div class="table-scroll" style="max-height:260px">
+                <table class="data-table">
+                  <thead id="db-rows-head"></thead>
+                  <tbody id="db-rows-body"><tr><td colspan="6" class="empty-row">Load a table to preview rows…</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -172,139 +358,7 @@
     <section id="atlas-col-centre">
       <div id="atlas-col-centre-scroll">
 
-      <!-- Middle top: plots + fundamentals + options -->
-      <div class="atlas-mid-top">
-        <div class="atlas-mid-top-left">
-      <!-- Chart section -->
-      <div id="atlas-underlying-chart-section">
-        <div class="chart-price-header">
-          <span class="chart-ticker-name" id="atlas-chart-ticker-label">SPY</span>
-          <span class="chart-last-price"  id="atlas-sd-last">—</span>
-          <span class="chart-chg-badge"   id="atlas-sd-chg1">—</span>
-          <span class="chart-chg-pct"     id="atlas-sd-chgper">—</span>
-          <span class="chart-hl-meta"     id="atlas-sd-hl">—</span>
-          <span class="chart-vol-meta"    id="atlas-sd-vol">—</span>
-          <span id="atlas-ticker-chart-source"  class="chart-src-badge">—</span>
-          <button id="atlas-l2-toggle-btn" class="header-action-btn" title="Show or hide L2/L3 depth &amp; tape below the chart">L2/L3</button>
-          <!-- hidden selects for JS compatibility -->
-          <select id="atlas-ticker-chart-style" class="chart-style-hidden">
-            <option value="candles" selected>Candles</option>
-            <option value="line">Line</option>
-            <option value="area">Area</option>
-          </select>
-          <select id="atlas-ticker-chart-tf" class="chart-style-hidden">
-            <option value="5D" selected>5D</option>
-            <option value="1M">1M</option><option value="3M">3M</option>
-            <option value="6M">6M</option><option value="1Y">1Y</option>
-            <option value="2Y">2Y</option><option value="5Y">5Y</option><option value="MAX">MAX</option>
-            <option value="1D">1D</option><option value="1Day">1Day</option>
-            <option value="1Hour">1H</option><option value="15Min">15m</option>
-            <option value="5Min">5m</option><option value="1Min">1m</option>
-          </select>
-        </div>
-
-        <div class="chart-wrap chart-wrap-underlying">
-          <div id="atlas-ticker-chart-crosshair" class="chart-crosshair-hint" aria-live="polite"></div>
-          <div id="atlas-ticker-chart" class="chart-inner"></div>
-        </div>
-
-        <div class="chart-tf-strip chart-tf-strip--compact">
-          <span class="chart-strip-label">RANGE</span>
-          <div class="chart-tf-group" id="atlas-chart-range-group">
-            <button class="chart-range-btn" data-range="1D">1D</button>
-            <button class="chart-range-btn active" data-range="5D">5D</button>
-            <button class="chart-range-btn" data-range="1M">1M</button>
-            <button class="chart-range-btn" data-range="3M">3M</button>
-            <button class="chart-range-btn" data-range="6M">6M</button>
-            <button class="chart-range-btn" data-range="1Y">1Y</button>
-            <button class="chart-range-btn" data-range="2Y">2Y</button>
-            <button class="chart-range-btn" data-range="5Y">5Y</button>
-            <button class="chart-range-btn" data-range="MAX" title="Daily candles — full Yahoo history (trimmed)">MAX</button>
-          </div>
-          <span id="atlas-ticker-chart-bar-size" class="chart-bar-size-meta"></span>
-          <div class="chart-settings-wrap">
-            <button type="button" id="atlas-chart-settings-btn" class="chart-settings-btn" aria-expanded="false" aria-haspopup="dialog" aria-controls="atlas-chart-settings-popover" title="Chart interval and type">⚙</button>
-            <div id="atlas-chart-settings-popover" class="chart-settings-popover" role="dialog" aria-label="Chart settings" hidden>
-              <div class="chart-settings-section">
-                <span class="chart-settings-heading">Bar interval</span>
-                <div class="chart-tf-group chart-tf-group--popover" id="atlas-chart-interval-group">
-                  <button type="button" class="chart-interval-btn" data-interval="1m">1m</button>
-                  <button type="button" class="chart-interval-btn" data-interval="5m">5m</button>
-                  <button type="button" class="chart-interval-btn" data-interval="15m">15m</button>
-                  <button type="button" class="chart-interval-btn active" data-interval="1H">1H</button>
-                  <button type="button" class="chart-interval-btn" data-interval="1D">1D</button>
-                </div>
-              </div>
-              <div class="chart-settings-section">
-                <span class="chart-settings-heading">Chart type</span>
-                <div class="chart-style-group chart-style-group--popover">
-                  <button type="button" class="chart-style-btn chart-style-active" data-style="candles">Candles</button>
-                  <button type="button" class="chart-style-btn" data-style="line">Line</button>
-                  <button type="button" class="chart-style-btn" data-style="area">Area</button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- L2/L3: below the chart (hidden until you tap L2/L3 — does not cover the price plot) -->
-        <div id="atlas-l2-market-panel" class="atlas-l2-market-panel" hidden>
-          <div class="atlas-l2-market-panel__head">
-            <span class="atlas-l2-market-panel__title">Live market · L2 / L3</span>
-            <button type="button" id="atlas-l2-panel-close" class="header-action-btn" title="Hide L2/L3">✕</button>
-          </div>
-          <div class="trading-viz-host atlas-l2-market-panel__body" id="atlas-trading-viz-host">
-            <div id="atlas-trading-viz-root"></div>
-          </div>
-        </div>
-      </div>
-
-        </div>
-        <div class="atlas-mid-top-right">
-          <div id="atlas-stock-info-panel" class="stock-info-panel">
-            <div class="si-tabs" role="tablist" aria-label="Company info">
-              <button type="button" class="si-tab si-tab-active" data-tab="fundamentals" role="tab" aria-selected="true">Fundamentals</button>
-              <button type="button" class="si-tab" data-tab="peers" role="tab" aria-selected="false">Peers</button>
-              <button type="button" class="si-tab" data-tab="ecosystem" role="tab" aria-selected="false">Ecosystem</button>
-            </div>
-            <div id="atlas-si-fundamentals" class="si-section si-section-active">
-              <div class="si-name-row">
-                <span id="atlas-si-name" class="si-name">—</span>
-                <span id="atlas-si-sector" class="si-sector-badge">—</span>
-              </div>
-              <div class="si-rh-list" role="list">
-                <div class="si-rh-row si-rh-row--emph" role="listitem"><span class="si-lab">Market cap</span><span id="atlas-si-mktcap" class="si-val">—</span></div>
-                <div class="si-rh-row si-rh-row--emph" role="listitem"><span class="si-lab">P/E ratio</span><span id="atlas-si-pe" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">Forward P/E</span><span id="atlas-si-fpe" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">PEG</span><span id="atlas-si-peg" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">EPS (TTM)</span><span id="atlas-si-eps" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">Revenue</span><span id="atlas-si-rev" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">Gross margin</span><span id="atlas-si-gm" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">Net margin</span><span id="atlas-si-nm" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">Beta</span><span id="atlas-si-beta" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">Dividend yield</span><span id="atlas-si-div" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">52-week high</span><span id="atlas-si-52h" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">52-week low</span><span id="atlas-si-52l" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">Return on equity</span><span id="atlas-si-roe" class="si-val">—</span></div>
-                <div class="si-rh-row" role="listitem"><span class="si-lab">Analyst rating</span><span id="atlas-si-rec" class="si-val">—</span></div>
-              </div>
-              <div id="atlas-si-desc" class="si-desc">—</div>
-            </div>
-            <div id="atlas-si-peers" class="si-section">
-              <div class="si-subsection-label">COMPETITORS</div>
-              <div id="atlas-si-competitors" class="si-chips"></div>
-              <div class="si-subsection-label mt4">SIMILAR</div>
-              <div id="atlas-si-similar" class="si-chips"></div>
-            </div>
-            <div id="atlas-si-ecosystem" class="si-section">
-              <div class="si-subsection-label">UPSTREAM SUPPLIERS</div>
-              <div id="atlas-si-depends-on" class="si-chips si-chips-upstream"></div>
-              <div class="si-subsection-label mt4">KEY CUSTOMERS</div>
-              <div id="atlas-si-depended-by" class="si-chips si-chips-downstream"></div>
-            </div>
-          </div>
-        </div>
-      </div>
+      <!-- Plots + fundamentals moved to left column -->
 
       <!-- Quote + options: single block so flex layout never collapses it under news/agents -->
       <div class="atlas-centre-chain-block">
@@ -365,9 +419,9 @@
       </div>
       </div><!-- /.atlas-centre-chain-block -->
 
-      <!-- Middle bottom: News + Agents -->
-      <div class="atlas-mid-bottom">
-        <div class="atlas-panel">
+      <!-- Centre column: Options → News → AI agents (vertical stack) -->
+      <div class="atlas-centre-stack">
+        <div class="atlas-panel atlas-panel--news">
           <div class="panel-header collapsible" data-target="atlas-news-tape">
             <span>NEWS FEED</span>
             <span id="atlas-news-feed-status" class="news-feed-badge">●</span>
@@ -385,90 +439,6 @@
           </div>
           <div id="atlas-news-impact-strip" class="news-impact-strip"></div>
           <div id="atlas-news-tape" class="collapsible-body"></div>
-        </div>
-
-        <div class="atlas-panel">
-          <div class="panel-header collapsible collapsed" id="ph-dashboard" data-target="dashboard-body">
-            <span>DATA DASHBOARD</span>
-            <span id="dash-stats" class="panel-header-sub">—</span>
-            <span class="ph-arrow">▾</span>
-          </div>
-          <div class="collapsible-body collapsed" id="dashboard-body">
-            <div class="dash-tabs" id="dash-tabs" style="display:flex;gap:6px;align-items:center;margin:8px 0 10px;">
-              <button type="button" class="mini-btn dash-tab dash-tab-active" data-tab="queue">Queue</button>
-              <button type="button" class="mini-btn dash-tab" data-tab="processed">Processed</button>
-              <button type="button" class="mini-btn dash-tab" data-tab="impacts">Impacts</button>
-              <button type="button" class="mini-btn dash-tab" data-tab="db">DB</button>
-              <span style="margin-left:auto;display:flex;gap:6px;align-items:center;">
-                <input id="dash-filter" type="text" placeholder="Filter…" class="mini-input" style="width:160px;" />
-                <button type="button" id="dash-refresh" class="mini-btn" title="Refresh dashboard tables">Refresh</button>
-              </span>
-            </div>
-
-            <!-- Queue -->
-            <div class="dash-pane" id="dash-pane-queue">
-              <div class="table-scroll" style="max-height:260px">
-                <table class="data-table">
-                  <thead><tr>
-                    <th>PRI</th><th>URG</th><th>IMPACT</th><th>SENT</th><th>CONF</th><th>AGE</th><th>HEADLINE</th><th>SEEN</th>
-                  </tr></thead>
-                  <tbody id="dash-queue-body"><tr><td colspan="8" class="empty-row">Loading queue…</td></tr></tbody>
-                </table>
-              </div>
-            </div>
-
-            <!-- Processed -->
-            <div class="dash-pane" id="dash-pane-processed" style="display:none">
-              <div class="table-scroll" style="max-height:260px">
-                <table class="data-table">
-                  <thead><tr>
-                    <th>TIME</th><th>TICKERS</th><th>CAT</th><th>IMP</th><th>SENT</th><th>CONF</th><th>HEADLINE</th>
-                  </tr></thead>
-                  <tbody id="dash-processed-body"><tr><td colspan="7" class="empty-row">Loading processed…</td></tr></tbody>
-                </table>
-              </div>
-            </div>
-
-            <!-- Impacts -->
-            <div class="dash-pane" id="dash-pane-impacts" style="display:none">
-              <div class="table-scroll" style="max-height:260px">
-                <table class="data-table">
-                  <thead><tr>
-                    <th>TICKER</th><th>TOTAL</th><th>ART</th><th>RELATIONSHIPS</th>
-                  </tr></thead>
-                  <tbody id="dash-impacts-body"><tr><td colspan="4" class="empty-row">Loading impacts…</td></tr></tbody>
-                </table>
-              </div>
-            </div>
-
-            <!-- DB Explorer -->
-            <div class="dash-pane" id="dash-pane-db" style="display:none">
-              <div style="display:flex;gap:8px;align-items:center;margin:6px 0 10px;flex-wrap:wrap;">
-                <label class="atlas-news-sort-wrap" for="db-source">SOURCE</label>
-                <select id="db-source" class="atlas-mini-select" title="Database source"></select>
-                <label class="atlas-news-sort-wrap" for="db-table">TABLE</label>
-                <select id="db-table" class="atlas-mini-select" title="Table"></select>
-                <button type="button" id="db-load" class="mini-btn" title="Load table schema + rows">Load</button>
-                <span id="db-meta" class="panel-header-sub" style="margin-left:auto;">—</span>
-              </div>
-
-              <div class="table-scroll" style="max-height:180px;margin-bottom:10px;">
-                <table class="data-table">
-                  <thead><tr>
-                    <th>COLUMN</th><th>TYPE</th><th>PK</th><th>NN</th><th>DEFAULT</th><th>FK →</th>
-                  </tr></thead>
-                  <tbody id="db-schema-body"><tr><td colspan="6" class="empty-row">Select a source and table…</td></tr></tbody>
-                </table>
-              </div>
-
-              <div class="table-scroll" style="max-height:260px">
-                <table class="data-table">
-                  <thead id="db-rows-head"></thead>
-                  <tbody id="db-rows-body"><tr><td colspan="6" class="empty-row">Load a table to preview rows…</td></tr></tbody>
-                </table>
-              </div>
-            </div>
-          </div>
         </div>
 
         <div class="atlas-panel atlas-panel--agents">
@@ -510,46 +480,6 @@
       <!-- Scrollable right area -->
       <div id="atlas-col-right-scroll">
 
-        <!-- Account strip (moved right) -->
-        <div id="atlas-account-strip" class="account-strip">
-          <div class="metric-card">
-            <div class="metric-label">CASH</div>
-            <div class="metric-value" id="atlas-acct-cash">—</div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">BUYING POWER</div>
-            <div class="metric-value" id="atlas-acct-bp">—</div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">EQUITY</div>
-            <div class="metric-value" id="atlas-acct-equity">—</div>
-          </div>
-        </div>
-
-        <!-- P&L strip -->
-        <div id="atlas-pnl-strip">
-          <div class="metric-card pnl-card" id="atlas-card-daily-pnl">
-            <div class="metric-label">DAILY P&amp;L <span class="metric-trend" id="atlas-trend-daily-pnl"></span></div>
-            <div class="metric-value" id="atlas-daily-pnl">$0.00</div>
-          </div>
-          <div class="metric-card pnl-card" id="atlas-card-port-delta">
-            <div class="metric-label">Δ PORTFOLIO <span class="metric-trend" id="atlas-trend-port-delta"></span></div>
-            <div class="metric-value" id="atlas-port-delta">0.000</div>
-          </div>
-          <div class="metric-card pnl-card" id="atlas-card-port-vega">
-            <div class="metric-label">V PORTFOLIO <span class="metric-trend" id="atlas-trend-port-vega"></span></div>
-            <div class="metric-value" id="atlas-port-vega">0.00</div>
-          </div>
-          <div class="metric-card pnl-card" id="atlas-card-drawdown">
-            <div class="metric-label">DRAWDOWN <span class="metric-trend" id="atlas-trend-drawdown"></span></div>
-            <div class="metric-value" id="atlas-drawdown">0.00%</div>
-          </div>
-          <div class="metric-card pnl-card" id="atlas-card-sentiment">
-            <div class="metric-label">SENTIMENT <span class="metric-trend" id="atlas-trend-sentiment"></span></div>
-            <div class="metric-value" id="atlas-sentiment">0.00</div>
-          </div>
-        </div>
-
         <!-- Agent Recommendations (moved to right) -->
         <div class="panel-header" id="atlas-ph-recommendations">
           <span>RECOMMENDATIONS</span>
@@ -578,7 +508,7 @@
           </div>
         </div>
 
-        <!-- Buy/Sell (order ticket) below account data -->
+        <!-- Orders -->
         <div id="atlas-order-ticket" class="order-ticket">
           <div class="ot-header">
             ORDER TICKET
@@ -634,25 +564,6 @@
               <span class="ot-opt-hint"></span>
             </div>
             <div class="ot-fields">
-              <div class="ot-field">
-                <label class="ot-lab" for="ot-rights">WORK ON</label>
-                <select id="atlas-ot-rights" class="ot-select" title="Restrict new strategy proposals to CALLs, PUTs, or BOTH">
-                  <option value="BOTH" selected>BOTH</option>
-                  <option value="CALL">CALLS</option>
-                  <option value="PUT">PUTS</option>
-                </select>
-              </div>
-              <div class="ot-field ot-field-wide">
-                <label class="ot-lab" for="ot-structures">STRATEGY TYPES</label>
-                <select id="atlas-ot-structures" class="ot-select" multiple size="4"
-                  title="Select which option strategy structures agents may propose (hold Cmd to multi-select on macOS)">
-                  <option value="ALL">ALL</option>
-                  <option value="SINGLE" selected>SINGLE (1‑leg)</option>
-                  <option value="VERTICAL">VERTICAL (2‑leg spread)</option>
-                  <option value="IRON_CONDOR">IRON CONDOR (4‑leg)</option>
-                  <option value="CALENDAR">CALENDAR (same strike, diff expiry)</option>
-                </select>
-              </div>
               <div class="ot-field ot-field-wide">
                 <label class="ot-lab" for="ot-o-symbol">SYMBOL</label>
                 <input id="atlas-ot-o-symbol" class="ot-input ot-mono" readonly placeholder="select from chain"/>
@@ -689,6 +600,46 @@
             </div>
             <div id="atlas-ot-o-status" class="ot-status"></div>
             <button id="atlas-ot-o-submit" class="ot-submit ot-submit-buy">PLACE BUY ORDER</button>
+          </div>
+        </div>
+
+        <!-- Account strip -->
+        <div id="atlas-account-strip" class="account-strip">
+          <div class="metric-card">
+            <div class="metric-label">CASH</div>
+            <div class="metric-value" id="atlas-acct-cash">—</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">BUYING POWER</div>
+            <div class="metric-value" id="atlas-acct-bp">—</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">EQUITY</div>
+            <div class="metric-value" id="atlas-acct-equity">—</div>
+          </div>
+        </div>
+
+        <!-- P&L strip -->
+        <div id="atlas-pnl-strip">
+          <div class="metric-card pnl-card" id="atlas-card-daily-pnl">
+            <div class="metric-label">DAILY P&amp;L <span class="metric-trend" id="atlas-trend-daily-pnl"></span></div>
+            <div class="metric-value" id="atlas-daily-pnl">$0.00</div>
+          </div>
+          <div class="metric-card pnl-card" id="atlas-card-port-delta">
+            <div class="metric-label">Δ PORTFOLIO <span class="metric-trend" id="atlas-trend-port-delta"></span></div>
+            <div class="metric-value" id="atlas-port-delta">0.000</div>
+          </div>
+          <div class="metric-card pnl-card" id="atlas-card-port-vega">
+            <div class="metric-label">V PORTFOLIO <span class="metric-trend" id="atlas-trend-port-vega"></span></div>
+            <div class="metric-value" id="atlas-port-vega">0.00</div>
+          </div>
+          <div class="metric-card pnl-card" id="atlas-card-drawdown">
+            <div class="metric-label">DRAWDOWN <span class="metric-trend" id="atlas-trend-drawdown"></span></div>
+            <div class="metric-value" id="atlas-drawdown">0.00%</div>
+          </div>
+          <div class="metric-card pnl-card" id="atlas-card-sentiment">
+            <div class="metric-label">SENTIMENT <span class="metric-trend" id="atlas-trend-sentiment"></span></div>
+            <div class="metric-value" id="atlas-sentiment">0.00</div>
           </div>
         </div>
 
@@ -835,24 +786,26 @@
           </p>
 
           <div class="agent-flow-pipeline" aria-label="Tier 3 LangGraph order">
-            <div class="agent-flow-node" data-step="1"><span class="agent-flow-node-name">ingest_data</span><span class="agent-flow-node-hint">features + IV analytics</span></div>
+            <div class="agent-flow-node" data-step="1"><span class="agent-flow-node-name">ingest_data</span><span class="agent-flow-node-hint">features + technical context + IV analytics</span></div>
             <div class="agent-flow-branch">
               uses <strong>NewsPriorityQueue</strong> (FinBERT-ranked) + Tier-2 digests · sets desk timing/bias
             </div>
             <div class="agent-flow-branch">or if gated → <strong>early_abort</strong> → xai_log</div>
             <div class="agent-flow-arrow" aria-hidden="true">↓</div>
-            <div class="agent-flow-node"><span class="agent-flow-node-name">options_specialist</span><span class="agent-flow-node-hint">vol structure</span></div>
+            <div class="agent-flow-node"><span class="agent-flow-node-name">parallel_analysis</span><span class="agent-flow-node-hint">stock + options + sentiment (concurrent)</span></div>
+            <div class="agent-flow-branch">
+              runs <strong>stock_specialist</strong> + <strong>options_specialist</strong> + <strong>sentiment_analyst</strong> at the same time
+            </div>
             <div class="agent-flow-arrow" aria-hidden="true">↓</div>
-            <div class="agent-flow-node"><span class="agent-flow-node-name">sentiment_analyst</span><span class="agent-flow-node-hint">Top-K headlines + monitor prior</span></div>
-            <div class="agent-flow-arrow" aria-hidden="true">↓</div>
-            <div class="agent-flow-node"><span class="agent-flow-node-name">bull_researcher</span><span class="agent-flow-node-hint">bull case</span></div>
-            <div class="agent-flow-arrow" aria-hidden="true">↓</div>
-            <div class="agent-flow-node"><span class="agent-flow-node-name">bear_researcher</span><span class="agent-flow-node-hint">bear case</span></div>
+            <div class="agent-flow-node"><span class="agent-flow-node-name">parallel_research</span><span class="agent-flow-node-hint">bull + bear (concurrent)</span></div>
+            <div class="agent-flow-branch">
+              runs <strong>bull_researcher</strong> + <strong>bear_researcher</strong> at the same time
+            </div>
             <div class="agent-flow-arrow" aria-hidden="true">↓</div>
             <div class="agent-flow-node"><span class="agent-flow-node-name">strategist</span><span class="agent-flow-node-hint">synthesis</span></div>
             <div class="agent-flow-arrow" aria-hidden="true">↓</div>
             <div class="agent-flow-node"><span class="agent-flow-node-name">risk_manager</span><span class="agent-flow-node-hint">limits</span></div>
-            <div class="agent-flow-branch">optional <strong>adversarial_debate</strong> (if enabled + proposal)</div>
+            <div class="agent-flow-branch">optional <strong>adversarial_debate</strong> (AUTOPILOT only; skipped in ADVISORY)</div>
             <div class="agent-flow-arrow" aria-hidden="true">↓</div>
             <div class="agent-flow-node"><span class="agent-flow-node-name">desk_head</span><span class="agent-flow-node-hint">desk decision</span></div>
             <div class="agent-flow-branch"><strong>autopilot</strong> → trader · <strong>advisory</strong> → recommend · else → xai_log</div>
@@ -877,6 +830,17 @@
         <button class="news-modal-close" id="atlas-agent-log-close">✕</button>
       </div>
       <div id="atlas-reasoning-panel"></div>
+    </div>
+  </div>
+
+  <!-- Metrics modal (TOK / LAT details) -->
+  <div id="atlas-metrics-modal" class="news-modal-overlay" role="dialog" aria-modal="true" hidden>
+    <div class="news-modal-card metrics-modal-card">
+      <div class="news-modal-header">
+        <div class="news-modal-meta news-modal-source" id="atlas-metrics-title">METRICS</div>
+        <button class="news-modal-close" id="atlas-metrics-close">✕</button>
+      </div>
+      <div id="atlas-metrics-body" class="metrics-modal-body"></div>
     </div>
   </div>
 
